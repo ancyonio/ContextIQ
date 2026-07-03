@@ -1,0 +1,15 @@
+# Task: Bug Fix
+
+## Symptom
+Describe the error message, failing test, or incorrect behavior.
+
+## Output
+1. Root Cause
+2. Minimal Fix
+3. Verified by <command>
+
+## Instructions
+1. Use `find_relevant_context` with the symptom as the task to find the buggy code.
+2. Confirm the root cause by inspecting the identified symbols.
+3. Propose a small, targeted fix.
+4. Run validation before finishing.

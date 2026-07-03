@@ -1,0 +1,38 @@
+name: Validate AI Config
+
+on:
+  pull_request:
+    paths:
+      - '.github/copilot-instructions.md'
+      - '.vscode/mcp.json'
+      - '.mcp.json'
+      - 'CLAUDE.md'
+      - '.prompts/**'
+      - 'tools/validate_ai_config.py'
+      - '.github/workflows/validate-ai-config.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/copilot-instructions.md'
+      - '.vscode/mcp.json'
+      - '.mcp.json'
+      - 'CLAUDE.md'
+      - '.prompts/**'
+      - 'tools/validate_ai_config.py'
+      - '.github/workflows/validate-ai-config.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run AI config validation
+        run: python tools/validate_ai_config.py

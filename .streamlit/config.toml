@@ -1,0 +1,13 @@
+# ContextIQ dashboard theme. Keeps the UI on-brand and hides prototype chrome.
+[theme]
+primaryColor = "#2f6fed"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7fa"
+textColor = "#1a2b4a"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false

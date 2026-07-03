@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "async": true,
+            "statusMessage": "Refreshing code graph",
+            "command": "python \"d:/05. TECHNICAL/ContextIQ/tokengraph_all.py\" --path \"${CLAUDE_PROJECT_DIR:-.}\" index >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}

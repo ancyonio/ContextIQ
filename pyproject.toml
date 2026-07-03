@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextiq"
+version = "0.1.0"
+description = "ContextIQ — local code-graph MCP server for token-efficient context (registered as tokengraph)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ContextIQ" }]
+keywords = ["mcp", "ast", "code-graph", "llm", "rag", "context", "tree-sitter",
+            "token-efficiency", "claude", "copilot", "agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Code Generators",
+    "Environment :: Console",
+]
+# Zero required runtime dependencies — everything below is opt-in.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/contextiq/contextiq"
+Repository = "https://github.com/contextiq/contextiq"
+Issues = "https://github.com/contextiq/contextiq/issues"
+
+[project.optional-dependencies]
+mcp = ["fastmcp"]
+embeddings = ["sentence-transformers"]
+tokens = ["tiktoken"]
+# 5 solo grammars (deep parse without the full pack)
+treesitter = [
+    "tree-sitter",
+    "tree-sitter-java",
+    "tree-sitter-go",
+    "tree-sitter-typescript",
+    "tree-sitter-javascript",
+]
+# the language pack powers all 25+ deep-parsed languages in one wheel set
+langpack = ["tree-sitter", "tree-sitter-language-pack"]
+all = [
+    "fastmcp",
+    "sentence-transformers",
+    "tiktoken",
+    "tree-sitter",
+    "tree-sitter-language-pack",
+]
+
+# Console entry points so MCP configs can call `tokengraph serve` instead of a
+# hardcoded absolute path to the script (G13).
+[project.scripts]
+tokengraph = "tokengraph_all:main"
+contextiq = "tokengraph_all:main"
+
+[tool.setuptools]
+py-modules = ["tokengraph_all"]
+
+[tool.pytest.ini_options]
+# keep the single-file module importable now that the suite lives in tests/
+pythonpath = ["."]
+testpaths = ["tests"]

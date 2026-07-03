@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tokengraph": {
+      "type": "stdio",
+      "command": "tokengraph",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}
