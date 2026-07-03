@@ -1,4 +1,5 @@
 # ContextIQ
+<<<<<<< HEAD
 
 A local, single-file **AST code graph** that gives AI coding agents token-efficient context. Instead of letting the agent read whole files (and re-read them every session), ContextIQ indexes your repo into a local SQLite graph of symbols + call/inheritance edges, then serves a **token-budgeted "context pack"** of only the symbols relevant to a task.
 
@@ -536,3 +537,6 @@ Suggested daily flow:
 | `.context/usage.ndjson` | Per-run metric log (timestamp + reduction %) read by `health` / `status` |
 
 Generated on demand (not committed): `ide-plugins/` (`ide-plugin`), distribution kit + `PUBLISHING.md` (`dist`), and per-assistant context files (`generate`).
+=======
+ContextIQ
+>>>>>>> d8c339c4398da78dd9addd30dced4867dfd6cd81
