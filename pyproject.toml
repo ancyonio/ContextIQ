@@ -4,18 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextiq"
-version = "0.1.0"
+version = "0.2.0"
 description = "ContextIQ — local code-graph MCP server for token-efficient context (registered as tokengraph)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "ContextIQ" }]
 keywords = ["mcp", "ast", "code-graph", "llm", "rag", "context", "tree-sitter",
             "token-efficiency", "claude", "copilot", "agents"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -35,6 +34,8 @@ Issues = "https://github.com/contextiq/contextiq/issues"
 [project.optional-dependencies]
 mcp = ["fastmcp"]
 embeddings = ["sentence-transformers"]
+ann = ["hnswlib", "numpy"]
+dashboard = ["streamlit", "plotly"]
 tokens = ["tiktoken"]
 # 5 solo grammars (deep parse without the full pack)
 treesitter = [
@@ -49,6 +50,8 @@ langpack = ["tree-sitter", "tree-sitter-language-pack"]
 all = [
     "fastmcp",
     "sentence-transformers",
+    "hnswlib",
+    "numpy",
     "tiktoken",
     "tree-sitter",
     "tree-sitter-language-pack",
@@ -61,7 +64,7 @@ tokengraph = "tokengraph_all:main"
 contextiq = "tokengraph_all:main"
 
 [tool.setuptools]
-py-modules = ["tokengraph_all"]
+py-modules = ["tokengraph_all", "dashboard"]
 
 [tool.pytest.ini_options]
 # keep the single-file module importable now that the suite lives in tests/

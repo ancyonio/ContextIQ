@@ -51,6 +51,7 @@ import io
 import os
 import sqlite3
 import sys
+import threading
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2188,6 +2189,38 @@ class Store:
         self.conn.execute("DELETE FROM summaries WHERE path=?", (path,))
         self.conn.execute("DELETE FROM files WHERE path=?", (path,))
 
+    def prepare_file_update(self, path: str, qnames: set[str]) -> None:
+        """Clear replaceable file data while preserving stable incoming edges."""
+        rows = list(self.conn.execute(
+            "SELECT id,qname FROM symbols WHERE file=?", (path,)))
+        retained_ids = [r["id"] for r in rows if r["qname"] in qnames]
+        removed_ids = [r["id"] for r in rows if r["qname"] not in qnames]
+
+        if retained_ids:
+            q = ",".join("?" * len(retained_ids))
+            self.conn.execute(f"DELETE FROM edges WHERE src_id IN ({q})", retained_ids)
+            self.conn.execute(f"DELETE FROM vectors WHERE symbol_id IN ({q})", retained_ids)
+        if removed_ids:
+            q = ",".join("?" * len(removed_ids))
+            self.conn.execute(
+                f"DELETE FROM edges WHERE src_id IN ({q}) OR dst_id IN ({q})",
+                removed_ids + removed_ids)
+            if self.fts:
+                for sid in removed_ids:
+                    self.conn.execute("DELETE FROM symbols_fts WHERE rowid=?", (sid,))
+            self.conn.execute(f"DELETE FROM vectors WHERE symbol_id IN ({q})", removed_ids)
+            self.conn.execute(f"DELETE FROM symbols WHERE id IN ({q})", removed_ids)
+
+        chunk_ids = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM chunks WHERE file=?", (path,))]
+        if chunk_ids:
+            q = ",".join("?" * len(chunk_ids))
+            if self.fts:
+                for cid in chunk_ids:
+                    self.conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (cid,))
+            self.conn.execute(f"DELETE FROM chunks WHERE id IN ({q})", chunk_ids)
+        self.conn.execute("DELETE FROM summaries WHERE path=?", (path,))
+
     # ---- writing symbols ----
     def upsert_symbol(self, s: Symbol) -> int:
         cur = self.conn.execute(
@@ -2232,6 +2265,9 @@ class Store:
 
     def iter_vectors(self):
         return self.conn.execute("SELECT symbol_id, dim, vec FROM vectors")
+
+    def vector_count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) n FROM vectors").fetchone()["n"]
 
     def has_vectors(self) -> bool:
         return self.conn.execute("SELECT 1 FROM vectors LIMIT 1").fetchone() is not None
@@ -2345,6 +2381,14 @@ class Store:
         """All symbols whose leaf name matches (used for edge resolution)."""
         return self.conn.execute(
             "SELECT * FROM symbols WHERE name=?", (name,)).fetchall()
+
+    def symbol_at(self, file: str, line: int) -> Optional[sqlite3.Row]:
+        """Smallest indexed symbol containing a one-based source line."""
+        return self.conn.execute(
+            "SELECT * FROM symbols WHERE file=? AND lineno<=? AND end_lineno>=? "
+            "ORDER BY CASE WHEN kind='module' THEN 1 ELSE 0 END, "
+            "(end_lineno-lineno) ASC, lineno DESC LIMIT 1",
+            (file, line, line)).fetchone()
 
     def search(self, terms: str, limit: int = 12) -> list[sqlite3.Row]:
         """Lexical search over names/signatures/docstrings."""
@@ -2492,9 +2536,17 @@ _EMBED_MODEL = None
 _EMBED_TRIED = False
 
 
+def offline_mode() -> bool:
+    return os.environ.get("TOKENGRAPH_OFFLINE", "").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 def _embed_model():
     """Lazily load sentence-transformers IFF explicitly opted in; else None."""
     global _EMBED_MODEL, _EMBED_TRIED
+    if offline_mode():
+        return None
     if _EMBED_TRIED:
         return _EMBED_MODEL
     _EMBED_TRIED = True
@@ -3373,21 +3425,36 @@ def _resolve_edge(store: Store, src_module_file: str, e: PendingEdge,
 
 
 def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
-               respect_gitignore: bool = True) -> IndexReport:
+               respect_gitignore: bool = True,
+               paths: list[str] | None = None) -> IndexReport:
     ignores = (ignores or set()) | DEFAULT_IGNORES
     root = root.resolve()
     store = Store(db_path)
     report = IndexReport(errors=[])
 
     gitignore = GitIgnore.load(root) if respect_gitignore else None
-    files = iter_source_files(root, ignores, gitignore)
+    if paths is None:
+        files = iter_source_files(root, ignores, gitignore)
+    else:
+        files = []
+        for rel in paths:
+            try:
+                candidate = (root / rel).resolve()
+                candidate.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            supported = (candidate.suffix.lower() in supported_extensions()
+                         or candidate.name.lower() in GENERIC_LANGUAGE_FILENAMES)
+            if candidate.is_file() and supported:
+                files.append(candidate)
     report.scanned = len(files)
     current = {p.relative_to(root).as_posix() for p in files}
 
     # drop deleted files
-    for gone in store.all_indexed_files() - current:
-        store.forget_file(gone)
-        report.removed += 1
+    if paths is None:
+        for gone in store.all_indexed_files() - current:
+            store.forget_file(gone)
+            report.removed += 1
 
     pending: list[tuple[str, PendingEdge]] = []
     import_maps: dict[str, dict[str, str]] = {}
@@ -3420,12 +3487,13 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
             report.skipped += 1
             continue
 
-        store.forget_file(rel)  # clear stale symbols/edges
         res: ParseResult | None = parse_path(root, path)
         if res is None:
             continue
         if res.error and not res.symbols:
             report.errors.append(f"{rel}: {res.error}")
+
+        store.prepare_file_update(rel, {s.qname for s in res.symbols})
 
         emb_sids: list[int] = []
         emb_texts: list[str] = []
@@ -3474,6 +3542,52 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
         report.stats["edge_resolution_pct"] = round(100 * resolved_n / len(pending), 1)
     store.close()
     return report
+
+
+def import_scip_json(root: Path, db_path: Path, index_file: Path) -> dict:
+    """Import definition/reference occurrences from `scip print --json` output."""
+    import json
+    root = Path(root).resolve()
+    payload = json.loads(Path(index_file).read_text(encoding="utf-8"))
+    documents = payload.get("documents", [])
+    store = Store(db_path)
+    definitions: dict[str, sqlite3.Row] = {}
+    occurrences: list[tuple[str, dict]] = []
+    try:
+        for document in documents:
+            file = (document.get("relativePath") or
+                    document.get("relative_path") or "").replace("\\", "/")
+            if not file or not (root / file).is_file():
+                continue
+            for occurrence in document.get("occurrences", []):
+                occurrences.append((file, occurrence))
+                roles = occurrence.get("symbolRoles", occurrence.get("symbol_roles", 0))
+                source_range = occurrence.get("range", [])
+                if roles & 1 and source_range:
+                    row = store.symbol_at(file, int(source_range[0]) + 1)
+                    if row is not None:
+                        definitions[occurrence.get("symbol", "")] = row
+
+        imported = unresolved = 0
+        for file, occurrence in occurrences:
+            roles = occurrence.get("symbolRoles", occurrence.get("symbol_roles", 0))
+            symbol = occurrence.get("symbol", "")
+            source_range = occurrence.get("range", [])
+            if roles & 1 or not symbol or not source_range:
+                continue
+            source = store.symbol_at(file, int(source_range[0]) + 1)
+            destination = definitions.get(symbol)
+            if source is None or destination is None:
+                unresolved += 1
+                continue
+            if source["id"] != destination["id"]:
+                store.add_edge(source["id"], destination["id"], "REFERENCES")
+                imported += 1
+        store.commit()
+        return {"documents": len(documents), "definitions": len(definitions),
+                "references_imported": imported, "unresolved": unresolved}
+    finally:
+        store.close()
 
 
 # ==========================================================================
@@ -3562,12 +3676,17 @@ class ContextPack:
         out, _ = redact_secrets("\n".join(lines))
         return out
 
+    @property
+    def rendered_tokens(self) -> int:
+        return count_tokens(self.to_markdown())
+
 
 class Retriever:
     def __init__(self, root: Path, db_path: Path):
         self.root = Path(root).resolve()
         self.store = Store(db_path)
         self._src_cache: dict[str, list[str]] = {}
+        self._ann_index = None
 
     # ---- source access ----
     def _lines(self, file: str) -> list[str]:
@@ -3647,13 +3766,15 @@ class Retriever:
         if len(rows) > MAX_SIGS_PER_FILE:
             out.append(f"# … +{len(rows) - MAX_SIGS_PER_FILE} more symbol(s) "
                        f"(capped at {MAX_SIGS_PER_FILE}/file; fetch via get_symbol/search)")
-        return "\n".join(out)
+        redacted, _ = redact_secrets("\n".join(out))
+        return redacted
 
     def module_summary(self, file: str) -> str:
         """Compact summary of a file (cached, or a signature skeleton fallback)."""
         row = self.store.get_summary(file)
         if row:
-            return row["summary"]
+            redacted, _ = redact_secrets(row["summary"])
+            return redacted
         return self.file_skeleton(file)
 
     # ---- semantic + hybrid seeding ----
@@ -3662,6 +3783,31 @@ class Retriever:
         if not self.store.has_vectors():
             return []
         qv = embed_text(query)
+        backend = os.environ.get("TOKENGRAPH_VECTOR_BACKEND", "exact").lower()
+        threshold = int(os.environ.get("TOKENGRAPH_ANN_THRESHOLD", "5000"))
+        vector_count = self.store.vector_count()
+        if backend == "hnsw" and vector_count >= threshold:
+            try:
+                import hnswlib  # type: ignore[import-not-found]
+                import numpy as np  # type: ignore[import-not-found]
+                if self._ann_index is None:
+                    index = hnswlib.Index(space="cosine", dim=len(qv))
+                    index.init_index(max_elements=vector_count, ef_construction=200,
+                                     M=16)
+                    rows = list(self.store.iter_vectors())
+                    labels = np.asarray([row["symbol_id"] for row in rows])
+                    vectors = np.asarray([blob_to_vec(row["vec"]) for row in rows],
+                                         dtype=np.float32)
+                    index.add_items(vectors, labels)
+                    index.set_ef(max(50, limit * 3))
+                    self._ann_index = index
+                labels, _ = self._ann_index.knn_query(
+                    np.asarray([qv], dtype=np.float32),
+                    k=min(limit, vector_count))
+                return [row for sid in labels[0]
+                        if (row := self.store.symbol(int(sid))) is not None]
+            except (ImportError, RuntimeError, ValueError):
+                pass
         scored: list[tuple[float, int]] = []
         for r in self.store.iter_vectors():
             v = blob_to_vec(r["vec"])
@@ -3703,6 +3849,14 @@ class Retriever:
         seeds = self._fuse([lexical, semantic], limit=12) if semantic else lexical
         # de-prioritise module nodes as seeds; we want concrete defs
         seeds = [s for s in seeds if s["kind"] != "module"] or seeds
+        diversified = []
+        per_file: dict[str, int] = {}
+        for seed in seeds:
+            if per_file.get(seed["file"], 0) >= 4:
+                continue
+            diversified.append(seed)
+            per_file[seed["file"]] = per_file.get(seed["file"], 0) + 1
+        seeds = diversified
         # G10: let learned file weights nudge ordering — reinforced files first,
         # penalised last. Stable sort keeps relevance order among unweighted files.
         weights = self.store.all_weights()
@@ -3718,13 +3872,13 @@ class Retriever:
         for _ in range(max(0, expand_depth)):
             nxt = []
             for sid in frontier:
-                for r in self.store.neighbors(sid, ["CALLS"], "out"):
+                for r in self.store.neighbors(sid, ["CALLS", "REFERENCES"], "out"):
                     if r["id"] not in seen:
                         neighbor_rows.setdefault(r["id"], (r, "callee")); nxt.append(r["id"])
                 for r in self.store.neighbors(sid, ["INHERITS"], "out"):
                     if r["id"] not in seen:
                         neighbor_rows.setdefault(r["id"], (r, "base")); nxt.append(r["id"])
-                for r in self.store.neighbors(sid, ["CALLS"], "in"):
+                for r in self.store.neighbors(sid, ["CALLS", "REFERENCES"], "in"):
                     if r["id"] not in seen:
                         neighbor_rows.setdefault(r["id"], (r, "caller")); nxt.append(r["id"])
             seen.update(nxt)
@@ -3794,6 +3948,13 @@ class Retriever:
             pack.pieces.append(Piece(label, "chunk", c["file"], "chunk",
                                      text, est, "indexed search"))
             included_chunks.add(c["id"])
+        # Piece estimates exclude Markdown headings, fences, paths, and the
+        # dropped list. Enforce the public contract against serialized output.
+        while pack.pieces and pack.rendered_tokens > budget_tokens:
+            removed = pack.pieces.pop()
+            pack.dropped.append(removed.qname)
+        while pack.dropped and pack.rendered_tokens > budget_tokens:
+            pack.dropped.pop()
         return pack
 
     def measure(self, task: str, **kw) -> dict:
@@ -3805,7 +3966,7 @@ class Retriever:
         pack = self.find_relevant_context(task, **kw)
         files = sorted({p.file for p in pack.pieces})
         baseline = sum(self.store.token_est_for(f) for f in files)
-        pack_tokens = pack.tokens
+        pack_tokens = pack.rendered_tokens
         saved = baseline - pack_tokens
         pct = (saved / baseline * 100.0) if baseline else 0.0
         return {
@@ -3930,7 +4091,7 @@ class Retriever:
         row = self.store.symbol_by_qname(qname)
         if not row:
             return {"symbol": qname, "found": False}
-        direct = self.store.neighbors(row["id"], ["CALLS"], "in")
+        direct = self.store.neighbors(row["id"], ["CALLS", "REFERENCES"], "in")
         # transitive callers (BFS, bounded)
         transitive: set[str] = set()
         frontier = [r["id"] for r in direct]
@@ -3939,7 +4100,7 @@ class Retriever:
         while frontier and depth < 5:
             nxt = []
             for sid in frontier:
-                for r in self.store.neighbors(sid, ["CALLS"], "in"):
+                for r in self.store.neighbors(sid, ["CALLS", "REFERENCES"], "in"):
                     if r["id"] not in seen:
                         seen.add(r["id"]); transitive.add(r["qname"]); nxt.append(r["id"])
             frontier = nxt
@@ -4042,7 +4203,8 @@ class Retriever:
         seeds = [p for p in pack.pieces if p.reason == "seed"]
         files = sorted({p.file for p in pack.pieces})
         baseline = sum(self.store.token_est_for(f) for f in files)
-        saved = baseline - pack.tokens
+        serialized_tokens = pack.rendered_tokens
+        saved = baseline - serialized_tokens
         # coverage: fraction of relevant seeds that made it into the pack
         total_seed_slots = len(seeds) + len(pack.dropped)
         coverage = (len(seeds) / total_seed_slots * 100.0) if total_seed_slots else 0.0
@@ -4057,7 +4219,7 @@ class Retriever:
             "intent": detect_intent(task),
             "coverage_pct": round(coverage, 1),
             "risk": risk,
-            "pack_tokens": pack.tokens,
+            "pack_tokens": serialized_tokens,
             "baseline_tokens": baseline,
             "tokens_saved": saved,
             "savings_pct": round(saved / baseline * 100.0, 1) if baseline else 0.0,
@@ -4159,7 +4321,7 @@ class Retriever:
             "changed_files": src_changed,
             "touched_symbols": touched_symbols,
             "impacted": impacted[:25],
-            "pack_tokens": pack.tokens,
+            "pack_tokens": pack.rendered_tokens,
             "baseline_tokens": baseline,
             "tokens_saved": saved,
             "savings_pct": round(saved / baseline * 100.0, 1) if baseline else 0.0,
@@ -4292,20 +4454,27 @@ class Retriever:
     def remember(self, text: str, kind: str = "note") -> dict:
         mid = self.store.add_memory(text, kind)
         self.store.commit()
-        return {"id": mid, "kind": kind, "text": text}
+        redacted, _ = redact_secrets(text)
+        return {"id": mid, "kind": kind, "text": redacted}
 
     def read_memory(self, limit: int = 20) -> dict:
-        notes = [{"kind": r["kind"], "text": r["text"]}
-                 for r in self.store.recent_memory(limit)]
-        cps = [{"label": r["label"], "git_sha": r["git_sha"], "note": r["note"]}
-               for r in self.store.recent_checkpoints(10)]
+        notes = []
+        for row in self.store.recent_memory(limit):
+            text, _ = redact_secrets(row["text"])
+            notes.append({"kind": row["kind"], "text": text})
+        cps = []
+        for row in self.store.recent_checkpoints(10):
+            note, _ = redact_secrets(row["note"])
+            cps.append({"label": row["label"], "git_sha": row["git_sha"],
+                        "note": note})
         return {"notes": notes, "checkpoints": cps}
 
     def create_checkpoint(self, label: str, note: str = "") -> dict:
         sha = _git(self.root, "rev-parse", "--short", "HEAD").strip()
         cid = self.store.add_checkpoint(label, sha, note)
         self.store.commit()
-        return {"id": cid, "label": label, "git_sha": sha, "note": note}
+        safe_note, _ = redact_secrets(note)
+        return {"id": cid, "label": label, "git_sha": sha, "note": safe_note}
 
     # ---- spec-named retrieval surface (MCP-2: read_context / search_signatures
     #      / query_context) layered on the existing graph ----
@@ -4344,9 +4513,14 @@ class Retriever:
     def search_signatures(self, query: str, limit: int = 20) -> list[dict]:
         """Keyword search across signatures (MCP-2)."""
         rows = self.store.search(query, limit=limit)
-        return [{"qname": r["qname"], "kind": r["kind"], "file": r["file"],
-                 "signature": (r["signature"] or r["qname"])}
-                for r in rows if r["kind"] != "module"]
+        results = []
+        for row in rows:
+            if row["kind"] == "module":
+                continue
+            signature, _ = redact_secrets(row["signature"] or row["qname"])
+            results.append({"qname": row["qname"], "kind": row["kind"],
+                            "file": row["file"], "signature": signature})
+        return results
 
     def rank_files(self, query: str, top_k: int = 10, recency_boost: float = 1.5,
                    use_recency: bool = True) -> list[tuple[str, float]]:
@@ -4362,7 +4536,13 @@ class Retriever:
         fscore: dict[str, float] = {}
         for rank, row in enumerate(fused):
             f = row["file"]
-            fscore[f] = fscore.get(f, 0.0) + 1.0 / (rank + 1)
+            fscore[f] = max(fscore.get(f, 0.0), 1.0 / (rank + 1))
+        # File-level prose, configuration, and UI modules can contain the task
+        # vocabulary outside symbol signatures. Fuse chunk search so these
+        # files are not invisible to rank_files even when symbols are sparse.
+        for rank, chunk in enumerate(self.store.search_chunks(query, limit=20)):
+            file = chunk["file"]
+            fscore[file] = fscore.get(file, 0.0) + 0.75 / (rank + 1)
         for f in list(fscore):
             fscore[f] += weights.get(f, 0.0) * 0.1
             if f in recent:
@@ -4451,6 +4631,8 @@ def _load_extends(ref: str, root: Path) -> dict:
     """
     import json
     if ref.startswith("https://"):
+        if offline_mode():
+            return {}
         import time
         import urllib.request
         cache = root / ".tokengraph" / ("config-" + file_hash(ref)[:16] + ".json")
@@ -4720,6 +4902,9 @@ def _tracking_disabled(no_track_flag: bool) -> bool:
                 or os.environ.get("TOKENGRAPH_NO_TRACK"))
 
 
+_GAIN_LOCK = threading.Lock()
+
+
 def track_gain(root: Path, counts: dict, no_track: bool = False) -> None:
     """Append count-only savings to .context/gain.ndjson (TB-6). No paths/queries.
 
@@ -4736,9 +4921,10 @@ def track_gain(root: Path, counts: dict, no_track: bool = False) -> None:
             {"final_tokens", "baseline_tokens", "saved", "reduction_pct", "files"}}
     p = root / ".context" / "gain.ndjson"
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": time.time(),
-                             "op": counts.get("op", "generate"), **safe}) + "\n")
+    with _GAIN_LOCK:
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(),
+                                 "op": counts.get("op", "generate"), **safe}) + "\n")
 
 
 def track_usage(root: Path, metrics: dict, no_track: bool = False) -> None:
@@ -4819,6 +5005,39 @@ def read_gain_ledger(root: Path) -> list[dict]:
         except Exception:
             continue
     return rows
+
+
+def gain_totals(rows: list[dict]) -> dict:
+    saved = sum(int(row.get("saved", 0)) for row in rows)
+    baseline = sum(int(row.get("baseline_tokens", 0)) for row in rows)
+    final = sum(int(row.get("final_tokens", 0)) for row in rows)
+    return {"runs": len(rows), "saved": saved, "baseline": baseline,
+            "final": final,
+            "reduction_pct": round(saved / baseline * 100, 1) if baseline else 0.0}
+
+
+def gain_by_operation(rows: list[dict]) -> list[dict]:
+    operations: dict[str, dict] = {}
+    for row in rows:
+        name = row.get("op", "?")
+        operation = operations.setdefault(name, {"op": name, "saved": 0, "runs": 0})
+        operation["saved"] += int(row.get("saved", 0))
+        operation["runs"] += 1
+    return sorted(operations.values(), key=lambda item: item["saved"], reverse=True)
+
+
+def gain_daily(rows: list[dict]) -> list[dict]:
+    from datetime import datetime, timezone
+    days: dict[str, dict] = {}
+    for row in rows:
+        timestamp = float(row.get("ts", 0.0))
+        if not timestamp:
+            continue
+        key = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+        day = days.setdefault(key, {"day": key, "saved": 0, "final": 0})
+        day["saved"] += int(row.get("saved", 0))
+        day["final"] += int(row.get("final_tokens", 0))
+    return [days[key] for key in sorted(days)]
 
 
 def summarize_gain(root: Path, since: str | None = None,
@@ -5753,7 +5972,8 @@ def hallucination_report_to_markdown(rep: dict) -> str:
 # ==========================================================================
 # IDE integration (FR-IDE): one-command MCP wiring for every major editor
 # ==========================================================================
-def ide_setup(root: Path, editors: list[str] | None = None) -> dict:
+def ide_setup(root: Path, editors: list[str] | None = None,
+              workspace_roots: list[Path] | None = None) -> dict:
     """Wire ContextIQ's MCP server into every (or selected) MCP-capable editor.
 
     For an MCP-native tool this is the equivalent of shipping editor plugins:
@@ -5762,6 +5982,7 @@ def ide_setup(root: Path, editors: list[str] | None = None) -> dict:
     import json
     import shutil
     root = Path(root).resolve()
+    roots = [Path(p).resolve() for p in workspace_roots] if workspace_roots else [root]
     entry = shutil.which("tokengraph")
     if entry:
         stdio = {"command": "tokengraph", "args": ["serve"]}
@@ -5781,21 +6002,22 @@ def ide_setup(root: Path, editors: list[str] | None = None) -> dict:
     }
     chosen = editors or list(targets)
     written: list[str] = []
-    for ed in chosen:
-        if ed not in targets:
-            continue
-        rel, payload = targets[ed]
-        p = root / rel
-        cur = {}
-        if p.exists():
-            try:
-                cur = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                cur = {}
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(_deep_merge(cur, payload), indent=2) + "\n",
-                     encoding="utf-8")
-        written.append(rel)
+    for workspace_root in roots:
+        for ed in chosen:
+            if ed not in targets:
+                continue
+            rel, payload = targets[ed]
+            p = workspace_root / rel
+            cur = {}
+            if p.exists():
+                try:
+                    cur = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    cur = {}
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(_deep_merge(cur, payload), indent=2) + "\n",
+                         encoding="utf-8")
+            written.append(rel if len(roots) == 1 else str(p))
 
     nvim = ('require("mcphub").setup({ servers = { tokengraph = { command = "%s", '
             'args = { %s } } } })' % (stdio["command"],
@@ -5806,6 +6028,7 @@ def ide_setup(root: Path, editors: list[str] | None = None) -> dict:
         "neovim_snippet": nvim,
         "jetbrains_note": ("JetBrains AI Assistant: Settings → Tools → MCP → Add → "
                            f"command `{stdio['command']} {' '.join(stdio['args'])}`"),
+        "workspace_roots": [str(p) for p in roots],
         "note": f"wired {len(written)} editor config(s); restart the editor to load",
     }
 
@@ -5840,7 +6063,11 @@ _VSCODE_PACKAGE_JSON = """\
       "properties": {
         "contextiq.command": {
           "type": "string", "default": "tokengraph",
-          "description": "CLI command (tokengraph, or e.g. 'python /path/tokengraph_all.py')."
+                    "description": "ContextIQ executable path."
+                },
+                "contextiq.commandArgs": {
+                    "type": "array", "default": [], "items": { "type": "string" },
+                    "description": "Arguments placed before the ContextIQ subcommand."
         }
       }
     }
@@ -5857,13 +6084,18 @@ const cp = require('child_process');
 function cli() {
   return vscode.workspace.getConfiguration('contextiq').get('command') || 'tokengraph';
 }
+function cliArgs() {
+    return vscode.workspace.getConfiguration('contextiq').get('commandArgs') || [];
+}
 function root() {
-  const f = vscode.workspace.workspaceFolders;
-  return f && f.length ? f[0].uri.fsPath : process.cwd();
+    const editor = vscode.window.activeTextEditor;
+    const active = editor && vscode.workspace.getWorkspaceFolder(editor.document.uri);
+    const folders = vscode.workspace.workspaceFolders;
+    return active ? active.uri.fsPath : (folders && folders.length ? folders[0].uri.fsPath : process.cwd());
 }
 function run(args) {
   return new Promise((resolve) => {
-    cp.exec(cli() + ' ' + args, { cwd: root(), maxBuffer: 16 * 1024 * 1024 },
+        cp.execFile(cli(), [...cliArgs(), ...args], { cwd: root(), maxBuffer: 16 * 1024 * 1024 },
       (err, stdout, stderr) => resolve(stdout || stderr || String(err)));
   });
 }
@@ -5878,19 +6110,19 @@ function activate(context) {
   reg('contextiq.context', async () => {
     const task = await vscode.window.showInputBox({ prompt: 'ContextIQ: task / question' });
     if (!task) return;
-    show('Context: ' + task, await run('context "' + task.replace(/"/g, '') + '"'));
+        show('Context: ' + task, await run(['context', task]));
   });
   reg('contextiq.reindex', async () => {
-    await run('index'); vscode.window.showInformationMessage('ContextIQ: reindexed');
+        await run(['index']); vscode.window.showInformationMessage('ContextIQ: reindexed');
   });
-  reg('contextiq.conventions', async () => show('Conventions', await run('conventions')));
+    reg('contextiq.conventions', async () => show('Conventions', await run(['conventions'])));
   reg('contextiq.impact', async () => {
     const ed = vscode.window.activeTextEditor; if (!ed) return;
     const sel = ed.document.getText(ed.selection);
     const word = sel || ed.document.getText(
       ed.document.getWordRangeAtPosition(ed.selection.active) || ed.selection);
     if (!word) return;
-    show('Impact: ' + word, await run('impact ' + word));
+    show('Impact: ' + word, await run(['impact', word]));
   });
 }
 function deactivate() {}
@@ -5921,14 +6153,17 @@ _VSCODE_IGNORE = ".vscode/**\n.gitignore\n*.vsix\nnode_modules/**\n"
 
 _NVIM_INIT_LUA = r"""-- ContextIQ Neovim plugin (lua/contextiq/init.lua)
 local M = {}
-M.config = { command = "tokengraph" }
+M.config = { command = "tokengraph", command_args = {} }
 
 function M.setup(opts)
   M.config = vim.tbl_extend("force", M.config, opts or {})
 end
 
 local function run(args)
-  return vim.fn.system(M.config.command .. " " .. args)
+    local cmd = { M.config.command }
+    vim.list_extend(cmd, M.config.command_args)
+    vim.list_extend(cmd, args)
+    return vim.fn.system(cmd)
 end
 
 local function show(title, text)
@@ -5944,18 +6179,18 @@ end
 function M.context(task)
   task = task or vim.fn.input("ContextIQ task: ")
   if task == "" then return end
-  show("Context: " .. task, run('context "' .. task .. '"'))
+    show("Context: " .. task, run({ "context", task }))
 end
 
-function M.conventions() show("Conventions", run("conventions")) end
+function M.conventions() show("Conventions", run({ "conventions" })) end
 
 function M.impact(sym)
   sym = (sym and sym ~= "") and sym or vim.fn.expand("<cword>")
-  show("Impact: " .. sym, run("impact " .. sym))
+    show("Impact: " .. sym, run({ "impact", sym }))
 end
 
 function M.reindex()
-  run("index")
+    run({ "index" })
   vim.notify("ContextIQ: reindexed")
 end
 
@@ -6419,7 +6654,7 @@ def build_mcp_server(root: Path, db: Path):
                                            expand_depth=depth,
                                            max_body_tokens=max_body_tokens)
             files = sorted({p.file for p in pack.pieces})
-            record_pack_savings(root, "mcp.context", final_tokens=pack.tokens,
+            record_pack_savings(root, "mcp.context", final_tokens=pack.rendered_tokens,
                                 baseline_tokens=sum(r.store.token_est_for(f) for f in files),
                                 files=len(files))
             return pack.to_markdown()
@@ -6548,6 +6783,18 @@ def build_mcp_server(root: Path, db: Path):
         return (f"parsed={rep.parsed} skipped={rep.skipped} removed={rep.removed} "
                 f"graph={rep.stats}")
 
+    @mcp.tool
+    def ingest_scip(index_file: str) -> dict:
+        """Import precise REFERENCES edges from SCIP JSON inside the repo."""
+        target = (root / index_file).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return {"error": "SCIP index must be inside the repository"}
+        if not target.is_file():
+            return {"error": f"no SCIP JSON file: {index_file}"}
+        return import_scip_json(root, db, target)
+
     # ---- proactive change notifications (optional; the graph also
     #      auto-refreshes on every query). An IDE/agent that already knows a
     #      file event happened can push it here to keep the graph warm so the
@@ -6568,7 +6815,7 @@ def build_mcp_server(root: Path, db: Path):
                 store.close()
             return {"event": "deleted", "paths": paths, "removed": removed,
                     "note": f"forgot {removed} file(s) from the graph"}
-        rep = index_repo(root, db)
+        rep = index_repo(root, db, paths=paths or None)
         return {"event": event, "paths": paths, "parsed": rep.parsed,
                 "skipped": rep.skipped, "removed": rep.removed,
                 "note": (f"reindexed: {rep.parsed} parsed, {rep.removed} removed "
@@ -6969,12 +7216,12 @@ def cmd_context(args):
                                    max_body_tokens=args.max_body)
     out = pack.to_markdown()
     files = sorted({p.file for p in pack.pieces})
-    record_pack_savings(root, "context", final_tokens=pack.tokens,
+    record_pack_savings(root, "context", final_tokens=pack.rendered_tokens,
                         baseline_tokens=sum(r.store.token_est_for(f) for f in files),
                         files=len(files), no_track=getattr(args, "no_track", False))
     if args.out:
         Path(args.out).write_text(out, encoding="utf-8")
-        print(f"wrote {args.out} (~{pack.tokens} tokens, {len(pack.pieces)} symbols)")
+        print(f"wrote {args.out} (~{pack.rendered_tokens} tokens, {len(pack.pieces)} symbols)")
     else:
         print(out)
     r.close()
@@ -7559,7 +7806,8 @@ def cmd_hallucination(args):
 def cmd_ide_setup(args):
     root = Path(args.path).resolve()
     editors = args.editor or None
-    res = ide_setup(root, editors=editors)
+    workspace_roots = [Path(p) for p in args.workspace_root] if args.workspace_root else None
+    res = ide_setup(root, editors=editors, workspace_roots=workspace_roots)
     if getattr(args, "plugins", False):
         res["plugins"] = emit_ide_plugins(root)
     if getattr(args, "json", False):
@@ -7586,6 +7834,31 @@ def cmd_ide_plugin(args):
         print("install:")
         for ed in res["editors"]:
             print(f"  {ed}: {res['install'][ed]}")
+
+
+def cmd_dashboard(args):
+    import importlib.util
+    import subprocess
+    if importlib.util.find_spec("streamlit") is None:
+        raise SystemExit("dashboard dependencies missing; install contextiq[dashboard]")
+    spec = importlib.util.find_spec("dashboard")
+    if spec is None or not spec.origin:
+        raise SystemExit("dashboard module is not installed")
+    root = str(Path(args.path).resolve())
+    raise SystemExit(subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", spec.origin,
+         "--", "--path", root]).returncode)
+
+
+def cmd_import_scip(args):
+    root = Path(args.path).resolve()
+    db = _db_path(root)
+    index_repo(root, db)
+    index_file = Path(args.index)
+    if not index_file.is_absolute():
+        index_file = root / index_file
+    result = import_scip_json(root, db, index_file)
+    _emit(result, getattr(args, "json", False))
 
 
 def cmd_freeze(args):
@@ -8027,38 +8300,85 @@ def cmd_health(args):
         raise SystemExit(1)
 
 
+def load_benchmark_corpus(path: Path) -> list[dict]:
+    import json
+    data = json.loads(path.read_text(encoding="utf-8"))
+    cases = data.get("cases", data) if isinstance(data, dict) else data
+    return [case for case in cases
+            if case.get("task") and case.get("expected_files")]
+
+
+def run_retrieval_benchmark(r: Retriever, cases: list[dict]) -> dict:
+    import time
+    hits = 0
+    reciprocal_rank = 0.0
+    irrelevant_tokens = 0
+    pack_tokens = 0
+    latencies_ms: list[float] = []
+    rows = []
+    for case in cases:
+        started = time.perf_counter()
+        ranked = [f for f, _ in r.rank_files(
+            case["task"], top_k=5, use_recency=False)]
+        pack = r.find_relevant_context(case["task"], budget_tokens=4000)
+        latencies_ms.append((time.perf_counter() - started) * 1000)
+        expected = set(case["expected_files"])
+        positions = [ranked.index(f) + 1 for f in expected if f in ranked]
+        rank = min(positions) if positions else 0
+        if rank:
+            hits += 1
+            reciprocal_rank += 1.0 / rank
+        row_pack_tokens = sum(piece.token_est for piece in pack.pieces)
+        row_irrelevant = sum(piece.token_est for piece in pack.pieces
+                             if piece.file not in expected)
+        pack_tokens += row_pack_tokens
+        irrelevant_tokens += row_irrelevant
+        rows.append({"task": case["task"], "expected_files": sorted(expected),
+                     "top_files": ranked, "rank": rank})
+    count = len(cases) or 1
+    return {
+        "queries": len(cases),
+        "recall_at_5": round(hits / count, 3),
+        "hit_at_5": round(hits / count, 3),
+        "mrr": round(reciprocal_rank / count, 3),
+        "irrelevant_token_ratio": round(
+            irrelevant_tokens / pack_tokens, 3) if pack_tokens else 0.0,
+        "mean_latency_ms": round(sum(latencies_ms) / count, 2),
+        "rows": rows,
+    }
+
+
 def cmd_benchmark(args):
-    """Retrieval-quality benchmark: hit@5 + MRR (CI-4)."""
+    """Corpus-driven retrieval benchmark: Recall@5, MRR, waste, latency."""
     root = Path(args.path).resolve()
     index_repo(root, _db_path(root))
     r = Retriever(root, _db_path(root))
     try:
-        samples = []
-        for fr in r.store.files_with_tokens():
-            for s in r.store.file_symbols(fr["path"]):
-                if s["kind"] == "module":
-                    continue
-                q = (s["name"] + " " + (s["docstring"] or "")).strip()
-                if len(q) >= 3:
-                    samples.append((q, s["file"]))
-        samples = samples[:args.limit]
-        hits = 0
-        rr_sum = 0.0
-        for q, expected in samples:
-            ranked = [f for f, _ in r.rank_files(q, top_k=5, use_recency=False)]
-            if expected in ranked:
-                pos = ranked.index(expected) + 1
-                if pos <= 5:
-                    hits += 1
-                rr_sum += 1.0 / pos
-        n = len(samples) or 1
-        out = {"queries": len(samples), "hit_at_5": round(hits / n, 3),
-               "mrr": round(rr_sum / n, 3)}
+        corpus = Path(args.corpus) if args.corpus else root / "benchmarks" / "retrieval_tasks.json"
+        if corpus.exists():
+            cases = load_benchmark_corpus(corpus)[:args.limit]
+            source = str(corpus)
+        else:
+            cases = []
+            for fr in r.store.files_with_tokens():
+                for symbol in r.store.file_symbols(fr["path"]):
+                    if symbol["kind"] != "module":
+                        query = (symbol["name"] + " " +
+                                 (symbol["docstring"] or "")).strip()
+                        if len(query) >= 3:
+                            cases.append({"task": query,
+                                          "expected_files": [symbol["file"]]})
+            cases = cases[:args.limit]
+            source = "generated-symbol-query fallback"
+        out = run_retrieval_benchmark(r, cases)
+        out["corpus"] = source
         if getattr(args, "json", False):
             _emit(out, True)
         else:
             print(f"benchmark: {out['queries']} queries  "
-                  f"hit@5={out['hit_at_5']}  MRR={out['mrr']}")
+                f"Recall@5={out['recall_at_5']}  MRR={out['mrr']}  "
+                f"irrelevant={out['irrelevant_token_ratio']}  "
+                f"mean={out['mean_latency_ms']}ms")
     finally:
         r.close()
 
@@ -8503,6 +8823,8 @@ def build_parser():
                      help="limit to specific editor(s); default = all")
     ide.add_argument("--plugins", action="store_true",
                      help="also scaffold installable VS Code / Neovim / JetBrains plugins")
+    ide.add_argument("--workspace-root", action="append",
+                     help="repeat for each folder in a multi-root workspace")
     ide.add_argument("--json", action="store_true")
     ide.set_defaults(func=cmd_ide_setup)
 
@@ -8514,6 +8836,16 @@ def build_parser():
                      help="limit to specific plugin(s); default = all")
     idp.add_argument("--json", action="store_true")
     idp.set_defaults(func=cmd_ide_plugin)
+
+    dash = sub.add_parser("dashboard",
+                          help="open the token-savings dashboard for --path")
+    dash.set_defaults(func=cmd_dashboard)
+
+    scip = sub.add_parser("import-scip",
+                          help="import precise REFERENCES edges from SCIP JSON")
+    scip.add_argument("index", help="output from `scip print --json index.scip`")
+    scip.add_argument("--json", action="store_true")
+    scip.set_defaults(func=cmd_import_scip)
 
     fz = sub.add_parser("freeze",
                         help="emit a PyInstaller spec (or --build it) for a standalone binary")
@@ -8576,6 +8908,8 @@ def build_parser():
     bm = sub.add_parser("benchmark", aliases=["eval"],
                         help="retrieval quality: hit@5 + MRR (CI-4)")
     bm.add_argument("-n", "--limit", type=int, default=100)
+    bm.add_argument("--corpus", default=None,
+                    help="JSON corpus with task + expected_files cases")
     bm.add_argument("--json", action="store_true")
     bm.set_defaults(func=cmd_benchmark)
 

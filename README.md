@@ -7,7 +7,7 @@ A local, single-file **AST code graph** that gives AI coding agents token-effici
 The graph **auto-refreshes on every query**, so it never goes stale — even right after an edit.
 
 - **One file, zero required dependencies** to run the CLI ([tokengraph_all.py](tokengraph_all.py)).
-- Works as an **MCP server** (39 tools) for **Claude Code** and **GitHub Copilot** (agent mode), and ships **one-command editor wiring + installable plugins** for VS Code / Cursor / Windsurf / Zed / Neovim / JetBrains.
+- Works as an **MCP server** (45 tools) for MCP-capable clients, with one-command wiring for VS Code / Cursor / Windsurf / Zed / Claude Code and locally generated plugin projects for VS Code / Neovim / JetBrains. Marketplace publication remains a separate release step.
 - **Deep parsing with a full call / import / inheritance graph for 25+ languages** — **Python** (stdlib `ast`) and, via tree-sitter, **Java / Go / TypeScript / JavaScript / C / C++ / C# / Rust / PHP / Ruby / Kotlin / Swift / Scala / Lua / Bash / Solidity / Perl / Erlang / Julia / R / Haskell / OCaml / Nim / PowerShell / Dart**. Plus lightweight regex indexing for **30+ more languages** — SQL / Elixir / Clojure / F# / Groovy / Zig / Crystal / Haxe / Objective-C / Visual Basic / Tcl / Pascal / GDScript and markup/config (Vue, Svelte, HTML, CSS, YAML, TOML, XML, INI, GraphQL, Terraform, Protobuf, **Markdown**, Dockerfile, …). Every deep-parsed language falls back to regex when its grammar isn't installed. Run `python tokengraph_all.py langs` to list them all.
 - **Grounded creation & guardrails** — close the loop from *retrieval* to *safe code generation*: detect house **`conventions`** (and **`conventions --fix`** to auto-rename outliers to house style), **`scaffold`** convention-matched files, **`verify-plan`** / **`verify-output`** to flag fabricated files / symbols / local imports, **`review`** a diff for scope-drift, hub-edits, missing tests and breaking changes, and **`create`** to orchestrate them through a gated pipeline.
 - **Realized-savings ledger** — every `context` / `ask` / `measure` / `generate` call (and the MCP context tool) appends its pack-vs-whole-file delta to a privacy-safe, count-only ledger. **`gain`** rolls it up into a token + **dollar** report with `--since` windows, per-op breakdown, daily/weekly/monthly trends, and a self-contained **`--html`** dashboard. **`status`** gives a one-line repo snapshot (branch / dirty / index freshness / notes / cumulative savings).
@@ -31,7 +31,7 @@ A context pack contains: relevant symbols (full body when small, signature when 
 
 ## Install
 
-The CLI needs **only Python 3.11+**. Pick a channel:
+The CLI needs **only Python 3.10+**. Pick a channel:
 
 ```bash
 pipx install "contextiq[all]"      # isolated global install (the npm -g / Volta equivalent)
@@ -42,8 +42,14 @@ docker run --rm -v "$PWD:/repo" -w /repo contextiq context "the task"
 
 The `[all]` extra pulls `tree-sitter-language-pack` (deep parsing for all 25+ languages),
 `fastmcp` (MCP `serve`), `tiktoken` (accurate token counts), and `sentence-transformers`.
-Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`. With zero extras the
+Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`, `[ann]`, and
+`[dashboard]`. With zero extras the
 single file still runs the full CLI (regex parsing + heuristic token counts).
+
+Set `TOKENGRAPH_OFFLINE=1` to disable remote configuration loading and optional
+neural-model loading. The deterministic hash embedding remains available. For large
+indexes, install `[ann]` and set `TOKENGRAPH_VECTOR_BACKEND=hnsw`; exact cosine remains
+the default and fallback.
 
 To ship binaries / publish, run `tokengraph dist` (CI release workflow, Dockerfile,
 Homebrew formula, `install.sh`) and `tokengraph freeze --build` for a local binary.
@@ -92,6 +98,7 @@ python tokengraph_all.py lines path/to/file.py 40 80    # exact line range (secr
 python tokengraph_all.py map imports                     # import graph (or: hierarchy | routes | hubs)
 python tokengraph_all.py map routes                      # HTTP endpoints (Flask/FastAPI/Express/Spring/Go)
 python tokengraph_all.py map hubs                        # fan-in/out ranking + import cycles
+python tokengraph_all.py import-scip index.scip.json     # add precise external REFERENCES edges
 
 # Decision support, gating, and cost control
 python tokengraph_all.py ask "the task" --json          # focused pack + intent/coverage/risk/cost
@@ -131,7 +138,9 @@ python tokengraph_all.py generate --adapter claude --adapter cursor  # write CLA
 python tokengraph_all.py generate --monorepo --adapter copilot       # per-package context for every nested manifest-detected package
 python tokengraph_all.py generate --each --adapter claude            # per immediate sub-directory (workspace of repos)
 python tokengraph_all.py ide-setup                       # one-command MCP wiring for VS Code / Cursor / Windsurf / Zed / Claude Code
+python tokengraph_all.py ide-setup --workspace-root repo-a --workspace-root repo-b  # multi-root wiring
 python tokengraph_all.py ide-plugin                      # scaffold installable plugins: VS Code .vsix / Neovim Lua / JetBrains
+python tokengraph_all.py dashboard                       # dashboard for the current --path ledger
 python tokengraph_all.py freeze --build                  # build a standalone binary now (PyInstaller)
 python tokengraph_all.py dist                            # scaffold release CI + Dockerfile + Homebrew formula + install.sh
 
@@ -286,7 +295,10 @@ python tokengraph_all.py freeze --build # build a standalone binary now (PyInsta
 python tokengraph_all.py dist          # CI release workflow + Dockerfile + Homebrew tap + install.sh + PUBLISHING.md
 ```
 
-`ide-setup` merges non-destructively into each editor's MCP config. `ide-plugin` emits real, installable plugin projects (the VS Code `extension.js` passes `node --check`). `dist` scaffolds everything needed to publish — see the generated `PUBLISHING.md` for the one-command-per-registry runbook (PyPI / VS Code / JetBrains / Homebrew).
+`ide-setup` merges non-destructively into each editor's MCP config and can repeat
+`--workspace-root` for multi-root workspaces. `ide-plugin` emits packageable plugin
+projects; it does not imply marketplace publication. `dist` scaffolds the separate
+publishing workflow.
 
 ---
 
@@ -456,7 +468,8 @@ source files ──parse──► symbols + edges + embeddings + summaries ─�
 
 - **Parse:** Python via stdlib `ast`; other languages via tree-sitter profiles or a conservative regex fallback. All paths emit the same `Symbol` / edge records, plus a per-symbol embedding and a per-file summary.
 - **Store:** SQLite + FTS5 (with a `LIKE` fallback) + a `vectors` table + a `summaries` table, WAL mode for safe concurrent read/reindex. Incremental: unchanged files (by mtime+size, then hash) are skipped.
-- **Edges:** `CALLS`, `INHERITS`, `IMPORTS`, and `DEFINES` (parent→child, which also answers "where is X defined"). Call/inherit resolution is best-effort and **scope-aware**: exact qname → **import-aware** (prefer the module a leaf was imported from) → **same enclosing scope** (a sibling in the same class/module — resolves intra-class `self.helper()` calls the old rule dropped) → same-file → unique global match, else dropped. The index report includes an `edge_resolution_pct` metric. Precise whole-program cross-references would need LSP/SCIP — the documented next step.
+- **Edges:** `CALLS`, `INHERITS`, `IMPORTS`, and `DEFINES` (parent→child, which also answers "where is X defined"). Call/inherit resolution is best-effort and **scope-aware**: exact qname → **import-aware** (prefer the module a leaf was imported from) → **same enclosing scope** (a sibling in the same class/module — resolves intra-class `self.helper()` calls the old rule dropped) → same-file → unique global match, else dropped. The index report includes an `edge_resolution_pct` metric.
+- **Precise references:** `import-scip` and the MCP `ingest_scip` tool consume JSON from `scip print --json`, map definition/reference occurrences to indexed symbols, and add `REFERENCES` edges used by context expansion and impact analysis. The built-in AST/tree-sitter resolver remains the zero-dependency fallback.
 - **Retrieve:** hybrid seed search (lexical + semantic, reciprocal-rank fused) → BFS over `CALLS`/`INHERITS` edges → tiered budget fill (full bodies → signatures → **module summaries** → indexed chunks → dropped-by-name).
 
 `.gitignore` is respected by default (a lightweight matcher; also skips `.git`, `node_modules`, `__pycache__`, `build`, `dist`, virtualenvs, etc.).
@@ -471,7 +484,11 @@ python -m pytest -q                              # or: python -m unittest tests.
 
 The suite lives in [tests/](tests/); `pyproject.toml` sets `pythonpath = ["."]` so the single-file `tokengraph_all` module stays importable from there.
 
-**120 tests, zero third-party deps.** Covers indexing, the incremental fast path, the freshen-on-query correctness guarantee (bodies stay aligned after lines shift), `.gitignore` handling, context budgeting, embeddings + semantic search, `DEFINES` edges, module summaries, scope-aware call resolution, token-savings measurement, input squeeze, answer verification, route/hub maps, the 25+ deep-parsed languages (call/inheritance/import edges per language), the grounded-creation pipeline (conventions/scaffold/verify-plan/verify-output/review/create), deterministic evidence packs, the hallucination benchmark, and the IDE-plugin / distribution scaffolding. A `diagnose-extractors` self-check validates every language extractor (`python tokengraph_all.py diagnose-extractors`).
+**131 tests.** The core suite uses only the standard library; optional integration
+tests exercise FastMCP when installed. Coverage includes incremental cross-file edge
+retention, hard serialized token budgets, offline/privacy behavior, targeted indexing,
+corpus benchmarking, multi-root editor wiring, real MCP client calls, dashboard ledger
+concurrency, language extractors, and the grounded-creation pipeline.
 
 ---
 
@@ -480,15 +497,14 @@ The suite lives in [tests/](tests/); `pyproject.toml` sets `pythonpath = ["."]` 
 Self-benchmark on **this repository** (5 files, 419 symbols, 881 edges):
 
 ```bash
-python tokengraph_all.py benchmark         # retrieval quality (hit@5 + MRR)
+python tokengraph_all.py benchmark         # corpus Recall@5, MRR, irrelevant-token ratio, latency
 python tokengraph_all.py measure "task"    # token savings vs reading files whole (single task)
 python tokengraph_all.py gain --all        # cumulative realized savings over time (tokens + $)
 ```
 
 | Metric | Value | How |
 |---|--:|---|
-| Retrieval hit@5 | **1.00** | `benchmark` over 100 symbol-name queries |
-| MRR | **0.90** | same run |
+| Retrieval quality | Repository-dependent | `benchmark` uses `benchmarks/retrieval_tasks.json` human-authored tasks |
 | Token savings (example task) | **95.9%** | pack ≈2,449 tok vs ≈59,678 tok reading the 3 referenced files whole |
 
 > These are this repo's own numbers; hit@5 is high because the project is a single

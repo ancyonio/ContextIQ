@@ -18,12 +18,15 @@ It reads the ledger directly, so no server or API layer is needed.
 
 from __future__ import annotations
 
-import json
+import argparse
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import plotly.graph_objects as go
 import streamlit as st
+from tokengraph_all import (gain_by_operation as by_op, gain_daily as daily,
+                            gain_totals as totals, read_gain_ledger)
 
 # Same pricing table tokengraph_all.py uses for its $ projection.
 PRICES_PER_1M: dict[str, float] = {
@@ -32,61 +35,13 @@ PRICES_PER_1M: dict[str, float] = {
     "gemini-1.5-pro": 1.25, "gemini-1.5-flash": 0.075,
 }
 RANGES = {"All time": None, "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}
-LEDGER = Path(__file__).parent / ".context" / "gain.ndjson"
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--path", default=".")
+_dashboard_args, _ = _parser.parse_known_args(sys.argv[1:])
+ROOT = Path(_dashboard_args.path).resolve()
+LEDGER = ROOT / ".context" / "gain.ndjson"
 LOGO = Path(__file__).parent / "ContextIQ.png"
 NAVY, BLUE, GREEN = "#1a2b4a", "#2f6fed", "#2e9e5b"  # brand navy/blue; green = savings
-
-
-# --- data helpers -----------------------------------------------------------
-def read_ledger(path: Path) -> list[dict]:
-    """Parse .context/gain.ndjson into a list of records (bad lines skipped)."""
-    rows: list[dict] = []
-    if not path.exists():
-        return rows
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue
-    return rows
-
-
-def totals(rows: list[dict]) -> dict:
-    """Roll a set of records up into headline numbers."""
-    saved = sum(int(r.get("saved", 0)) for r in rows)
-    baseline = sum(int(r.get("baseline_tokens", 0)) for r in rows)
-    final = sum(int(r.get("final_tokens", 0)) for r in rows)
-    return {
-        "runs": len(rows), "saved": saved, "baseline": baseline, "final": final,
-        "reduction_pct": round(saved / baseline * 100, 1) if baseline else 0.0,
-    }
-
-
-def by_op(rows: list[dict]) -> list[dict]:
-    """Aggregate saved tokens per operation, largest first."""
-    ops: dict[str, dict] = {}
-    for r in rows:
-        o = ops.setdefault(r.get("op", "?"), {"op": r.get("op", "?"), "saved": 0, "runs": 0})
-        o["saved"] += int(r.get("saved", 0))
-        o["runs"] += 1
-    return sorted(ops.values(), key=lambda x: x["saved"], reverse=True)
-
-
-def daily(rows: list[dict]) -> list[dict]:
-    """Bucket saved vs. sent tokens by UTC day, oldest first."""
-    days: dict[str, dict] = {}
-    for r in rows:
-        ts = float(r.get("ts", 0.0))
-        if not ts:
-            continue
-        key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        d = days.setdefault(key, {"day": key, "saved": 0, "final": 0})
-        d["saved"] += int(r.get("saved", 0))
-        d["final"] += int(r.get("final_tokens", 0))
-    return [days[k] for k in sorted(days)]
 
 
 def human(n: float) -> str:
@@ -133,7 +88,7 @@ with head_r:
 AUTO_REFRESH_SECONDS = 10  # how often the fragment below re-reads the ledger
 
 # --- sidebar (regular, non-fragment widgets trigger a full app rerun) -------
-_all_rows = read_ledger(LEDGER)
+_all_rows = read_gain_ledger(ROOT)
 if not _all_rows:
     st.warning(
         f"No ledger yet at `{LEDGER}`.\n\n"
@@ -163,7 +118,7 @@ with st.sidebar:
 # write to the sidebar, so the controls above stay outside this function.
 @st.fragment(run_every=AUTO_REFRESH_SECONDS)
 def render_dashboard(model: str, rng: str) -> None:
-    all_rows = read_ledger(LEDGER)
+    all_rows = read_gain_ledger(ROOT)
 
     if not all_rows:
         st.warning(

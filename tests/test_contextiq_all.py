@@ -9,6 +9,9 @@ freshen-on-query correctness guarantee (the bug that mis-sliced edited files),
 """
 from __future__ import annotations
 
+import json
+import os
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -126,6 +129,58 @@ class IndexerTests(unittest.TestCase):
         self.assertIn("def helper(x):", body)
         self.assertIn("return x * 2", body)
         self.assertNotIn("# new header line", body)  # not mis-sliced into the header
+
+    def test_incremental_edit_preserves_unchanged_cross_file_caller(self):
+        _write(self.root, "callee.py", "def target():\n    return 1\n")
+        _write(self.root, "caller.py",
+               "from callee import target\n\ndef call():\n    return target()\n")
+        tg.index_repo(self.root, self.db)
+
+        _write(self.root, "callee.py", "def target():\n    return 200\n")
+        rep = tg.index_repo(self.root, self.db)
+
+        store = tg.Store(self.db)
+        try:
+            caller_id = store.id_for_qname("caller.call")
+            callees = [r["qname"] for r in
+                       store.neighbors(caller_id, ["CALLS"], "out")]
+        finally:
+            store.close()
+        self.assertEqual(rep.parsed, 1)
+        self.assertIn("callee.target", callees)
+
+    def test_targeted_index_only_scans_notified_path(self):
+        _write(self.root, "first.py", "def first(): return 1\n")
+        _write(self.root, "second.py", "def second(): return 2\n")
+        tg.index_repo(self.root, self.db)
+        _write(self.root, "second.py", "def second(): return 200\n")
+        rep = tg.index_repo(self.root, self.db, paths=["second.py"])
+        self.assertEqual(rep.scanned, 1)
+        self.assertEqual(rep.parsed, 1)
+
+    def test_import_scip_adds_precise_reference_edge(self):
+        _write(self.root, "callee.py", "def target():\n    return 1\n")
+        _write(self.root, "caller.py", "def call():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        index = self.root / "index.scip.json"
+        index.write_text(json.dumps({"documents": [
+            {"relativePath": "callee.py", "occurrences": [
+                {"range": [0, 4, 0, 10], "symbol": "python pkg target().",
+                 "symbolRoles": 1}]},
+            {"relativePath": "caller.py", "occurrences": [
+                {"range": [1, 4, 1, 10], "symbol": "python pkg target().",
+                 "symbolRoles": 0}]}
+        ]}), encoding="utf-8")
+        result = tg.import_scip_json(self.root, self.db, index)
+        self.assertEqual(result["references_imported"], 1)
+        store = tg.Store(self.db)
+        try:
+            source_id = store.id_for_qname("caller.call")
+            references = [row["qname"] for row in
+                          store.neighbors(source_id, ["REFERENCES"], "out")]
+        finally:
+            store.close()
+        self.assertIn("callee.target", references)
 
     def test_gitignore_excludes_files_and_dirs(self):
         _write(self.root, "keep.py", "def kept(): return 1\n")
@@ -306,6 +361,78 @@ class SecurityUnitTests(unittest.TestCase):
     def test_redact_never_raises_on_empty(self):
         self.assertEqual(tg.redact_secrets(""), ("", 0))
 
+    def test_offline_mode_blocks_remote_config(self):
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.dict(os.environ, {"TOKENGRAPH_OFFLINE": "1"}):
+                with unittest.mock.patch("urllib.request.urlopen") as urlopen:
+                    self.assertEqual(
+                        tg._load_extends("https://example.invalid/config.json", Path(tmp)),
+                        {})
+                    urlopen.assert_not_called()
+
+    def test_gain_ledger_helpers_skip_bad_lines_and_aggregate(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / ".context" / "gain.ndjson"
+            ledger.parent.mkdir()
+            ledger.write_text(
+                '{"ts": 1, "op": "context", "saved": 80, '
+                '"baseline_tokens": 100, "final_tokens": 20}\nnot-json\n',
+                encoding="utf-8")
+            rows = tg.read_gain_ledger(root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(tg.gain_totals(rows)["reduction_pct"], 80.0)
+            self.assertEqual(tg.gain_by_operation(rows)[0]["op"], "context")
+            self.assertEqual(len(tg.gain_daily(rows)), 1)
+
+    def test_gain_ledger_concurrent_writes_remain_valid(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            threads = [threading.Thread(
+                target=tg.track_gain,
+                args=(root, {"op": "context", "saved": 1,
+                             "baseline_tokens": 2, "final_tokens": 1}))
+                for _ in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(len(tg.read_gain_ledger(root)), 20)
+
+
+class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_client_lists_tools_and_observes_edits(self):
+        try:
+            from fastmcp import Client  # type: ignore[import-not-found]
+        except ImportError:
+            self.skipTest("fastmcp optional dependency is not installed")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / ".tokengraph" / "graph.db"
+            source = _write(root, "service.py",
+                            "def status():\n    return 'before'\n")
+            tg.index_repo(root, db)
+            server = tg.build_mcp_server(root, db)
+
+            async with Client(server) as client:
+                tools = await client.list_tools()
+                names = {tool.name for tool in tools}
+                self.assertIn("find_relevant_context", names)
+                self.assertIn("get_symbol", names)
+
+                before = await client.call_tool(
+                    "get_symbol", {"qname": "service.status"})
+                self.assertFalse(before.is_error)
+                self.assertIn("'before'", before.data)
+
+                source.write_text(
+                    "def status():\n    return 'after-edit'\n", encoding="utf-8")
+                after = await client.call_tool(
+                    "get_symbol", {"qname": "service.status"})
+                self.assertFalse(after.is_error)
+                self.assertIn("'after-edit'", after.data)
+
 
 class IntentRoutingUnitTests(unittest.TestCase):
     def test_intent_detection(self):
@@ -370,6 +497,33 @@ class RetrieverFeatureTests(unittest.TestCase):
         self.assertIn("def helper", body)
         escaped = self.ret.get_lines("../outside.txt", 1, 5)
         self.assertIn("refused", escaped)
+
+    def test_skeleton_and_summary_redact_secrets(self):
+        _write(self.root, "credentials.py",
+               '"""password = "summary-secret"""\n\n'
+               'def connect(password="function-secret"):\n'
+               '    """password = "docstring-secret"""\n'
+               '    return password\n')
+        tg.index_repo(self.root, self.db)
+        skeleton = self.ret.file_skeleton("credentials.py")
+        summary = self.ret.module_summary("credentials.py")
+        for output in (skeleton, summary):
+            self.assertIn("[REDACTED]", output)
+            self.assertNotIn("function-secret", output)
+
+    def test_context_budget_includes_markdown_envelope(self):
+        pack = self.ret.find_relevant_context("helper run caller", budget_tokens=160)
+        self.assertLessEqual(tg.count_tokens(pack.to_markdown()), 160)
+
+    def test_corpus_benchmark_reports_quality_waste_and_latency(self):
+        result = tg.run_retrieval_benchmark(self.ret, [{
+            "task": "double a number using the shared helper",
+            "expected_files": ["lib.py"],
+        }])
+        self.assertEqual(result["queries"], 1)
+        self.assertIn("recall_at_5", result)
+        self.assertIn("irrelevant_token_ratio", result)
+        self.assertGreaterEqual(result["mean_latency_ms"], 0)
 
     def test_get_lines_redacts(self):
         _write(self.root, "secret.py",
@@ -1417,6 +1571,19 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         self.assertIn("other", cfg["servers"])
         self.assertIn("tokengraph", cfg["servers"])
 
+    def test_ide_setup_wires_each_multi_root_folder(self):
+        first = self.root / "workspace-one"
+        second = self.root / "workspace-two"
+        first.mkdir()
+        second.mkdir()
+        res = tg.ide_setup(self.root, editors=["vscode"],
+                           workspace_roots=[first, second])
+        self.assertEqual(len(res["workspace_roots"]), 2)
+        for folder in (first, second):
+            config = json.loads(
+                (folder / ".vscode" / "mcp.json").read_text("utf-8"))
+            self.assertIn("tokengraph", config["servers"])
+
     # ---- IDE integration: real installable plugin artifacts ----
     def test_emit_ide_plugins_writes_installable_artifacts(self):
         import json
@@ -1428,6 +1595,10 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         self.assertEqual(pkg["main"], "./extension.js")
         self.assertGreaterEqual(len(pkg["contributes"]["commands"]), 4)
         self.assertTrue((base / "vscode" / "extension.js").exists())
+        extension = (base / "vscode" / "extension.js").read_text("utf-8")
+        self.assertIn("cp.execFile", extension)
+        self.assertIn("getWorkspaceFolder", extension)
+        self.assertNotIn("cp.exec(", extension)
         # Neovim Lua plugin: module + command registration
         self.assertTrue((base / "nvim" / "lua" / "contextiq" / "init.lua").exists())
         self.assertIn("nvim_create_user_command",

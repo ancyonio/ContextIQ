@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "description": "Human-authored ContextIQ repository tasks. Queries intentionally avoid expected symbol names where practical.",
+  "cases": [
+    {
+      "task": "keep caller relationships intact when only the called file changes during an incremental refresh",
+      "expected_files": ["tokengraph_all.py"]
+    },
+    {
+      "task": "connect an AI client to the local code graph over the model context protocol",
+      "expected_files": ["tokengraph_all.py"]
+    },
+    {
+      "task": "show cumulative prompt token savings and cost estimates as interactive charts",
+      "expected_files": ["dashboard.py"]
+    },
+    {
+      "task": "verify that repository AI configuration files point to valid local resources",
+      "expected_files": ["tools/validate_ai_config.py"]
+    },
+    {
+      "task": "test editor configuration generation for several development environments",
+      "expected_files": ["tests/test_contextiq_all.py"]
+    },
+    {
+      "task": "declare optional packages for parsing languages, serving MCP, and accurate token counts",
+      "expected_files": ["pyproject.toml"]
+    },
+    {
+      "task": "explain practical techniques for reducing context consumed by coding assistants",
+      "expected_files": ["docs/TokenEfficiency.md"]
+    },
+    {
+      "task": "compare this graph retriever with the predecessor across capabilities and maturity",
+      "expected_files": ["docs/Comparison.md"]
+    },
+    {
+      "task": "instruct GitHub Copilot to use graph retrieval before opening complete files",
+      "expected_files": [".github/copilot-instructions.md"]
+    },
+    {
+      "task": "install and configure the local graph tool for a new repository",
+      "expected_files": ["README.md"]
+    }
+  ]
+}

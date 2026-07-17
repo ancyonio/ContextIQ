@@ -16,11 +16,21 @@ env/
 venv/
 ENV/
 
-# tokengraph
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# tokengraph runtime state (rebuildable caches / local ledgers)
 .tokengraph/
+.context/
+
+# Generated editor plugin scaffolds (produced by `ide-plugin`)
+ide-plugins/
 
 # IDEs
 .vscode/
+!.vscode/mcp.json
 .idea/
 
 # OS

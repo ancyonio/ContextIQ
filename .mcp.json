@@ -2,10 +2,14 @@
   "mcpServers": {
     "tokengraph": {
       "type": "stdio",
-      "command": "tokengraph",
+      "command": "python",
       "args": [
+        "tokengraph_all.py",
         "serve"
-      ]
+      ],
+      "env": {
+        "TOKENGRAPH_ROOT": "."
+      }
     }
   }
 }

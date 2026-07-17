@@ -2,7 +2,7 @@
 
 > Source-verified comparison of **Sigmap** (`testmap/`, `gen-context.js`, v7.28.0) and
 > **ContextIQ** (`tokengraph_all.py`, registered as `tokengraph`).
-> Last validated: 2026-06-24 — counts read directly from each codebase, not estimated.
+> Last validated: 2026-07-17 — counts read directly from each codebase, not estimated.
 >
 > **ContextIQ % complete** = maturity of ContextIQ's implementation of that dimension (100% = fully shipped & tested).
 > **Better** = which tool currently leads on that dimension (Tie = at parity).
@@ -14,15 +14,15 @@
 | Metric | Sigmap v7.28 | ContextIQ | Source |
 |---|--:|--:|---|
 | Main-file LOC | 20,826 (`gen-context.js`) | **8,379** (`tokengraph_all.py`) | `wc -l` |
-| Tests | 103 | **120** | `version.json` / `pytest --collect-only` |
-| MCP tools | 17 | **39** | `src/mcp/tools.js` / `grep -c '@mcp.tool'` |
-| CLI commands | ~27 subcommands (+~13 flag-ops) | **53 subcommands** | dispatch / `--help` |
+| Tests | 103 | **131** | `version.json` / `pytest --collect-only` |
+| MCP tools | 17 | **45** | `src/mcp/tools.js` / FastMCP client discovery |
+| CLI commands | ~27 subcommands (+~13 flag-ops) | **56 subcommands** | dispatch / `--help` |
 | Output adapters | 8 (+`llm-full`) | 8 | `packages/adapters` / `ADAPTERS` dict |
 | Languages (total) | 33 | **55+** | `version.json` / `langs` |
 | Deep-parsed (AST) languages | 1 (Python AST; rest regex) | **25+** (tree-sitter) | extractor dispatch / profiles |
 | Storage | JSON cache (`.sigmap-cache.json`) | **SQLite + FTS5 + vectors** | source |
 | Embeddings | none | hash-embed default; optional `sentence-transformers` | source |
-| Retrieval hit@5 (self) | 75.6% (21-repo study) | 1.00 (single dense module) | benchmarks |
+| Retrieval evaluation | 75.6% hit@5 (21-repo study) | corpus Recall@5/MRR/waste/latency | benchmarks |
 | Token reduction (example) | 97.0% (21-repo mean) | 95.1% (this-repo example) | `measure` |
 | Hallucination reduction | 99.6% (LLM-measured, published) | reproducible multi-repo modelled benchmark | source |
 
@@ -118,10 +118,10 @@ revision of this document.)*
 | **Embeddings** | none (no drift) | hash default; optional sentence-transformers | 100% | ContextIQ |
 | **Storage** | JSON cache | SQLite + FTS5 + vectors (WAL) | 100% | ContextIQ |
 | **Freshness** | mtime cache; `--watch` | auto-reindex per query; `watch` daemon | 100% | ContextIQ |
-| **MCP server** | 17 tools | **39 tools** | 100% | ContextIQ |
+| **MCP server** | 17 tools | **45 tools** | 100% | ContextIQ |
 | **MCP clients** | Claude Code, Cursor | Claude Code, GitHub Copilot (agent mode) | 100% | Tie |
 | **Multi-adapter output** | 8 (+llm-full) | 8 | 100% | Tie |
-| **CLI commands** | ~27 subcommands | **53 subcommands** | 100% | ContextIQ |
+| **CLI commands** | ~27 subcommands | **56 subcommands** | 100% | ContextIQ |
 | **Call graph / impact** | import-graph + regex-derived | true AST call/inherit/import edges, scope-aware | 100% | ContextIQ |
 | **Token budgeting** | ✅ | ✅ tiered assembly | 100% | Tie |
 | **Memory / checkpoints** | ✅ | ✅ | 100% | Tie |
