@@ -7,12 +7,13 @@ A local, single-file **AST code graph** that gives AI coding agents token-effici
 The graph **auto-refreshes on every query**, so it never goes stale — even right after an edit.
 
 - **One file, zero required dependencies** to run the CLI ([tokengraph_all.py](tokengraph_all.py)).
-- Works as an **MCP server** (45 tools) for MCP-capable clients, with one-command wiring for VS Code / Cursor / Windsurf / Zed / Claude Code and locally generated plugin projects for VS Code / Neovim / JetBrains. Marketplace publication remains a separate release step.
+- Works as an **MCP server** (50 tools) for MCP-capable clients, with one-command wiring for VS Code / Cursor / Windsurf / Zed / Claude Code and locally generated plugin projects for VS Code / Neovim / JetBrains. Marketplace publication remains a separate release step.
 - **Deep parsing with a full call / import / inheritance graph for 25+ languages** — **Python** (stdlib `ast`) and, via tree-sitter, **Java / Go / TypeScript / JavaScript / C / C++ / C# / Rust / PHP / Ruby / Kotlin / Swift / Scala / Lua / Bash / Solidity / Perl / Erlang / Julia / R / Haskell / OCaml / Nim / PowerShell / Dart**. Plus lightweight regex indexing for **30+ more languages** — SQL / Elixir / Clojure / F# / Groovy / Zig / Crystal / Haxe / Objective-C / Visual Basic / Tcl / Pascal / GDScript and markup/config (Vue, Svelte, HTML, CSS, YAML, TOML, XML, INI, GraphQL, Terraform, Protobuf, **Markdown**, Dockerfile, …). Every deep-parsed language falls back to regex when its grammar isn't installed. Run `python tokengraph_all.py langs` to list them all.
 - **Grounded creation & guardrails** — close the loop from *retrieval* to *safe code generation*: detect house **`conventions`** (and **`conventions --fix`** to auto-rename outliers to house style), **`scaffold`** convention-matched files, **`verify-plan`** / **`verify-output`** to flag fabricated files / symbols / local imports, **`review`** a diff for scope-drift, hub-edits, missing tests and breaking changes, and **`create`** to orchestrate them through a gated pipeline.
 - **Realized-savings ledger** — every `context` / `ask` / `measure` / `generate` call (and the MCP context tool) appends its pack-vs-whole-file delta to a privacy-safe, count-only ledger. **`gain`** rolls it up into a token + **dollar** report with `--since` windows, per-op breakdown, daily/weekly/monthly trends, and a self-contained **`--html`** dashboard. **`status`** gives a one-line repo snapshot (branch / dirty / index freshness / notes / cumulative savings).
 - **Monorepo-aware** — **`generate --monorepo`** discovers every nested package by manifest and writes per-package context; **`--each`** does the same per immediate sub-directory.
 - **Auditable & measurable** — deterministic, hash-grounded **`evidence`** packs for CI, and a reproducible multi-repo **`hallucination`** reduction benchmark.
+- **Cost & context optimization** — **model-aware token counting** and pre-flight **`cost`** estimation (input+output USD across **GPT / Claude / Gemini / Llama**, `--compare` to pick the cheapest sufficient model), **`prompt-score`** to catch under-specified prompts before they burn a round-trip, automatic **context deduplication** in every pack (plus **`dedupe`** for ad-hoc blocks), and **`summarize-chat`** to compress a long session into a token-cheap brief. All deterministic and local.
 
 ---
 
@@ -25,7 +26,7 @@ The graph **auto-refreshes on every query**, so it never goes stale — even rig
 | Risk of stale understanding after edits | Graph re-indexes incrementally before every query |
 | Savings are invisible / unprovable | Every retrieval appends to a savings ledger; `gain` reports tokens + dollars saved over time |
 
-A context pack contains: relevant symbols (full body when small, signature when large), their callers/callees/base classes as signatures, matching indexed source chunks, and a list of anything dropped for budget so the agent can request it by name.
+A context pack contains: relevant symbols (full body when small, signature when large), their callers/callees/base classes as signatures, matching indexed source chunks, and a list of anything dropped for budget so the agent can request it by name. Near-duplicate pieces (e.g. an indexed chunk that merely re-shows a symbol body already in the pack) are removed automatically and reported under `deduped`.
 
 ---
 
@@ -85,7 +86,8 @@ python tokengraph_all.py measure "add retry logic"     # token savings vs whole 
 python tokengraph_all.py report --tasks-file tasks.txt -o report.md --csv report.csv  # aggregate with/without report
 python tokengraph_all.py gain                           # realized savings from the ledger (tokens + $)
 python tokengraph_all.py gain --since 30d --all         # window + daily/weekly/monthly trends
-python tokengraph_all.py gain --model claude-opus --html gain.html  # dollar projection + HTML dashboard
+python tokengraph_all.py gain --report                  # per-workspace dashboard -> .tokengraph/token-usage.html
+python tokengraph_all.py gain --serve                   # live dashboard on 127.0.0.1 (no Streamlit/deps)
 python tokengraph_all.py status                         # one-line repo snapshot (branch/index/savings)
 python tokengraph_all.py stats                          # graph counts
 python tokengraph_all.py langs                          # parseable languages
@@ -109,6 +111,13 @@ cat build.log | python tokengraph_all.py squeeze        # shrink a pasted stackt
 python tokengraph_all.py suggest-tool "the task"        # model-tier hint (fast/balanced/powerful)
 python tokengraph_all.py routing                         # per-file model-tier hints
 python tokengraph_all.py learn path/to/file.py          # reinforce a file (--bad to penalise)
+
+# Cost, prompt quality, dedup, and session compression
+python tokengraph_all.py cost --text "the prompt" --model claude-sonnet --output-tokens 800  # $ before you send
+python tokengraph_all.py cost --text-file prompt.txt --compare   # rank GPT/Claude/Gemini/Llama cheapest-first
+python tokengraph_all.py prompt-score --text "fix the retry logic in count_tokens"  # rate a prompt 0–100 + tips
+cat snippets.txt | python tokengraph_all.py dedupe --threshold 0.8  # drop near-duplicate context blocks
+python tokengraph_all.py summarize-chat --text-file session.txt --max-tokens 400   # compress a chat transcript
 
 # Grounded creation: retrieval -> safe code generation
 python tokengraph_all.py conventions                     # detect file-naming / per-dir / test / export style + conformance
@@ -140,7 +149,6 @@ python tokengraph_all.py generate --each --adapter claude            # per immed
 python tokengraph_all.py ide-setup                       # one-command MCP wiring for VS Code / Cursor / Windsurf / Zed / Claude Code
 python tokengraph_all.py ide-setup --workspace-root repo-a --workspace-root repo-b  # multi-root wiring
 python tokengraph_all.py ide-plugin                      # scaffold installable plugins: VS Code .vsix / Neovim Lua / JetBrains
-python tokengraph_all.py dashboard                       # dashboard for the current --path ledger
 python tokengraph_all.py freeze --build                  # build a standalone binary now (PyInstaller)
 python tokengraph_all.py dist                            # scaffold release CI + Dockerfile + Homebrew formula + install.sh
 
@@ -203,7 +211,7 @@ Three layers, in order of how aggressively they keep the graph current:
 
 Optimizing tokens only matters if you can *prove* it. ContextIQ keeps a running, privacy-safe ledger of realized savings and turns it into a token + dollar report.
 
-**How it accumulates.** Every retrieval — the CLI `context` / `ask` / `measure` / `generate` commands and the MCP `find_relevant_context` tool — appends one line to `.context/gain.ndjson` with its pack size, the whole-file baseline, the delta, and a timestamp. The lines are **count-only**: never a path, a query, or any source. Opt a single run out with `--no-track`, or disable globally with `TOKENGRAPH_NO_TRACK=1` (`SIGMAP_NO_TRACK=1` also honored).
+**How it accumulates.** Every retrieval — the CLI `context` / `ask` / `measure` / `generate` commands and the MCP `find_relevant_context` tool — appends one line to `.context/gain.ndjson` with its pack size, the whole-file baseline, the delta, and a timestamp. The token-reducing tools (`squeeze` / `dedupe` / `summarize-chat`) log their own before→after delta the same way. Only genuine savings are recorded (a run that doesn't reduce anything is skipped). The lines are **count-only**: never a path, a query, or any source. Opt a single run out with `--no-track`, or disable globally with `TOKENGRAPH_NO_TRACK=1` (`SIGMAP_NO_TRACK=1` also honored).
 
 ```bash
 python tokengraph_all.py gain                       # totals: tokens saved, reduction %, $ projection, per-op table
@@ -211,9 +219,27 @@ python tokengraph_all.py gain --since 7d            # window the ledger (7d / 12
 python tokengraph_all.py gain --all                 # add daily/weekly/monthly trend buckets + a sparkline
 python tokengraph_all.py gain --model claude-opus   # price the saved tokens against a specific model
 python tokengraph_all.py gain --top 5 --json        # machine-readable rollup for CI / spreadsheets
-python tokengraph_all.py gain --html gain.html      # self-contained HTML dashboard (inline SVG, zero deps)
+python tokengraph_all.py gain --report              # write .tokengraph/token-usage.html for this workspace
+python tokengraph_all.py gain --serve               # live dashboard on 127.0.0.1 (no Streamlit, no deps)
+python tokengraph_all.py gain --html gain.html      # same report, written to a path you choose
 python tokengraph_all.py gain --reset               # clear the ledger
 ```
+
+### The per-workspace dashboard: `.tokengraph/token-usage.html`
+
+Because `.tokengraph/` is created in **every** workspace you use ContextIQ in, each one carries its own dashboard next to its own graph. It is **regenerated automatically on every logged op**, so it is always current — just open it.
+
+- **Zero dependencies, fully self-contained.** All CSS/JS/charts are inlined; no CDN, no network, no server. Double-click the file and it works offline, in any client.
+- **Six sections, all from the local ledger + graph** — *Overview* (hero cost avoided, a reduction gauge, and scorecards for saved / **sent (consumed)** / cost of tokens sent / reduction / runs / baseline / avg per run / leverage / files covered), *Savings* (baseline → avoided → sent waterfall, a stacked avoided-&-sent trend, and a 26-week activity heatmap), *Operations* (tokens avoided by op, share of runs, and a per-op table), *Cost by model* (the same token counts priced against every model, input **and** output list prices), *Workspace* (files / symbols / edges / chunks / summaries / graph size and a language breakdown), and the raw *Activity log*.
+- **Enterprise UI, built in** — design tokens for color/type/space, light **and** dark themes (OS setting plus a toggle that overrides it), WCAG-minded markup (skip link, labelled controls, `aria-live` status, `scope`d table headers, visible focus rings, reduced-motion support), skeleton loading and explicit empty states, and a responsive layout down to phone width. No numbers are shown that the ledger did not record.
+- **Interactive without a server** — the pricing-model and date-range selectors re-filter an inlined snapshot client-side, so switching to `claude-opus` or "last 7 days" works from `file://`.
+- **Live two ways.** Served (`gain --serve`) the page polls `/data.json` and redraws in place. Opened as a file it reloads periodically to pick up the rewritten snapshot — the page detects which mode it is in and shows a `live` or `snapshot` badge.
+
+```bash
+python tokengraph_all.py gain --serve --port 8787   # http://127.0.0.1:8787 (loopback only)
+```
+
+> **`dashboard.py` (Streamlit) has been removed.** The report above replaces it and shows strictly more, with no `streamlit`/`plotly` install and no server process. The `dashboard` subcommand remains only as a signpost to `gain --report` / `gain --serve`.
 
 Example:
 
@@ -233,6 +259,7 @@ savings (all time): 209,426 tokens saved across 2 run(s)  (96.1% reduction)
 python tokengraph_all.py status
 # branch=main  dirty=3  indexed=15 files / 676 symbols  index=1m ago
 # notes=2  savings=209,426 tok over 2 run(s)
+# report=/path/to/repo/.tokengraph/token-usage.html
 ```
 
 The same realized rollup is available to agents via the **`savings_ledger`** MCP tool, and `health` grades the project off the same `usage.ndjson` trend.
@@ -367,6 +394,11 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 | `estimate_savings(task)` | Tokens in the pack vs. reading the referenced files whole (single what-if) |
 | `savings_report(tasks)` | Aggregate with/without savings across many tasks |
 | `savings_ledger(since="", model="claude-sonnet", top=0)` | **Realized** savings from the persistent ledger: totals, reduction %, per-op breakdown, dollar projection, and daily/weekly/monthly trends |
+| `estimate_call_cost(prompt, model="claude-sonnet", expected_output_tokens=500, compare=False)` | Price an API call **before** sending it — model-aware input+output USD; `compare=True` ranks GPT/Claude/Gemini/Llama cheapest-first |
+| `count_tokens_model(text, model="gpt-4o")` | Model-aware token count across the GPT / Claude / Gemini / Llama tokenizer families |
+| `score_prompt_quality(prompt)` | Score a **prompt** 0–100 on clarity / specificity / context / actionability, with concrete fix suggestions (distinct from `judge`, which scores an *answer*) |
+| `dedupe_context(blocks, threshold=0.8)` | Remove near-duplicate context snippets (packs are already deduped automatically; this is for ad-hoc blocks) |
+| `summarize_chat(transcript, max_tokens=400)` | Compress a chat transcript into a token-cheap brief — decisions, action items, open questions, code entities touched |
 | `reindex()` | Force a full rescan (auto-refresh already runs per call) |
 
 **Grounded creation & guardrails** (retrieval → safe code generation):
@@ -383,6 +415,15 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 | `hallucination_benchmark(sample_per_repo=40, baseline_per_100=99.8)` | Reproducible multi-repo codebase-fact hallucination-reduction benchmark (no LLM) |
 
 > **Privacy:** all output is secret-scanned (AWS/GitHub/JWT/DB-URL/SSH/GCP/Stripe/Twilio/Slack + generic password patterns redacted to `[REDACTED]`). Memory, checkpoints, and learning weights never leave the repo.
+
+### How the cost & context-optimization tools behave
+
+All five are **deterministic and local** (no LLM, no network). Their heuristics are tuned deliberately — know the trade-offs:
+
+- **`estimate_call_cost` / `count_tokens_model`** — token counts use tiktoken's `cl100k_base` corrected by a per-family ratio (GPT/Claude 1.00, Gemini 0.98, **Llama 1.10**), so a Llama call reports a few more tokens than the GPT/Claude base for the same text. Prices are **list-price constants** in `MODEL_PRICES_PER_1M` ([tokengraph_all.py](tokengraph_all.py)) — update them there when a provider changes pricing. Cost is usually dominated by `expected_output_tokens`, not the prompt.
+- **`dedupe_context`** (and the automatic per-pack dedup) — uses **5-gram shingle containment**, precision-over-recall: it reliably collapses exact / near-exact repeats and keeps the *longest* variant as canonical, but it will **not** merge heavy paraphrases (that would need embeddings). Lower `threshold` (default `0.8`) for looser matching.
+- **`summarize_chat`** — extractive and recall-favoring: it would rather over-capture a decision than miss one, so the "Decisions" bucket can include the odd question. It nets real savings only on **genuinely long** transcripts — on a short one the section scaffolding can cost more than it saves.
+- **`score_prompt_quality`** — scores a *prompt* (not an answer) on clarity / specificity / context / actionability; a low score comes with concrete fix suggestions. Complements `judge`, which scores whether an *answer* is grounded.
 
 ---
 

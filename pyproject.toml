@@ -35,7 +35,6 @@ Issues = "https://github.com/contextiq/contextiq/issues"
 mcp = ["fastmcp"]
 embeddings = ["sentence-transformers"]
 ann = ["hnswlib", "numpy"]
-dashboard = ["streamlit", "plotly"]
 tokens = ["tiktoken"]
 # 5 solo grammars (deep parse without the full pack)
 treesitter = [
@@ -64,7 +63,7 @@ tokengraph = "tokengraph_all:main"
 contextiq = "tokengraph_all:main"
 
 [tool.setuptools]
-py-modules = ["tokengraph_all", "dashboard"]
+py-modules = ["tokengraph_all"]
 
 [tool.pytest.ini_options]
 # keep the single-file module importable now that the suite lives in tests/

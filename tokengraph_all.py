@@ -96,6 +96,40 @@ def count_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+# Model-aware token counting (MA-1). tiktoken's cl100k_base is exact for
+# OpenAI/Copilot tokenizers and a good proxy for the others; these ratios
+# correct the base count toward each family's real tokenizer (Claude/Gemini
+# pack ~a bit more text per token; Llama's SentencePiece a bit less). Values
+# are empirical multipliers over the cl100k count, keyed by model *family*.
+MODEL_TOKEN_RATIOS: dict[str, float] = {
+    "gpt": 1.00, "claude": 1.00, "gemini": 0.98, "llama": 1.10,
+}
+
+
+def model_family(model: str) -> str:
+    """Map a concrete model name to a tokenizer/pricing family."""
+    m = (model or "").lower()
+    if "claude" in m or "anthropic" in m or m in ("opus", "sonnet", "haiku"):
+        return "claude"
+    if "gemini" in m or "bison" in m or "palm" in m:
+        return "gemini"
+    if "llama" in m or "codellama" in m or "mistral" in m or "mixtral" in m:
+        return "llama"
+    return "gpt"                                  # gpt-* / default
+
+
+def count_tokens_for_model(text: str, model: str = "gpt-4o") -> int:
+    """Token count adjusted for a specific model's tokenizer family (MA-1).
+
+    Bridges the four families the router advertises (GPT/Claude/Gemini/Llama)
+    from the single cl100k base count, so budgeting/costing is model-aware
+    without shipping four tokenizers.
+    """
+    base = count_tokens(text)
+    ratio = MODEL_TOKEN_RATIOS.get(model_family(model), 1.0)
+    return max(1, round(base * ratio))
+
+
 # Per-file signature cap (FR-2a): bound worst-case token cost so a single huge
 # file can never dominate emitted context. Applied at the rendering layer
 # (file_skeleton / read_context / generated context), NOT at parse time — the
@@ -3178,17 +3212,17 @@ def _tier_info(tier: str, task: str = "", file: str = "") -> dict:
     table = {
         "fast": {
             "tier": "fast", "cost_hint_per_1k": 0.0008,
-            "models": ["claude-haiku", "gpt-4o-mini", "gemini-flash"],
+            "models": ["claude-haiku", "gpt-4o-mini", "gemini-flash", "llama-3.1-8b"],
             "use_for": "config/markup/typos/simple lookups",
         },
         "balanced": {
             "tier": "balanced", "cost_hint_per_1k": 0.003,
-            "models": ["claude-sonnet", "gpt-4o", "gemini-pro"],
+            "models": ["claude-sonnet", "gpt-4o", "gemini-pro", "llama-3.1-70b"],
             "use_for": "features/tests/debugging",
         },
         "powerful": {
             "tier": "powerful", "cost_hint_per_1k": 0.015,
-            "models": ["claude-opus", "gpt-5", "gemini-ultra"],
+            "models": ["claude-opus", "gpt-5", "gemini-ultra", "llama-3.1-405b"],
             "use_for": "architecture/security/multi-file refactors",
         },
     }
@@ -3636,6 +3670,297 @@ def _fence(file: str) -> str:
     return _FENCE.get(splitext(file)[1].lower(), "")
 
 
+# ==========================================================================
+# context deduplication (DD-1) — drop pieces/blocks whose content is already
+# covered, so the same code isn't paid for twice in a pack or a prompt.
+# ==========================================================================
+def _dedup_shingles(text: str, k: int = 5) -> set:
+    """Set of k-gram token shingles for near-duplicate detection."""
+    toks = _tokenize(text)
+    if len(toks) < k:
+        return frozenset([" ".join(toks)]) if toks else frozenset()
+    return frozenset(" ".join(toks[i:i + k]) for i in range(len(toks) - k + 1))
+
+
+def _dedup_similarity(a: set, b: set) -> float:
+    """Containment score: fraction of the smaller shingle set covered by the other.
+
+    Containment (not Jaccard) so a short excerpt fully inside a larger body
+    scores ~1.0 even though their sizes differ wildly.
+    """
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / min(len(a), len(b))
+
+
+def dedupe_blocks(blocks: list[str], threshold: float = 0.8) -> dict:
+    """Remove near-duplicate text blocks, keeping the first (longest-wins) copy.
+
+    General-purpose context dedup: feed a list of retrieved snippets / tool
+    outputs / pasted context and get back only the non-redundant ones plus the
+    token saving. Deterministic, order-stable (longer blocks are preferred as
+    the canonical copy). See also the automatic per-pack dedup in
+    find_relevant_context.
+    """
+    indexed = sorted(enumerate(blocks), key=lambda it: -len(it[1] or ""))
+    kept: list[tuple[int, str, set]] = []
+    removed: list[dict] = []
+    for idx, text in indexed:
+        shingles = _dedup_shingles(text or "")
+        dup_of = None
+        for kidx, _ktext, kshingles in kept:
+            if _dedup_similarity(shingles, kshingles) >= threshold:
+                dup_of = kidx
+                break
+        if dup_of is None:
+            kept.append((idx, text, shingles))
+        else:
+            removed.append({"index": idx, "duplicate_of": dup_of})
+    kept_order = [text for idx, text, _ in sorted(kept, key=lambda it: it[0])]
+    before = sum(count_tokens(b or "") for b in blocks)
+    after = sum(count_tokens(b or "") for b in kept_order)
+    return {
+        "kept": kept_order,
+        "removed": removed,
+        "input_blocks": len(blocks),
+        "kept_blocks": len(kept_order),
+        "tokens_before": before,
+        "tokens_after": after,
+        "tokens_saved": before - after,
+        "reduction_pct": round((before - after) / before * 100.0, 1) if before else 0.0,
+    }
+
+
+def _dedupe_pieces(pieces: list["Piece"], threshold: float = 0.8) -> tuple[list, list]:
+    """Drop pack pieces whose text is near-duplicate of an earlier, kept piece.
+
+    Preserves pack priority order (seeds before neighbors before chunks), so an
+    indexed chunk that merely re-shows a body already in the pack is removed,
+    not the other way round. Returns (kept_pieces, removed_qnames).
+    """
+    kept: list[Piece] = []
+    kept_shingles: list[set] = []
+    removed: list[str] = []
+    for p in pieces:
+        shingles = _dedup_shingles(p.text or "")
+        if any(_dedup_similarity(shingles, ks) >= threshold for ks in kept_shingles):
+            removed.append(p.qname)
+            continue
+        kept.append(p)
+        kept_shingles.append(shingles)
+    return kept, removed
+
+
+# ==========================================================================
+# prompt quality scoring (PQ-1) — rate a *prompt* (not an answer) on clarity,
+# specificity, context and actionability, with concrete fix suggestions.
+# Deterministic and local; complements judge() which scores answer grounding.
+# ==========================================================================
+_PQ_ACTION_VERBS = {
+    "add", "fix", "implement", "refactor", "explain", "remove", "delete",
+    "optimize", "optimise", "test", "write", "create", "update", "debug",
+    "review", "rename", "migrate", "document", "compare", "analyze", "analyse",
+    "build", "generate", "find", "trace", "summarize", "summarise", "improve",
+}
+_PQ_VAGUE_TERMS = {
+    "something", "somehow", "stuff", "things", "etc", "whatever", "some",
+    "maybe", "kinda", "sort", "nice", "good", "better", "properly", "correctly",
+}
+
+
+def score_prompt(prompt: str) -> dict:
+    """Score a prompt's quality 0–100 on four axes, with suggestions (PQ-1).
+
+    Axes: clarity (concrete vs vague wording), specificity (code identifiers /
+    file paths / quoted terms), context (references the code it's about), and
+    actionability (a clear verb/ask). Deterministic — no LLM. Use it to catch
+    under-specified prompts before they burn a round-trip on a vague answer.
+    """
+    import re
+    text = (prompt or "").strip()
+    words = text.split()
+    n = len(words)
+    lower = text.lower()
+    toks = _tokenize(text)
+
+    # --- clarity: penalise vague filler and extreme length; reward focus ---
+    vague_hits = sum(1 for w in toks if w in _PQ_VAGUE_TERMS)
+    clarity = 100.0
+    clarity -= vague_hits * 15
+    if n < 3:
+        clarity -= 40                          # too terse to be clear
+    if n > 120:
+        clarity -= 20                          # rambling / unfocused
+    clarity = max(0.0, min(100.0, clarity))
+
+    # --- specificity: concrete identifiers, paths, quoted terms, numbers ---
+    idents = re.findall(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+"
+                        r"|[a-z]+_[a-z0-9_]+|[a-z]+[A-Z][A-Za-z0-9]+", text)
+    paths = re.findall(r"[\w./-]+\.[A-Za-z]{1,6}\b", text)
+    quoted = re.findall(r"`[^`]+`|\"[^\"]+\"|'[^']+'", text)
+    signal = len(set(idents)) + len(set(paths)) + len(quoted)
+    specificity = min(100.0, signal * 22.0)
+    if signal == 0 and n >= 3:
+        specificity = 20.0                     # prose-only, no concrete anchor
+
+    # --- context: does it point at the codebase it wants changed? ---
+    has_ctx = bool(paths) or bool(idents) or bool(
+        re.search(r"\b(file|function|class|module|method|endpoint|test)\b", lower))
+    context = 85.0 if has_ctx else 30.0
+
+    # --- actionability: is there a clear ask? ---
+    first = toks[0] if toks else ""
+    has_verb = any(v in toks for v in _PQ_ACTION_VERBS)
+    is_question = text.endswith("?") or first in {"how", "why", "what", "where", "when"}
+    actionability = 90.0 if (has_verb or is_question) else 35.0
+    if first in _PQ_ACTION_VERBS:
+        actionability = min(100.0, actionability + 10)
+
+    overall = round(0.3 * clarity + 0.3 * specificity +
+                    0.2 * context + 0.2 * actionability, 1)
+
+    suggestions: list[str] = []
+    if vague_hits:
+        suggestions.append(f"replace vague wording ({vague_hits} term(s): "
+                           f"e.g. 'something', 'properly') with concrete detail")
+    if specificity < 50:
+        suggestions.append("name the file(s), function(s) or symbol(s) involved")
+    if not has_ctx:
+        suggestions.append("point at the code — a path, class or function")
+    if actionability < 50:
+        suggestions.append("lead with a clear ask (a verb: add / fix / explain …)")
+    if n < 3:
+        suggestions.append("add detail — a 2–3 word prompt is too terse to act on")
+
+    grade = ("excellent" if overall >= 85 else "good" if overall >= 70 else
+             "fair" if overall >= 50 else "weak")
+    return {
+        "score": overall,
+        "grade": grade,
+        "subscores": {
+            "clarity": round(clarity, 1),
+            "specificity": round(specificity, 1),
+            "context": round(context, 1),
+            "actionability": round(actionability, 1),
+        },
+        "signals": {"identifiers": sorted(set(idents))[:12],
+                    "paths": sorted(set(paths))[:12],
+                    "vague_terms": vague_hits, "words": n},
+        "suggestions": suggestions,
+    }
+
+
+# ==========================================================================
+# conversation summarization (CS-1) — compress a long chat transcript into a
+# compact, token-cheap brief so a session can carry forward without replaying
+# the whole history. Deterministic, extractive, local (no LLM).
+# ==========================================================================
+_CS_DECISION_CUES = ("decid", "let's", "lets ", "we'll", "we will", "going to",
+                     "chose", "choose", "use ", "should ", "will use", "agreed",
+                     "plan is", "approach", "instead of")
+_CS_ACTION_CUES = ("todo", "to do", "next step", "need to", "must ", "follow up",
+                   "action item", "remaining", "still need")
+
+
+def _cs_parse_turns(transcript: str) -> list[tuple[str, str]]:
+    """Split a transcript into (role, text) turns. Tolerant of plain text."""
+    import re
+    turns: list[tuple[str, str]] = []
+    role, buf = "note", []
+    for line in (transcript or "").splitlines():
+        m = re.match(r"^\s*(user|assistant|system|human|ai|claude|me)\s*[:>-]\s*(.*)$",
+                     line, re.IGNORECASE)
+        if m:
+            if buf:
+                turns.append((role, "\n".join(buf).strip()))
+            role, buf = m.group(1).lower(), [m.group(2)]
+        else:
+            buf.append(line)
+    if buf:
+        turns.append((role, "\n".join(buf).strip()))
+    return [(r, t) for r, t in turns if t]
+
+
+def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
+    """Extractive summary of a chat transcript, capped at ~max_tokens (CS-1).
+
+    Pulls out decisions, action items / open questions, and the code entities
+    (files, identifiers) the conversation touched, then renders a compact brief.
+    Returns the summary text plus the token saving vs. replaying the transcript.
+    """
+    import re
+    turns = _cs_parse_turns(transcript)
+    orig_tokens = count_tokens(transcript or "")
+    if not turns:
+        return {"summary": "", "turns": 0, "original_tokens": orig_tokens,
+                "summary_tokens": 0, "tokens_saved": 0, "reduction_pct": 0.0,
+                "decisions": [], "action_items": [], "open_questions": [],
+                "entities": []}
+
+    decisions, actions, questions = [], [], []
+    seen_d, seen_a, seen_q = set(), set(), set()
+    ent_counts: dict[str, int] = {}
+    for _role, text in turns:
+        for raw in re.split(r"(?<=[.!?])\s+|\n", text):
+            s = raw.strip(" -*•\t")
+            if not s:
+                continue
+            low = s.lower()
+            key = low[:80]
+            if s.endswith("?") and key not in seen_q and len(s) < 200:
+                seen_q.add(key); questions.append(s)
+            if any(c in low for c in _CS_DECISION_CUES) and key not in seen_d:
+                seen_d.add(key); decisions.append(s)
+            if any(c in low for c in _CS_ACTION_CUES) and key not in seen_a:
+                seen_a.add(key); actions.append(s)
+        for ident in re.findall(r"`([^`]+)`|([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]+)"
+                                r"|([\w/-]+\.[A-Za-z]{1,6})\b", text):
+            name = next((g for g in ident if g), "")
+            if name and 2 < len(name) < 60:
+                ent_counts[name] = ent_counts.get(name, 0) + 1
+    entities = [e for e, _ in sorted(ent_counts.items(),
+                                     key=lambda kv: -kv[1])][:12]
+
+    def _cap(items: list[str], n: int) -> list[str]:
+        return items[:n]
+
+    lines = [f"# Conversation summary ({len(turns)} turns)"]
+    if decisions:
+        lines.append("\n## Decisions")
+        lines += [f"- {d}" for d in _cap(decisions, 8)]
+    if actions:
+        lines.append("\n## Action items / open work")
+        lines += [f"- {a}" for a in _cap(actions, 8)]
+    if questions:
+        lines.append("\n## Open questions")
+        lines += [f"- {q}" for q in _cap(questions, 6)]
+    if entities:
+        lines.append("\n## Code entities touched")
+        lines.append(", ".join(f"`{e}`" for e in entities))
+
+    summary = "\n".join(lines)
+    # Trim to budget from the least-critical tail (entities → questions → …).
+    while count_tokens(summary) > max_tokens and len(lines) > 3:
+        lines.pop()
+        summary = "\n".join(lines).rstrip()
+    summary, _ = redact_secrets(summary)
+    sum_tokens = count_tokens(summary)
+    return {
+        "summary": summary,
+        "turns": len(turns),
+        "original_tokens": orig_tokens,
+        "summary_tokens": sum_tokens,
+        "tokens_saved": orig_tokens - sum_tokens,
+        "reduction_pct": round((orig_tokens - sum_tokens) / orig_tokens * 100.0, 1)
+        if orig_tokens else 0.0,
+        "decisions": _cap(decisions, 8),
+        "action_items": _cap(actions, 8),
+        "open_questions": _cap(questions, 6),
+        "entities": entities,
+    }
+
+
 @dataclass
 class Piece:
     qname: str
@@ -3652,6 +3977,7 @@ class ContextPack:
     task: str
     pieces: list[Piece] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
+    deduped: list[str] = field(default_factory=list)   # DD-1: redundant pieces removed
     budget: int = 0
 
     @property
@@ -3673,6 +3999,9 @@ class ContextPack:
         if self.dropped:
             lines.append("## Available but not included (request by name if needed)")
             lines.append(", ".join(f"`{d}`" for d in self.dropped))
+        if self.deduped:
+            lines.append("## Deduplicated (redundant with content already shown)")
+            lines.append(", ".join(f"`{d}`" for d in self.deduped))
         out, _ = redact_secrets("\n".join(lines))
         return out
 
@@ -3948,6 +4277,10 @@ class Retriever:
             pack.pieces.append(Piece(label, "chunk", c["file"], "chunk",
                                      text, est, "indexed search"))
             included_chunks.add(c["id"])
+        # DD-1: drop pieces whose content is already covered by a higher-priority
+        # piece (e.g. an indexed chunk re-showing a seed body). Frees budget and
+        # keeps the pack free of redundant tokens.
+        pack.pieces, pack.deduped = _dedupe_pieces(pack.pieces)
         # Piece estimates exclude Markdown headings, fences, paths, and the
         # dropped list. Enforce the public contract against serialized output.
         while pack.pieces and pack.rendered_tokens > budget_tokens:
@@ -4950,12 +5283,21 @@ def record_pack_savings(root: Path, op: str, *, final_tokens: int,
     """
     try:
         saved = baseline_tokens - final_tokens
+        if saved <= 0:
+            # Skip non-savings (e.g. a tiny transcript whose summary scaffolding
+            # exceeds the original) — recording them would only dilute the
+            # ledger's totals and run counts on the dashboard.
+            return
         red = round(saved / baseline_tokens * 100.0, 1) if baseline_tokens else 0.0
         track_gain(root, {"op": op, "final_tokens": final_tokens,
                           "baseline_tokens": baseline_tokens, "saved": saved,
                           "reduction_pct": red, "files": files}, no_track=no_track)
         track_usage(root, {"op": op, "final_tokens": final_tokens,
                            "reduction_pct": red}, no_track=no_track)
+        if not _tracking_disabled(no_track):
+            # Keep the per-workspace static report fresh so any client can just
+            # open .tokengraph/token-usage.html — no server, no dependencies.
+            write_usage_report(root)
     except Exception:
         pass
 
@@ -4969,8 +5311,64 @@ GAIN_PRICES_PER_1M: dict[str, float] = {
     "claude-opus": 15.0, "claude-sonnet": 3.0, "claude-haiku": 0.80,
     "gpt-4o": 2.5, "gpt-4o-mini": 0.15, "gpt-4.1": 2.0,
     "gemini-1.5-pro": 1.25, "gemini-1.5-flash": 0.075,
+    "llama-3.1-405b": 3.0, "llama-3.1-70b": 0.60, "llama-3.1-8b": 0.10,
 }
 DEFAULT_GAIN_MODEL = "claude-sonnet"
+
+# Pre-flight cost estimation (CE-1). List prices in USD per 1M tokens, split
+# into input (prompt) and output (completion). Used to price a call *before*
+# it's sent — unlike GAIN_PRICES_PER_1M, which projects savings after the fact.
+MODEL_PRICES_PER_1M: dict[str, dict[str, float]] = {
+    "claude-opus":      {"input": 15.0,  "output": 75.0},
+    "claude-sonnet":    {"input": 3.0,   "output": 15.0},
+    "claude-haiku":     {"input": 0.80,  "output": 4.0},
+    "gpt-4o":           {"input": 2.5,   "output": 10.0},
+    "gpt-4o-mini":      {"input": 0.15,  "output": 0.60},
+    "gpt-4.1":          {"input": 2.0,   "output": 8.0},
+    "gemini-1.5-pro":   {"input": 1.25,  "output": 5.0},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
+    "llama-3.1-405b":   {"input": 3.0,   "output": 3.0},
+    "llama-3.1-70b":    {"input": 0.60,  "output": 0.60},
+    "llama-3.1-8b":     {"input": 0.10,  "output": 0.10},
+}
+DEFAULT_COST_MODEL = "claude-sonnet"
+
+
+def estimate_cost(prompt: str | int, model: str = DEFAULT_COST_MODEL,
+                  expected_output_tokens: int = 500) -> dict:
+    """Price an API call *before* sending it (CE-1).
+
+    `prompt` may be the raw text (counted with the model-aware tokenizer) or a
+    pre-computed input-token integer. Returns a per-call USD breakdown so you
+    can compare models / trim context before spending. Deterministic, local.
+    """
+    if isinstance(prompt, int):
+        in_tok = max(0, prompt)
+    else:
+        in_tok = count_tokens_for_model(prompt or "", model)
+    out_tok = max(0, int(expected_output_tokens))
+    price = MODEL_PRICES_PER_1M.get(model, MODEL_PRICES_PER_1M[DEFAULT_COST_MODEL])
+    in_usd = in_tok / 1_000_000 * price["input"]
+    out_usd = out_tok / 1_000_000 * price["output"]
+    return {
+        "model": model,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "input_usd": round(in_usd, 6),
+        "output_usd": round(out_usd, 6),
+        "total_usd": round(in_usd + out_usd, 6),
+        "price_per_1m_input_usd": price["input"],
+        "price_per_1m_output_usd": price["output"],
+    }
+
+
+def compare_cost(prompt: str | int, expected_output_tokens: int = 500,
+                 models: list[str] | None = None) -> dict:
+    """estimate_cost across several models — the cheapest sufficient pick (CE-2)."""
+    names = models or list(MODEL_PRICES_PER_1M.keys())
+    rows = [estimate_cost(prompt, m, expected_output_tokens) for m in names]
+    rows.sort(key=lambda r: r["total_usd"])
+    return {"cheapest": rows[0] if rows else None, "by_model": rows}
 
 
 def _parse_since(spec: str | None) -> float | None:
@@ -5089,9 +5487,13 @@ def _gain_buckets(rows: list[dict], fmt: str) -> list[dict]:
         if not ts:
             continue
         key = _dt.datetime.fromtimestamp(ts).strftime(fmt)
-        b = buckets.setdefault(key, {"period": key, "saved": 0, "runs": 0})
+        b = buckets.setdefault(key, {"period": key, "saved": 0, "runs": 0,
+                                     "baseline": 0, "final": 0})
         b["saved"] += int(r.get("saved", 0))
         b["runs"] += 1
+        # baseline/final let the report recompute windowed totals client-side
+        b["baseline"] += int(r.get("baseline_tokens", 0))
+        b["final"] += int(r.get("final_tokens", 0))
     return [buckets[k] for k in sorted(buckets)]
 
 
@@ -5105,48 +5507,1505 @@ def _sparkline(values: list[int]) -> str:
     return "".join(blocks[min(7, int((v - lo) / span * 7))] for v in values)
 
 
-def render_gain_html(summary: dict) -> str:
-    """Self-contained HTML dashboard (inline SVG sparkline, no external deps)."""
-    daily = summary.get("daily") or []
-    vals = [d["saved"] for d in daily]
-    # inline SVG sparkline of daily saved tokens
-    bars = ""
-    if vals:
-        hi = max(vals) or 1
-        w, h, gap = 26, 90, 6
-        for i, v in enumerate(vals):
-            bh = int(v / hi * h)
-            x = i * (w + gap)
-            bars += (f'<rect x="{x}" y="{h - bh}" width="{w}" height="{bh}" '
-                     f'rx="3" fill="#3b82f6"><title>{daily[i]["period"]}: '
-                     f'{v:,} tok</title></rect>')
-    svg_w = max(1, len(vals)) * 32
-    op_rows = "".join(
-        f"<tr><td>{o['op']}</td><td>{o['runs']:,}</td>"
-        f"<td>{o['saved']:,}</td>"
-        f"<td>{round(o['saved']/o['baseline']*100,1) if o['baseline'] else 0}%</td></tr>"
-        for o in summary.get("by_op", []))
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>ContextIQ — Token Savings</title><style>
-body{{font:14px system-ui,sans-serif;margin:2rem;color:#0f172a;background:#f8fafc}}
-.card{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:1.2rem;margin:1rem 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}}
-.big{{font-size:2rem;font-weight:700}}.muted{{color:#64748b}}
-table{{border-collapse:collapse;width:100%}}td,th{{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #f1f5f9}}
-.grid{{display:flex;gap:1rem;flex-wrap:wrap}}.grid .card{{flex:1;min-width:160px}}
-</style></head><body>
-<h1>ContextIQ — Token Savings Dashboard</h1>
-<p class="muted">model: <b>{summary['model']}</b> · window: <b>{summary['since'] or 'all time'}</b> · runs: <b>{summary['runs']:,}</b></p>
-<div class="grid">
-  <div class="card"><div class="muted">tokens saved</div><div class="big">{summary['saved_tokens']:,}</div></div>
-  <div class="card"><div class="muted">reduction</div><div class="big">{summary['reduction_pct']}%</div></div>
-  <div class="card"><div class="muted">projected $ saved</div><div class="big">${summary['saved_usd']:,}</div></div>
-</div>
-<div class="card"><h3>Daily saved tokens (last {len(vals)})</h3>
-<svg width="{svg_w}" height="110" role="img">{bars}</svg></div>
-<div class="card"><h3>By operation</h3>
-<table><tr><th>op</th><th>runs</th><th>saved</th><th>reduction</th></tr>{op_rows}</table></div>
-<p class="muted">Generated by <code>tokengraph gain --html</code> · projection is list-price input tokens, indicative only.</p>
+# ==========================================================================
+# report payload + self-contained HTML dashboard (replaces the Streamlit app)
+# ==========================================================================
+# The page is *progressively enhanced*: it always ships an inline snapshot so
+# it works from file:// with zero dependencies, and if it detects it is being
+# served (see serve_report) it polls /data.json and redraws live instead.
+REPORT_SCHEMA_VERSION = 1
+
+
+def _report_daily(rows: list[dict], cap: int = 180) -> list[dict]:
+    """Daily buckets for the report, carrying `files` and capped to `cap` days.
+
+    `summarize_gain(trends=True)` keeps only 14 days (it feeds the CLI trend
+    line), which is too short for the report's 30/90-day windows and its
+    26-week activity view — so the page gets its own, wider series. Same shape
+    as `_gain_buckets` plus a `files` sum, keyed on the local date to match
+    what a user sees in the log.
+    """
+    import datetime as _dt
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        ts = float(r.get("ts", 0.0))
+        if not ts:
+            continue
+        key = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        b = buckets.setdefault(key, {"period": key, "saved": 0, "runs": 0,
+                                     "baseline": 0, "final": 0, "files": 0})
+        b["saved"] += int(r.get("saved", 0))
+        b["runs"] += 1
+        b["baseline"] += int(r.get("baseline_tokens", 0))
+        b["final"] += int(r.get("final_tokens", 0))
+        b["files"] += int(r.get("files", 0) or 0)
+    return [buckets[k] for k in sorted(buckets)][-cap:]
+
+
+def _ledger_span(rows: list[dict]) -> dict:
+    """First/last run and how many distinct days the ledger actually spans."""
+    import datetime as _dt
+    stamps = [float(r.get("ts", 0.0)) for r in rows if float(r.get("ts", 0.0))]
+    days = {_dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d") for t in stamps}
+    return {"first_ts": min(stamps) if stamps else 0.0,
+            "last_ts": max(stamps) if stamps else 0.0,
+            "active_days": len(days)}
+
+
+def _workspace_stats(root: Path) -> dict:
+    """Read-only facts about the local graph, for the report's workspace panel.
+
+    Best-effort and strictly read-only: it opens the existing DB in `mode=ro`
+    (so it can never create one) with a short timeout, and returns `{}` on any
+    problem — this runs on the savings-logging hot path and must never raise,
+    block, or write.
+    """
+    try:
+        db = _db_path(Path(root).resolve())   # as_uri() needs an absolute path
+        if not db.exists():
+            return {}
+        import sqlite3
+        con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.25)
+        try:
+            def scalar(sql: str) -> int:
+                try:
+                    return int(con.execute(sql).fetchone()[0] or 0)
+                except Exception:
+                    return 0
+
+            files = scalar("SELECT COUNT(*) FROM files")
+            if not files:
+                # No readable file table (absent, empty or not a graph db) —
+                # report "no index" rather than a row of confident zeroes.
+                return {}
+            languages: list[dict] = []
+            try:
+                for lang, files, tokens in con.execute(
+                        "SELECT COALESCE(NULLIF(language,''),'unknown') AS lang, "
+                        "COUNT(*), COALESCE(SUM(token_est),0) FROM files "
+                        "GROUP BY lang ORDER BY 2 DESC LIMIT 12"):
+                    languages.append({"language": str(lang), "files": int(files),
+                                      "tokens": int(tokens)})
+            except Exception:
+                pass
+            return {
+                "files": files,
+                "symbols": scalar("SELECT COUNT(*) FROM symbols"),
+                "chunks": scalar("SELECT COUNT(*) FROM chunks"),
+                "edges": scalar("SELECT COUNT(*) FROM edges"),
+                "summaries": scalar("SELECT COUNT(*) FROM summaries"),
+                "indexed_tokens": scalar(
+                    "SELECT COALESCE(SUM(token_est),0) FROM files"),
+                "db_bytes": db.stat().st_size,
+                "languages": languages,
+            }
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
+def build_report_payload(root: Path, model: str = DEFAULT_GAIN_MODEL,
+                         generated_at: str | None = None,
+                         max_rows: int = 200) -> dict:
+    """Everything the HTML report needs, as one versioned JSON-safe dict.
+
+    Deliberately aggregated: daily/weekly/monthly buckets plus a bounded tail
+    of raw rows, so the inlined payload stays small as the ledger grows. Pure
+    data (no HTML) so it can also be served as /data.json and unit-tested.
+    `rows_capped` tells the page when a view built from the row tail (per-op
+    windows, the log) is showing a slice rather than everything, so it can say
+    so instead of implying the tail is the whole ledger.
+    """
+    rows = read_gain_ledger(root)
+    s = summarize_gain(root, model=model, trends=True)
+    return {
+        "version": REPORT_SCHEMA_VERSION,
+        "workspace": Path(root).resolve().name,
+        "generated_at": generated_at or "",
+        "model": model,
+        "prices": dict(GAIN_PRICES_PER_1M),
+        "prices_io": {m: dict(p) for m, p in MODEL_PRICES_PER_1M.items()},
+        "totals": {
+            "runs": s["runs"], "saved": s["saved_tokens"],
+            "baseline": s["baseline_tokens"], "final": s["final_tokens"],
+            "reduction_pct": s["reduction_pct"], "saved_usd": s["saved_usd"],
+            "files": sum(int(r.get("files", 0) or 0) for r in rows),
+        },
+        "by_op": s["by_op"],
+        "daily": _report_daily(rows),
+        "weekly": s.get("weekly", []),
+        "monthly": s.get("monthly", []),
+        "ledger": _ledger_span(rows),
+        "workspace_stats": _workspace_stats(root),
+        "rows": rows[-max_rows:],
+        "rows_capped": len(rows) > max_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Presentation layer for the report. Three constants — design tokens + CSS,
+# the view logic, and the document skeleton — kept apart from the payload so
+# the data contract (build_report_payload / data.json) stays untouched.
+# ---------------------------------------------------------------------------
+
+# Dark steps are *selected* for the dark surface (same ramps, re-stepped) and
+# checked against it — not an automatic inversion. Emitted under two scopes so
+# an explicit theme choice beats the OS setting in both directions.
+_REPORT_DARK_VARS = """
+  color-scheme:dark;
+  --bg:#080d18;--surface:#111a2e;--surface-2:#152039;--surface-3:#1b2740;
+  --overlay:rgba(255,255,255,.07);
+  --fg:#e9effb;--fg-2:#c3d0e4;--muted:#94a5be;--muted-2:#6f819c;
+  --line:#22304d;--line-2:#2e3f63;--grid:#1e2b47;
+  --brand:#5b93ff;--brand-2:#0f1c33;--brand-3:#0a1428;--brand-soft:#182741;
+  --s-sent:#3987e5;--s-saved:#008300;--s-c3:#d55181;--s-c4:#c98500;
+  --s-c5:#199e70;--s-base:#8496ae;
+  --seq-0:#16203a;--seq-1:#104281;--seq-2:#184f95;--seq-3:#1c5cab;
+  --seq-4:#2a78d6;--seq-5:#5598e7;--seq-6:#86b6ef;--track:#1c2b49;
+  --good:#0ca30c;--good-ink:#7ee07e;--good-soft:#12301a;
+  --warn:#fab219;--warn-ink:#f0c46a;--warn-soft:#312413;
+  --crit:#d03b3b;--crit-ink:#f19a9a;--crit-soft:#331919;
+  --sh-1:0 1px 2px rgba(0,0,0,.40);--sh-2:0 10px 30px rgba(0,0,0,.45);
+"""
+
+_REPORT_TOKENS = """
+/* ==== design tokens =======================================================
+   One source of truth for color, type, space, radius, elevation and motion.
+   Every component is written against these roles (never raw hex), so themes
+   and rebrands change in exactly one place. Data-mark colors are a palette
+   checked for colour-vision separation against both chart surfaces; brand
+   navy/blue is reserved for chrome so it can't be misread as a series.
+   ======================================================================= */
+:root{
+  color-scheme:light;
+  --bg:#f4f6fa;--surface:#fff;--surface-2:#f8fafc;--surface-3:#eef2f8;
+  --overlay:rgba(14,23,41,.06);
+  --fg:#0e1729;--fg-2:#334155;--muted:#5b6b83;--muted-2:#8496ae;
+  --line:#e4e9f0;--line-2:#cfd8e5;--grid:#e9eef6;
+  --brand:#2f6fed;--brand-2:#1a2b4a;--brand-3:#12203a;--brand-soft:#eaf1ff;
+  --s-sent:#2a78d6;--s-saved:#008300;--s-c3:#e87ba4;--s-c4:#eda100;
+  --s-c5:#1baf7a;--s-base:#7c8aa0;
+  --seq-0:#eef2f8;--seq-1:#cde2fb;--seq-2:#9ec5f4;--seq-3:#6da7ec;
+  --seq-4:#3987e5;--seq-5:#256abf;--seq-6:#0d366b;--track:#dde8f8;
+  --good:#0ca30c;--good-ink:#0a6b0a;--good-soft:#e6f6e6;
+  --warn:#fab219;--warn-ink:#8a5a00;--warn-soft:#fff5e0;
+  --crit:#d03b3b;--crit-ink:#a12626;--crit-soft:#fdeaea;
+  --sh-1:0 1px 2px rgba(14,23,41,.05),0 1px 3px rgba(14,23,41,.04);
+  --sh-2:0 8px 28px rgba(14,23,41,.10);
+  --r-1:8px;--r-2:12px;--r-3:16px;--r-pill:999px;
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:24px;--sp-6:32px;--sp-7:48px;
+  --fs-1:11px;--fs-2:12px;--fs-3:13px;--fs-4:14px;--fs-5:16px;--fs-6:20px;
+  --fs-7:28px;--fs-8:46px;
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --ease:cubic-bezier(.2,.7,.3,1);--dur-1:120ms;--dur-2:220ms;
+}
+"""
+
+_REPORT_COMPONENTS = """
+/* ==== base ============================================================== */
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:var(--fs-4)/1.55 var(--font);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+h1,h2,h3,p,ul,dl,figure{margin:0}
+ul{padding:0;list-style:none}
+a{color:var(--brand)}
+b,strong{font-weight:650}
+code{font:var(--fs-2)/1.4 var(--mono);background:var(--surface-3);padding:1px 6px;
+  border-radius:6px;color:var(--fg-2)}
+.wrap{max-width:1240px;margin:0 auto;padding:0 var(--sp-5)}
+:focus-visible{outline:2px solid var(--brand);outline-offset:2px;border-radius:4px}
+.skip{position:absolute;left:-9999px;top:8px;z-index:60;background:var(--surface);
+  color:var(--fg);padding:10px 16px;border-radius:var(--r-1);box-shadow:var(--sh-2)}
+.skip:focus{left:16px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+  white-space:nowrap}
+.muted{color:var(--muted)}
+.num{font-variant-numeric:tabular-nums}
+
+/* ==== app bar =========================================================== */
+.appbar{position:sticky;top:0;z-index:40;background:var(--surface);
+  border-bottom:1px solid var(--line)}
+.appbar .row{display:flex;align-items:center;gap:var(--sp-4);height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:680;font-size:var(--fs-5);
+  letter-spacing:-.01em;color:var(--fg);white-space:nowrap}
+.brand .mark{width:28px;height:28px;flex:0 0 28px;border-radius:9px;color:#fff;
+  background:linear-gradient(140deg,var(--brand-2),var(--brand));display:grid;
+  place-items:center}
+.brand .sub{font-weight:500;font-size:var(--fs-2);color:var(--muted);
+  border-left:1px solid var(--line-2);padding-left:10px}
+.appnav{display:flex;gap:2px;margin:0 auto}
+.appnav a{padding:7px 12px;border-radius:var(--r-1);color:var(--muted);
+  text-decoration:none;font-size:var(--fs-3);font-weight:560;
+  transition:background var(--dur-1) var(--ease),color var(--dur-1) var(--ease)}
+.appnav a:hover{background:var(--surface-3);color:var(--fg)}
+.bar-end{display:flex;align-items:center;gap:var(--sp-2)}
+
+/* ==== primitives ======================================================== */
+.btn{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;
+  border:1px solid var(--line-2);border-radius:var(--r-1);background:var(--surface);
+  color:var(--fg-2);font:560 var(--fs-3)/1 var(--font);cursor:pointer;
+  transition:background var(--dur-1) var(--ease),color var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease)}
+.btn:hover{background:var(--surface-3);color:var(--fg)}
+.btn:active{transform:translateY(1px)}
+.btn.icon{width:34px;padding:0;justify-content:center}
+.field{display:inline-flex;align-items:center;gap:8px;font-size:var(--fs-3);
+  color:var(--muted);font-weight:560}
+select{font:var(--fs-3)/1 var(--font);color:var(--fg);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:var(--r-1);padding:0 28px 0 10px;
+  height:34px;appearance:none;cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),
+    linear-gradient(135deg,var(--muted) 50%,transparent 50%);
+  background-position:calc(100% - 15px) 15px,calc(100% - 10px) 15px;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;
+  transition:border-color var(--dur-1) var(--ease)}
+select:hover{border-color:var(--muted-2)}
+.switch{display:inline-flex;align-items:center;gap:8px;font-size:var(--fs-3);
+  color:var(--muted);font-weight:560;cursor:pointer;user-select:none}
+.switch input{width:34px;height:20px;margin:0;appearance:none;cursor:pointer;
+  background:var(--line-2);border-radius:var(--r-pill);position:relative;
+  transition:background var(--dur-2) var(--ease)}
+.switch input:before{content:"";position:absolute;top:2px;left:2px;width:16px;
+  height:16px;border-radius:50%;background:#fff;box-shadow:var(--sh-1);
+  transition:transform var(--dur-2) var(--ease)}
+.switch input:checked{background:var(--brand)}
+.switch input:checked:before{transform:translateX(14px)}
+.pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;
+  border-radius:var(--r-pill);font-size:var(--fs-1);font-weight:650;
+  letter-spacing:.02em;text-transform:uppercase;background:var(--surface-3);
+  color:var(--muted);white-space:nowrap}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.live{background:var(--good-soft);color:var(--good-ink)}
+.pill.live .dot{animation:pulse 2.4s var(--ease) infinite}
+.pill.warn{background:var(--warn-soft);color:var(--warn-ink)}
+.pill.info{background:var(--brand-soft);color:var(--brand)}
+.chip{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;
+  border-radius:var(--r-1);background:var(--surface-3);color:var(--fg-2);
+  font-size:var(--fs-2);font-weight:560;max-width:280px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* ==== layout ============================================================ */
+main{padding:var(--sp-6) 0 var(--sp-7)}
+.page-head{display:flex;flex-wrap:wrap;gap:var(--sp-3) var(--sp-5);
+  align-items:flex-end;justify-content:space-between;margin-bottom:var(--sp-5)}
+h1{font-size:var(--fs-7);font-weight:680;letter-spacing:-.02em;line-height:1.2}
+.page-head p{color:var(--muted);font-size:var(--fs-3);margin-top:2px}
+.status{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
+section{margin-top:var(--sp-6);scroll-margin-top:76px}
+.sec-head{display:flex;align-items:baseline;gap:var(--sp-3);flex-wrap:wrap;
+  margin-bottom:var(--sp-3)}
+h2{font-size:var(--fs-5);font-weight:660;letter-spacing:-.01em}
+.sec-head .hint{font-size:var(--fs-2);color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-3);
+  padding:var(--sp-5);box-shadow:var(--sh-1);min-width:0;
+  transition:box-shadow var(--dur-2) var(--ease)}
+.card:hover{box-shadow:var(--sh-2)}
+.card h3{font-size:var(--fs-4);font-weight:640;letter-spacing:-.01em}
+.card .sub{font-size:var(--fs-2);color:var(--muted);margin-top:2px}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;
+  gap:var(--sp-3);margin-bottom:var(--sp-4)}
+.grid{display:grid;gap:var(--sp-4)}
+.g-5{grid-template-columns:repeat(5,minmax(0,1fr))}
+.g-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.g-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g-23{grid-template-columns:minmax(0,3fr) minmax(0,2fr)}
+
+/* ==== toolbar =========================================================== */
+.toolbar{display:flex;flex-wrap:wrap;gap:var(--sp-3) var(--sp-4);align-items:center;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r-2);
+  padding:var(--sp-3) var(--sp-4);box-shadow:var(--sh-1);margin-bottom:var(--sp-4)}
+.toolbar .spacer{flex:1 1 auto}
+.toolbar .meta{font-size:var(--fs-2);color:var(--muted);display:flex;
+  align-items:center;gap:8px}
+
+/* ==== hero + gauge ====================================================== */
+.hero{grid-column:span 3;border-radius:var(--r-3);padding:var(--sp-5) var(--sp-6);
+  background:linear-gradient(135deg,var(--brand-3),var(--brand));color:#fff;
+  display:flex;flex-direction:column;justify-content:center;position:relative;
+  overflow:hidden;box-shadow:var(--sh-1)}
+.hero:after{content:"";position:absolute;right:-70px;top:-90px;width:280px;
+  height:280px;border-radius:50%;background:rgba(255,255,255,.07)}
+.hero-label{font-size:var(--fs-2);text-transform:uppercase;letter-spacing:.1em;
+  font-weight:650;opacity:.85}
+.hero-value{font-size:var(--fs-8);font-weight:700;line-height:1.1;
+  letter-spacing:-.03em;margin:6px 0 4px}
+.hero-sub{font-size:var(--fs-4);opacity:.94}
+.hero-foot{margin-top:var(--sp-4);font-size:var(--fs-2);opacity:.82;display:flex;
+  gap:var(--sp-3);flex-wrap:wrap;align-items:center;position:relative}
+.gauge-card{grid-column:span 2;display:flex;flex-direction:column;
+  justify-content:center}
+
+/* ==== stat tiles ======================================================== */
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-2);
+  padding:var(--sp-4);box-shadow:var(--sh-1);min-width:0;
+  transition:transform var(--dur-2) var(--ease),box-shadow var(--dur-2) var(--ease)}
+.stat:hover{transform:translateY(-1px);box-shadow:var(--sh-2)}
+.stat .k{font-size:var(--fs-2);color:var(--muted);font-weight:600;display:flex;
+  align-items:center;gap:6px}
+.stat .v{font-size:var(--fs-7);font-weight:680;letter-spacing:-.02em;line-height:1.25;
+  margin-top:2px;overflow-wrap:anywhere}
+.stat.sm .v{font-size:var(--fs-6)}
+.stat .n{font-size:var(--fs-2);color:var(--muted);margin-top:2px}
+.stat .spark{margin-top:var(--sp-2)}
+.swatch{width:9px;height:9px;border-radius:3px;flex:0 0 9px;display:inline-block}
+
+/* ==== charts ============================================================ */
+.chart{width:100%;overflow-x:auto}
+.chart svg{display:block;width:100%;height:auto}
+.chart.center svg{margin-left:auto;margin-right:auto}
+.legend{display:flex;flex-wrap:wrap;gap:var(--sp-2) var(--sp-4);
+  margin-bottom:var(--sp-3)}
+.legend .item{display:inline-flex;align-items:center;gap:7px;font-size:var(--fs-2);
+  color:var(--muted);font-weight:560}
+.legend .key{width:14px;height:4px;border-radius:2px;display:inline-block}
+.donut-wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+  gap:var(--sp-4);align-items:center}
+.klist{display:flex;flex-direction:column;gap:7px;font-size:var(--fs-3)}
+.klist .row{display:flex;align-items:center;gap:8px}
+.klist .nm{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.klist .vl{color:var(--muted);font-variant-numeric:tabular-nums}
+
+/* ==== tables ============================================================ */
+.table-wrap{width:100%;overflow-x:auto;border:1px solid var(--line);
+  border-radius:var(--r-2)}
+table{border-collapse:collapse;width:100%;font-size:var(--fs-3)}
+caption{text-align:left;font-size:var(--fs-2);color:var(--muted);
+  padding:0 0 var(--sp-2)}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line);
+  white-space:nowrap}
+thead th{background:var(--surface-2);color:var(--muted);font-size:var(--fs-2);
+  font-weight:640;text-transform:uppercase;letter-spacing:.04em}
+tbody tr:last-child td{border-bottom:0}
+tbody tr{transition:background var(--dur-1) var(--ease)}
+tbody tr:hover{background:var(--surface-2)}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.is-sel td{background:var(--brand-soft)}
+
+/* ==== states ============================================================ */
+.empty{padding:var(--sp-6) var(--sp-4);text-align:center;color:var(--muted);
+  border:1px dashed var(--line-2);border-radius:var(--r-2);background:var(--surface-2)}
+.empty .t{font-weight:620;color:var(--fg-2);font-size:var(--fs-4)}
+.empty .m{font-size:var(--fs-3);margin-top:4px}
+.banner{display:flex;gap:var(--sp-3);align-items:flex-start;padding:var(--sp-4);
+  border-radius:var(--r-2);font-size:var(--fs-3);margin-bottom:var(--sp-4)}
+.banner.info{background:var(--brand-soft);color:var(--fg-2)}
+.banner.warn{background:var(--warn-soft);color:var(--warn-ink)}
+.skel{background:linear-gradient(90deg,var(--surface-3) 25%,var(--overlay) 37%,
+  var(--surface-3) 63%);background-size:400% 100%;border-radius:var(--r-1);
+  animation:shimmer 1.4s var(--ease) infinite}
+.skel.line{height:12px;margin:6px 0}
+.skel.chart{height:240px}
+@keyframes shimmer{0%{background-position:100% 50%}100%{background-position:0 50%}}
+details{background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--r-3);padding:var(--sp-4) var(--sp-5);box-shadow:var(--sh-1)}
+summary{cursor:pointer;font-weight:620;font-size:var(--fs-4);list-style:none;
+  display:flex;align-items:center;gap:8px}
+summary::-webkit-details-marker{display:none}
+summary:before{content:"";width:0;height:0;border:5px solid transparent;
+  border-left-color:var(--muted-2);transition:transform var(--dur-2) var(--ease)}
+details[open] summary:before{transform:rotate(90deg) translateX(-2px)}
+details .body{margin-top:var(--sp-4)}
+footer{margin-top:var(--sp-6);padding:var(--sp-5) 0;border-top:1px solid var(--line);
+  color:var(--muted);font-size:var(--fs-2);display:flex;gap:var(--sp-4);
+  flex-wrap:wrap;justify-content:space-between}
+
+/* ==== responsive ======================================================== */
+@media (max-width:1080px){
+  .g-5{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .g-23{grid-template-columns:minmax(0,1fr)}
+  .hero,.gauge-card{grid-column:span 3}
+  .appnav{display:none}
+}
+@media (max-width:760px){
+  .wrap{padding:0 var(--sp-4)}
+  :root{--fs-7:24px;--fs-8:38px}
+  .grid{gap:var(--sp-3)}
+  .g-5,.g-4,.g-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .hero,.gauge-card{grid-column:span 2}
+  .card{padding:var(--sp-4)}
+  .donut-wrap{grid-template-columns:minmax(0,1fr)}
+  .brand .sub{display:none}
+}
+@media (max-width:460px){
+  /* Stat tiles stay two-up — a nine-tile single column is a scroll, not a
+     scorecard. Only the hero and the gauge take the full width. */
+  .g-2{grid-template-columns:minmax(0,1fr)}
+  .hero,.gauge-card{grid-column:span 2}
+  .hero{padding:var(--sp-4)}
+  .stat .v{font-size:var(--fs-6)}
+}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important}
+}
+@media print{
+  .appbar,.toolbar,.skip,.no-print{display:none !important}
+  body{background:#fff}
+  .card,.stat,.table-wrap{break-inside:avoid;box-shadow:none}
+  section{margin-top:18px}
+}
+"""
+
+_REPORT_CSS = (_REPORT_TOKENS
+               + ':root[data-theme="dark"]{' + _REPORT_DARK_VARS + '}\n'
+               + '@media (prefers-color-scheme:dark){:root:not([data-theme="light"])'
+               + '{' + _REPORT_DARK_VARS + '}}\n'
+               + _REPORT_COMPONENTS)
+
+_REPORT_JS = """
+/* ContextIQ report view layer.
+   Plain ES5, no dependencies, no globals: the page must work from file:// in
+   any client, so every dependency is inlined and every DOM write goes through
+   set()/put(), which no-op when a container is absent. */
+(function(){
+  var RANGES=['all','7','30','90'];
+  var C_SENT='var(--s-sent)', C_SAVED='var(--s-saved)', C_BASE='var(--s-base)';
+  var CAT=[C_SENT,C_SAVED,'var(--s-c3)','var(--s-c4)','var(--s-c5)',C_BASE];
+  var SEQ=['var(--seq-0)','var(--seq-1)','var(--seq-2)','var(--seq-3)',
+           'var(--seq-4)','var(--seq-5)'];
+  var GRID='var(--grid)', MUT='var(--muted)', SURF='var(--surface)';
+  var THEMES=['auto','light','dark'];
+  var MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var state={data:null,model:null,range:'all',theme:'auto',live:false,auto:true,
+             sig:null,left:0,err:false};
+  var tick=null;
+
+  /* ---------- dom + formatting ------------------------------------------ */
+  function el(id){return document.getElementById(id);}
+  function set(id,t){var n=el(id); if(n)n.textContent=t; return n;}
+  function put(id,h){var n=el(id); if(n)n.innerHTML=h; return n;}
+  function on(id,ev,fn){var n=el(id);
+    if(n&&n.addEventListener)n.addEventListener(ev,fn); return n;}
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function fmt(n){n=Number(n)||0;var a=Math.abs(n);
+    if(a>=1e9)return (n/1e9).toFixed(1).replace(/\\.0$/,'')+'B';
+    if(a>=1e6)return (n/1e6).toFixed(1).replace(/\\.0$/,'')+'M';
+    if(a>=1e3)return (n/1e3).toFixed(1).replace(/\\.0$/,'')+'K';
+    return String(Math.round(n));}
+  function full(n){return (Number(n)||0).toLocaleString();}
+  // Adaptive precision: money reads normally at cent scale and above, and only
+  // grows decimals below that — otherwise a young ledger (or a cheap model)
+  // collapses every figure to "$0.00" and switching model looks like a no-op.
+  // Under $0.10 we keep three significant digits, so two models whose prices
+  // differ stay visibly different.
+  function usd(n){
+    n=Number(n)||0;
+    var a=Math.abs(n), d=2;
+    if(a>0&&a<0.1)d=Math.min(8,Math.max(3,2-Math.floor(Math.log(a)/Math.LN10)));
+    return '$'+n.toLocaleString(undefined,
+      {minimumFractionDigits:d,maximumFractionDigits:d});
+  }
+  function pct(part,whole){return whole?Math.round(part/whole*1000)/10:0;}
+  function priceOf(){
+    var p=state.data.prices[state.model];
+    return p===undefined?3.0:p;
+  }
+  function priceIo(m){
+    var t=state.data.prices_io||{};
+    return t[m]||{input:(state.data.prices||{})[m],output:null};
+  }
+  function priceLabel(){
+    var p=priceOf();
+    return '@ $'+(p<1?p.toFixed(3):p.toFixed(2))+' / 1M tokens';
+  }
+  function rangeLabel(){
+    return state.range==='all'?'all time':'last '+state.range+' days';
+  }
+
+  /* ---------- UI state in the URL hash ----------------------------------- */
+  // The static page can only pick up new data by reloading (file:// cannot
+  // fetch), so selections are round-tripped through location.hash to survive
+  // it. sessionStorage is not usable here: Chrome restricts it on file://.
+  function readHash(){
+    var out={};
+    (location.hash||'').replace(/^#/,'').split('&').forEach(function(kv){
+      var i=kv.indexOf('=');
+      if(i>0)out[decodeURIComponent(kv.slice(0,i))]=decodeURIComponent(kv.slice(i+1));
+    });
+    return out;
+  }
+  function writeHash(){
+    var h='#model='+encodeURIComponent(state.model)+
+          '&range='+encodeURIComponent(state.range)+'&auto='+(state.auto?'1':'0')+
+          '&theme='+encodeURIComponent(state.theme);
+    try{history.replaceState(null,'',h);}catch(e){location.hash=h;}
+  }
+  // Cheap change-detector so a poll that returns identical data doesn't redraw.
+  function sig(d){
+    var t=d.totals||{};
+    return [d.generated_at,t.runs,t.saved,t.final,(d.rows||[]).length].join('|');
+  }
+
+  /* ---------- windowing --------------------------------------------------- */
+  function dkey(d){
+    var m=d.getMonth()+1, day=d.getDate();
+    return d.getFullYear()+'-'+(m<10?'0':'')+m+'-'+(day<10?'0':'')+day;
+  }
+  function windowStart(){                  // local midnight, N-1 days back
+    var d=new Date(); d.setHours(0,0,0,0);
+    d.setDate(d.getDate()-(parseInt(state.range,10)-1));
+    return d;
+  }
+  function series(){
+    var d=state.data.daily||[];
+    if(state.range==='all')return d;
+    var cut=dkey(windowStart());
+    return d.filter(function(x){return x.period>=cut;});
+  }
+  function totals(s){
+    if(state.range==='all')return state.data.totals||
+      {runs:0,saved:0,baseline:0,final:0,reduction_pct:0,files:0};
+    var t=s.reduce(function(a,x){return {runs:a.runs+(x.runs||0),
+      saved:a.saved+(x.saved||0),baseline:a.baseline+(x.baseline||0),
+      final:a.final+(x.final||0),files:a.files+(x.files||0)};},
+      {runs:0,saved:0,baseline:0,final:0,files:0});
+    t.reduction_pct=pct(t.saved,t.baseline);
+    return t;
+  }
+  function ops(){                          // per-operation rows for the window
+    if(state.range==='all')return state.data.by_op||[];
+    var cut=windowStart().getTime()/1000, agg={}, out=[];
+    (state.data.rows||[]).forEach(function(r){
+      if(Number(r.ts||0)<cut)return;
+      var k=r.op||'?', b=agg[k];
+      if(!b){b=agg[k]={op:k,runs:0,saved:0,baseline:0,final:0};out.push(b);}
+      b.runs++; b.saved+=Number(r.saved||0);
+      b.baseline+=Number(r.baseline_tokens||0);
+      b.final+=Number(r.final_tokens||0);
+    });
+    return out.sort(function(a,b){return b.saved-a.saved;});
+  }
+  function windowRows(){
+    if(state.range==='all')return state.data.rows||[];
+    var cut=windowStart().getTime()/1000;
+    return (state.data.rows||[]).filter(function(r){return Number(r.ts||0)>=cut;});
+  }
+  function savedUsd(saved){return saved/1e6*priceOf();}
+  function spendUsd(sent){return sent/1e6*priceOf();}
+
+  /* ---------- svg primitives ---------------------------------------------- */
+  // max-width = the viewBox width so labels never scale *up* past their design
+  // size in a wide card; min-width keeps them legible in a narrow one — the
+  // .chart container scrolls instead of shrinking the type to nothing.
+  function svg(w,h,label,inner){
+    return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" height="'+h+'" '+
+      'style="min-width:'+Math.min(w,430)+'px;max-width:'+w+'px" '+
+      'preserveAspectRatio="xMidYMid meet" role="img" aria-label="'+esc(label)+
+      '">'+inner+'</svg>';
+  }
+  function empty(title,msg){
+    return '<div class="empty"><div class="t">'+esc(title)+'</div>'+
+           '<div class="m">'+esc(msg)+'</div></div>';
+  }
+  function niceMax(v){
+    if(!(v>0))return 1;
+    var e=Math.pow(10,Math.floor(Math.log(v)/Math.LN10)), f=v/e;
+    return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*e;
+  }
+  function colTop(x,y,w,h,r){           // column: rounded cap, square baseline
+    if(h<=0.5)h=0.5;
+    r=Math.min(r,w/2,h);
+    return 'M'+x+','+(y+h).toFixed(1)+'V'+(y+r).toFixed(1)+'Q'+x+','+y.toFixed(1)+
+      ' '+(x+r)+','+y.toFixed(1)+'H'+(x+w-r)+'Q'+(x+w)+','+y.toFixed(1)+' '+
+      (x+w)+','+(y+r).toFixed(1)+'V'+(y+h).toFixed(1)+'Z';
+  }
+  function barEnd(x,y,w,h,r){           // horizontal bar: rounded data end
+    if(w<=0.5)w=0.5;
+    r=Math.min(r,h/2,w);
+    return 'M'+x+','+y+'H'+(x+w-r).toFixed(1)+'Q'+(x+w).toFixed(1)+','+y+' '+
+      (x+w).toFixed(1)+','+(y+r)+'V'+(y+h-r)+'Q'+(x+w).toFixed(1)+','+(y+h)+' '+
+      (x+w-r).toFixed(1)+','+(y+h)+'H'+x+'Z';
+  }
+  function gridY(max,x0,x1,top,bot,steps){
+    var out='';
+    for(var i=0;i<=steps;i++){
+      var y=bot-(bot-top)*(i/steps);
+      out+='<line x1="'+x0+'" y1="'+y.toFixed(1)+'" x2="'+x1+'" y2="'+y.toFixed(1)+
+        '" stroke="'+GRID+'" stroke-width="1"/>'+
+        '<text x="'+(x0-8)+'" y="'+(y+3.5).toFixed(1)+'" text-anchor="end" '+
+        'font-size="10" fill="'+MUT+'">'+fmt(max*i/steps)+'</text>';
+    }
+    return out;
+  }
+  function tip(text){return '<title>'+esc(text)+'</title>';}
+
+  /* ---------- charts ------------------------------------------------------ */
+  function sparkline(vals){
+    if(!vals.length)return '';
+    var w=150,h=30,max=Math.max.apply(null,vals.concat([1])),n=vals.length,p='';
+    function x(i){return n<2?w/2:i*(w/(n-1));}
+    function y(v){return h-3-(v/max)*(h-8);}
+    for(var i=0;i<n;i++)p+=(i?' L':'M')+x(i).toFixed(1)+','+y(vals[i]).toFixed(1);
+    return svg(w,h,'Daily tokens avoided, last '+n+' day(s)',
+      '<path d="'+p+'" fill="none" stroke="'+C_SAVED+'" stroke-width="2" '+
+      'stroke-linejoin="round" stroke-linecap="round" opacity=".7"/>'+
+      '<circle cx="'+x(n-1).toFixed(1)+'" cy="'+y(vals[n-1]).toFixed(1)+
+      '" r="3.5" fill="'+C_SAVED+'" stroke="'+SURF+'" stroke-width="2"/>');
+  }
+
+  function waterfall(t){
+    if(!t.baseline)return empty('Nothing measured yet',
+      'Run a context, ask or measure call and the breakdown appears here.');
+    var w=560,h=300,x0=64,x1=548,top=30,bot=236,bw=30;
+    var max=niceMax(t.baseline), slot=(x1-x0)/3;
+    function y(v){return bot-(v/max)*(bot-top);}
+    function cx(i){return x0+slot*i+slot/2;}
+    var b=t.baseline, f=t.final, sv=t.saved;
+    var o=gridY(max,x0,x1,top,bot,4);
+    o+='<line x1="'+x0+'" y1="'+bot+'" x2="'+x1+'" y2="'+bot+
+      '" stroke="var(--line-2)" stroke-width="1"/>';
+    o+='<line x1="'+(cx(0)+bw/2)+'" y1="'+y(b).toFixed(1)+'" x2="'+(cx(1)-bw/2)+
+      '" y2="'+y(b).toFixed(1)+'" stroke="var(--line-2)" stroke-width="1"/>';
+    o+='<line x1="'+(cx(1)+bw/2)+'" y1="'+y(f).toFixed(1)+'" x2="'+(cx(2)-bw/2)+
+      '" y2="'+y(f).toFixed(1)+'" stroke="var(--line-2)" stroke-width="1"/>';
+    o+='<path d="'+colTop(cx(0)-bw/2,y(b),bw,bot-y(b),4)+'" fill="'+C_BASE+'">'+
+      tip('Baseline (same files read whole): '+full(b)+' tokens')+'</path>';
+    o+='<rect x="'+(cx(1)-bw/2)+'" y="'+y(b).toFixed(1)+'" width="'+bw+'" height="'+
+      Math.max(1,y(f)-y(b)).toFixed(1)+'" rx="3" fill="'+C_SAVED+'">'+
+      tip('Avoided by ContextIQ: '+full(sv)+' tokens ('+usd(savedUsd(sv))+')')+
+      '</rect>';
+    o+='<path d="'+colTop(cx(2)-bw/2,y(f),bw,bot-y(f),4)+'" fill="'+C_SENT+'">'+
+      tip('Actually sent: '+full(f)+' tokens ('+usd(spendUsd(f))+')')+'</path>';
+    [['Baseline',fmt(b),'100%',cx(0),y(b)],
+     ['Avoided','-'+fmt(sv),t.reduction_pct+'%',cx(1),y(b)],
+     ['Sent',fmt(f),(Math.round((100-t.reduction_pct)*10)/10)+'%',cx(2),y(f)]
+    ].forEach(function(r){
+      o+='<text x="'+r[3]+'" y="'+(r[4]-10).toFixed(1)+'" text-anchor="middle" '+
+        'font-size="13" font-weight="650" fill="currentColor">'+r[1]+'</text>'+
+        '<text x="'+r[3]+'" y="'+(bot+19)+'" text-anchor="middle" font-size="11" '+
+        'fill="currentColor">'+r[0]+'</text>'+
+        '<text x="'+r[3]+'" y="'+(bot+34)+'" text-anchor="middle" font-size="10" '+
+        'fill="'+MUT+'">'+r[2]+' of baseline</text>';
+    });
+    return svg(w,h,'Waterfall: baseline '+fmt(b)+' tokens, '+fmt(sv)+
+      ' avoided, '+fmt(f)+' sent',o);
+  }
+
+  function areaChart(s){
+    if(!s.length)return empty('No runs in this window',
+      'Widen the date range, or run a few context packs to fill the trend.');
+    var w=560,h=300,x0=64,x1=548,top=30,bot=236,n=s.length,peak=0,i;
+    s.forEach(function(d){peak=Math.max(peak,(d.final||0)+(d.saved||0));});
+    var max=niceMax(peak);
+    function y(v){return bot-(v/max)*(bot-top);}
+    var o=gridY(max,x0,x1,top,bot,4);
+    o+='<line x1="'+x0+'" y1="'+bot+'" x2="'+x1+'" y2="'+bot+
+      '" stroke="var(--line-2)" stroke-width="1"/>';
+    if(n<2){                               // one day of data: columns, not a band
+      var d0=s[0], c=(x0+x1)/2, bw=34;
+      o+='<path d="'+colTop(c-bw-4,y(d0.final||0),bw,bot-y(d0.final||0),4)+
+        '" fill="'+C_SENT+'">'+tip(d0.period+': '+full(d0.final)+' sent')+'</path>'+
+        '<path d="'+colTop(c+4,y(d0.saved||0),bw,bot-y(d0.saved||0),4)+'" fill="'+
+        C_SAVED+'">'+tip(d0.period+': '+full(d0.saved)+' avoided')+'</path>'+
+        '<text x="'+c+'" y="'+(bot+19)+'" text-anchor="middle" font-size="11" '+
+        'fill="'+MUT+'">'+esc(d0.period)+'</text>';
+      return svg(w,h,'Tokens sent and avoided on '+d0.period,o);
+    }
+    function x(i){return x0+i*((x1-x0)/(n-1));}
+    var sentTop='',sentBot='',savTop='',savBot='',lineSent='',lineSav='';
+    for(i=0;i<n;i++){
+      var f=s[i].final||0, tot=f+(s[i].saved||0);
+      sentTop+=x(i).toFixed(1)+','+y(f).toFixed(1)+' ';
+      savTop+=x(i).toFixed(1)+','+y(tot).toFixed(1)+' ';
+      lineSent+=(i?' L':'M')+x(i).toFixed(1)+','+y(f).toFixed(1);
+      lineSav+=(i?' L':'M')+x(i).toFixed(1)+','+y(tot).toFixed(1);
+    }
+    for(i=n-1;i>=0;i--){
+      sentBot+=x(i).toFixed(1)+','+bot+' ';
+      savBot+=x(i).toFixed(1)+','+(y(s[i].final||0)-2).toFixed(1)+' ';
+    }
+    o+='<polygon points="'+(savTop+savBot)+'" fill="'+C_SAVED+'" opacity=".16"/>'+
+      '<polygon points="'+(sentTop+sentBot)+'" fill="'+C_SENT+'" opacity=".16"/>'+
+      '<path d="'+lineSav+'" fill="none" stroke="'+C_SAVED+'" stroke-width="2" '+
+      'stroke-linejoin="round"/>'+
+      '<path d="'+lineSent+'" fill="none" stroke="'+C_SENT+'" stroke-width="2" '+
+      'stroke-linejoin="round"/>';
+    var lastTot=(s[n-1].final||0)+(s[n-1].saved||0);
+    o+='<circle cx="'+x(n-1).toFixed(1)+'" cy="'+y(lastTot).toFixed(1)+
+      '" r="4" fill="'+C_SAVED+'" stroke="'+SURF+'" stroke-width="2"/>'+
+      '<circle cx="'+x(n-1).toFixed(1)+'" cy="'+y(s[n-1].final||0).toFixed(1)+
+      '" r="4" fill="'+C_SENT+'" stroke="'+SURF+'" stroke-width="2"/>'+
+      '<text x="'+(x1-2)+'" y="'+(y(lastTot)-12).toFixed(1)+'" text-anchor="end" '+
+      'font-size="11" font-weight="620" fill="currentColor">'+fmt(lastTot)+
+      ' total</text>';
+    for(i=0;i<n;i++){                      // generous hover targets
+      var t2=(s[i].final||0)+(s[i].saved||0);
+      o+='<circle cx="'+x(i).toFixed(1)+'" cy="'+y(t2).toFixed(1)+'" r="10" '+
+        'fill="transparent">'+tip(s[i].period+' — avoided '+full(s[i].saved)+
+        ', sent '+full(s[i].final)+', '+(s[i].runs||0)+' run(s)')+'</circle>';
+    }
+    var mid=Math.floor((n-1)/2);
+    [[0,'start'],[mid,'middle'],[n-1,'end']].forEach(function(L,k){
+      if(k===1&&n<4)return;
+      o+='<text x="'+x(L[0]).toFixed(1)+'" y="'+(bot+19)+'" text-anchor="'+L[1]+
+        '" font-size="11" fill="'+MUT+'">'+esc(s[L[0]].period)+'</text>';
+    });
+    return svg(w,h,'Daily tokens avoided and sent over '+n+' days',o);
+  }
+
+  function opBars(rows){
+    if(!rows.length)return empty('No operations in this window',
+      'Every context, ask, measure, squeeze or dedupe call lands here.');
+    var top=rows.slice(0,8), total=0;
+    rows.forEach(function(o){total+=o.saved;});
+    var max=Math.max.apply(null,top.map(function(o){return o.saved;}).concat([1]));
+    var w=560,lw=104,right=170,rh=32,bt=14,h=top.length*rh+10,o='';
+    top.forEach(function(r,i){
+      var y=i*rh+8, bw=Math.max(2,(r.saved/max)*(w-lw-right));
+      o+='<text x="0" y="'+(y+bt-2)+'" font-size="12" fill="currentColor">'+
+        esc(String(r.op).slice(0,15))+'</text>'+
+        '<path d="'+barEnd(lw,y,bw,bt,4)+'" fill="'+C_SAVED+'">'+
+        tip(r.op+': '+full(r.saved)+' tokens avoided ('+usd(savedUsd(r.saved))+
+        ') over '+r.runs+' run(s)')+'</path>'+
+        '<text x="'+(lw+bw+8)+'" y="'+(y+bt-3)+'" font-size="11" fill="'+MUT+'">'+
+        fmt(r.saved)+' · '+usd(savedUsd(r.saved))+' · '+pct(r.saved,total)+
+        '%</text>';
+    });
+    return svg(w,h,'Tokens avoided by operation',o);
+  }
+
+  function donut(rows){
+    var runs=0;
+    rows.forEach(function(r){runs+=r.runs;});
+    if(!runs)return empty('No runs yet','Nothing to break down.');
+    var slice=rows.slice(0,5), rest=rows.slice(5), other=0;
+    rest.forEach(function(r){other+=r.runs;});
+    if(other)slice=slice.concat([{op:'other ('+rest.length+')',runs:other}]);
+    var w=240,h=240,cx=120,cy=118,r=94,ir=62,a=0,gap=slice.length>1?2:0,o='';
+    function pt(rad,deg){var t=(deg-90)*Math.PI/180;
+      return [(cx+rad*Math.cos(t)).toFixed(2),(cy+rad*Math.sin(t)).toFixed(2)];}
+    slice.forEach(function(s,i){
+      var span=s.runs/runs*360, a0=a+gap/2, a1=a+span-gap/2, col=CAT[i%CAT.length];
+      a+=span;
+      if(span>=359.5){
+        o+='<circle cx="'+cx+'" cy="'+cy+'" r="'+((r+ir)/2)+'" fill="none" '+
+          'stroke="'+col+'" stroke-width="'+(r-ir)+'">'+
+          tip(s.op+': '+s.runs+' run(s), 100%')+'</circle>';
+        return;
+      }
+      if(a1<=a0)return;
+      var p0=pt(r,a0),p1=pt(r,a1),q1=pt(ir,a1),q0=pt(ir,a0),la=(a1-a0)>180?1:0;
+      o+='<path d="M'+p0[0]+','+p0[1]+'A'+r+','+r+' 0 '+la+' 1 '+p1[0]+','+p1[1]+
+        'L'+q1[0]+','+q1[1]+'A'+ir+','+ir+' 0 '+la+' 0 '+q0[0]+','+q0[1]+'Z" fill="'+
+        col+'">'+tip(s.op+': '+s.runs+' run(s), '+pct(s.runs,runs)+'%')+'</path>';
+    });
+    o+='<text x="'+cx+'" y="'+(cy+4)+'" text-anchor="middle" font-size="30" '+
+      'font-weight="680" fill="currentColor">'+fmt(runs)+'</text>'+
+      '<text x="'+cx+'" y="'+(cy+24)+'" text-anchor="middle" font-size="11" '+
+      'fill="'+MUT+'">runs</text>';
+    var list='<ul class="klist">';
+    slice.forEach(function(s,i){
+      list+='<li class="row"><span class="swatch" style="background:'+
+        CAT[i%CAT.length]+'"></span><span class="nm">'+esc(s.op)+
+        '</span><span class="vl">'+full(s.runs)+' · '+pct(s.runs,runs)+
+        '%</span></li>';
+    });
+    return '<div class="donut-wrap"><div class="chart">'+
+      svg(w,h,'Share of runs by operation',o)+'</div>'+list+'</ul></div>';
+  }
+
+  function heatmap(s){
+    if(!s.length)return empty('No activity yet',
+      'Daily savings appear here once the ledger has entries.');
+    var by={};
+    s.forEach(function(d){by[d.period]={saved:d.saved||0,runs:d.runs||0};});
+    var WEEKS=26, cs=20, gp=4, left=36, top=30, vals=[], k;
+    for(k in by){if(by[k].saved>0)vals.push(by[k].saved);}
+    vals.sort(function(a,b){return a-b;});
+    var q=[0.2,0.4,0.6,0.8].map(function(p){
+      return vals.length?vals[Math.floor(p*(vals.length-1))]:0;});
+    function bucket(v){
+      if(!v)return 0;
+      if(!vals.length)return 3;
+      return v<=q[0]?1:v<=q[1]?2:v<=q[2]?3:v<=q[3]?4:5;
+    }
+    var today=new Date(); today.setHours(12,0,0,0);
+    var start=new Date(today);
+    start.setDate(today.getDate()-((WEEKS-1)*7+today.getDay()));
+    var w=left+WEEKS*(cs+gp)+8, h=top+7*(cs+gp)+32, o='', lastMonth=-1;
+    for(var i=0;i<WEEKS*7;i++){
+      var d=new Date(start); d.setDate(start.getDate()+i);
+      if(d>today)continue;
+      var col=Math.floor(i/7), row=i%7, key=dkey(d), cell=by[key];
+      var v=cell?cell.saved:0, x=left+col*(cs+gp), y=top+row*(cs+gp);
+      o+='<rect x="'+x+'" y="'+y+'" width="'+cs+'" height="'+cs+'" rx="3" fill="'+
+        SEQ[bucket(v)]+'">'+tip(key+(cell?(': '+full(v)+' tokens avoided · '+
+        cell.runs+' run(s)'):': no runs'))+'</rect>';
+      if(row===0&&d.getMonth()!==lastMonth&&d.getDate()<=7){
+        lastMonth=d.getMonth();
+        o+='<text x="'+x+'" y="'+(top-9)+'" font-size="10" fill="'+MUT+'">'+
+          MONTHS[d.getMonth()]+'</text>';
+      }
+    }
+    ['Mon','Wed','Fri'].forEach(function(lab,j){
+      o+='<text x="0" y="'+(top+(j*2+1)*(cs+gp)+cs-2)+'" font-size="10" fill="'+
+        MUT+'">'+lab+'</text>';
+    });
+    var lx=left, ly=h-15;
+    o+='<text x="'+lx+'" y="'+(ly+cs-3)+'" font-size="10" fill="'+MUT+
+      '">less</text>';
+    for(var b=0;b<6;b++){
+      o+='<rect x="'+(lx+30+b*(cs+gp))+'" y="'+ly+'" width="'+cs+'" height="'+cs+
+        '" rx="3" fill="'+SEQ[b]+'"/>';
+    }
+    o+='<text x="'+(lx+36+6*(cs+gp))+'" y="'+(ly+cs-3)+'" font-size="10" fill="'+
+      MUT+'">more</text>';
+    return svg(w,h,'Daily savings over the last '+WEEKS+' weeks',o);
+  }
+
+  function gauge(t){
+    var w=260,h=152,cx=130,cy=128,r=96,sw=18;
+    var val=Math.max(0,Math.min(100,Number(t.reduction_pct)||0)), frac=val/100;
+    function arc(f){
+      var ang=Math.PI*f;
+      return 'M'+(cx-r)+','+cy+' A'+r+','+r+' 0 '+(f>0.5?1:0)+' 1 '+
+        (cx-r*Math.cos(ang)).toFixed(2)+','+(cy-r*Math.sin(ang)).toFixed(2);
+    }
+    var o='<path d="'+arc(1)+'" fill="none" stroke="var(--track)" stroke-width="'+
+      sw+'" stroke-linecap="round"/>';
+    if(frac>0.004){
+      o+='<path d="'+arc(frac)+'" fill="none" stroke="'+C_SAVED+'" stroke-width="'+
+        sw+'" stroke-linecap="round">'+tip('Prompts are '+val+
+        '% smaller than the same files read whole')+'</path>';
+    }
+    o+='<text x="'+cx+'" y="'+(cy-18)+'" text-anchor="middle" font-size="40" '+
+      'font-weight="700" fill="currentColor">'+val+'%</text>'+
+      '<text x="'+cx+'" y="'+(cy+4)+'" text-anchor="middle" font-size="12" '+
+      'fill="'+MUT+'">of baseline avoided</text>'+
+      '<text x="'+(cx-r)+'" y="'+(cy+22)+'" text-anchor="middle" font-size="10" '+
+      'fill="'+MUT+'">0%</text>'+
+      '<text x="'+(cx+r)+'" y="'+(cy+22)+'" text-anchor="middle" font-size="10" '+
+      'fill="'+MUT+'">100%</text>';
+    return svg(w,h,'Prompt reduction gauge: '+val+
+      ' percent of baseline tokens avoided',o);
+  }
+
+  function modelNames(){
+    var names=Object.keys(state.data.prices||{});
+    names.sort(function(a,b){
+      return state.data.prices[b]-state.data.prices[a];});
+    return names;
+  }
+
+  function modelChart(t){
+    var names=modelNames();
+    if(!names.length||!t.saved)return empty('No pricing comparison yet',
+      'Once the ledger records savings, every priced model is compared here.');
+    var max=Math.max.apply(null,names.map(function(m){
+      return t.saved/1e6*state.data.prices[m];}).concat([1e-9]));
+    var w=940,lw=150,right=200,rh=28,bt=14,h=names.length*rh+10,o='';
+    names.forEach(function(m,i){
+      var v=t.saved/1e6*state.data.prices[m], sel=(m===state.model);
+      var y=i*rh+7, bw=Math.max(2,(v/max)*(w-lw-right));
+      if(sel)o+='<rect x="0" y="'+(y-4)+'" width="'+w+'" height="'+(rh-3)+
+        '" rx="6" fill="var(--brand-soft)"/>';
+      o+='<text x="6" y="'+(y+bt-2)+'" font-size="11.5" font-weight="'+
+        (sel?'660':'400')+'" fill="currentColor">'+esc(m)+'</text>'+
+        '<path d="'+barEnd(lw,y,bw,bt,4)+'" fill="'+C_SENT+'" opacity="'+
+        (sel?'1':'.6')+'">'+tip(m+': '+usd(v)+' avoided on '+full(t.saved)+
+        ' tokens at $'+state.data.prices[m]+' per 1M input tokens')+'</path>'+
+        '<text x="'+(lw+bw+8)+'" y="'+(y+bt-3)+'" font-size="11" fill="'+MUT+'">'+
+        usd(v)+(sel?' · selected':'')+'</text>';
+    });
+    return svg(w,h,'Cost avoided by pricing model',o);
+  }
+
+  function modelTable(t){
+    var names=modelNames();
+    if(!names.length)return '';
+    var o='<div class="table-wrap" tabindex="0" role="region" '+
+      'aria-label="Cost by pricing model"><table><caption class="sr">'+
+      'Projected cost avoided and estimated spend for every priced model'+
+      '</caption><thead><tr><th scope="col">Model</th>'+
+      '<th scope="col" class="n">Input $/1M</th>'+
+      '<th scope="col" class="n">Output $/1M</th>'+
+      '<th scope="col" class="n">Cost avoided</th>'+
+      '<th scope="col" class="n">Est. spend on sent</th>'+
+      '<th scope="col" class="n">Baseline cost</th></tr></thead><tbody>';
+    names.forEach(function(m){
+      var p=state.data.prices[m], io=priceIo(m);
+      o+='<tr'+(m===state.model?' class="is-sel"':'')+'><td>'+esc(m)+
+        (m===state.model?' <span class="pill info">selected</span>':'')+
+        '</td><td class="n">$'+(p<1?p.toFixed(3):p.toFixed(2))+'</td>'+
+        '<td class="n">'+(io.output==null?'—':'$'+Number(io.output).toFixed(2))+
+        '</td><td class="n">'+usd(t.saved/1e6*p)+'</td><td class="n">'+
+        usd(t.final/1e6*p)+'</td><td class="n">'+usd(t.baseline/1e6*p)+'</td></tr>';
+    });
+    return o+'</tbody></table></div>';
+  }
+
+  function opTable(rows,t){
+    if(!rows.length)return '';
+    var o='<div class="table-wrap" tabindex="0" role="region" '+
+      'aria-label="Savings by operation"><table><caption class="sr">'+
+      'Per-operation totals for the selected window</caption><thead><tr>'+
+      '<th scope="col">Operation</th><th scope="col" class="n">Runs</th>'+
+      '<th scope="col" class="n">Baseline</th><th scope="col" class="n">Sent</th>'+
+      '<th scope="col" class="n">Avoided</th>'+
+      '<th scope="col" class="n">Reduction</th><th scope="col" class="n">Share</th>'+
+      '<th scope="col" class="n">Cost avoided</th></tr></thead><tbody>';
+    rows.forEach(function(r){
+      o+='<tr><td>'+esc(r.op)+'</td><td class="n">'+full(r.runs)+
+        '</td><td class="n">'+full(r.baseline)+'</td><td class="n">'+full(r.final)+
+        '</td><td class="n">'+full(r.saved)+'</td><td class="n">'+
+        pct(r.saved,r.baseline)+'%</td><td class="n">'+pct(r.saved,t.saved)+
+        '%</td><td class="n">'+usd(savedUsd(r.saved))+'</td></tr>';
+    });
+    return o+'</tbody></table></div>';
+  }
+
+  function wsCards(ws,d){
+    var tiles=[], lg=d.ledger||{};
+    if(ws&&ws.files){
+      tiles=[['Files indexed',full(ws.files),'tracked in the code graph'],
+             ['Symbols',full(ws.symbols),'functions, classes, methods'],
+             ['Graph edges',full(ws.edges),'calls, imports, inheritance'],
+             ['Indexed chunks',full(ws.chunks),'retrievable text blocks'],
+             ['Module summaries',full(ws.summaries),'reused by future packs'],
+             ['Tokens in repo',fmt(ws.indexed_tokens),'estimated across indexed files'],
+             ['Graph size',(Number(ws.db_bytes||0)/1048576).toFixed(1)+' MB',
+              'tokengraph/graph.db']];
+    }
+    if(lg.first_ts){
+      tiles.push(['First run',
+        new Date(lg.first_ts*1000).toLocaleDateString(),'oldest ledger entry']);
+      tiles.push(['Active days',full(lg.active_days),
+        'days with at least one recorded run']);
+    }
+    if(!tiles.length)return empty('No graph index found',
+      'Workspace facts appear once the graph database exists — run an index or '+
+      'any context call.');
+    var o='<div class="grid g-4">';
+    tiles.forEach(function(t){
+      o+='<div class="stat sm"><div class="k">'+esc(t[0])+'</div>'+
+        '<div class="v num">'+esc(t[1])+'</div><div class="n">'+esc(t[2])+
+        '</div></div>';
+    });
+    return o+'</div>';
+  }
+
+  function langBars(ws){
+    var langs=(ws&&ws.languages)||[];
+    if(!langs.length)return empty('No language breakdown',
+      'Index the workspace to see what the graph covers.');
+    var top=langs.slice(0,8), tot=0;
+    langs.forEach(function(l){tot+=l.files;});
+    var max=Math.max.apply(null,top.map(function(l){return l.files;}).concat([1]));
+    var w=940,lw=140,right=220,rh=30,bt=14,h=top.length*rh+10,o='';
+    top.forEach(function(l,i){
+      var y=i*rh+8, bw=Math.max(2,(l.files/max)*(w-lw-right));
+      o+='<text x="0" y="'+(y+bt-2)+'" font-size="12" fill="currentColor">'+
+        esc(String(l.language).slice(0,14))+'</text>'+
+        '<path d="'+barEnd(lw,y,bw,bt,4)+'" fill="'+C_SENT+'">'+
+        tip(l.language+': '+full(l.files)+' file(s), '+fmt(l.tokens)+
+        ' tokens indexed')+'</path>'+
+        '<text x="'+(lw+bw+8)+'" y="'+(y+bt-3)+'" font-size="11" fill="'+MUT+'">'+
+        full(l.files)+' files · '+fmt(l.tokens)+' tok · '+pct(l.files,tot)+
+        '%</text>';
+    });
+    return svg(w,h,'Indexed files by language',o);
+  }
+
+  function rowsTable(rows){
+    if(!rows.length)return empty('No records in this window',
+      'Savings are appended to the ledger as you use the graph.');
+    var o='<div class="table-wrap" tabindex="0" role="region" '+
+      'aria-label="Raw ledger records"><table><caption class="sr">'+
+      'Most recent ledger entries, newest first</caption><thead><tr>'+
+      '<th scope="col">When</th><th scope="col">Operation</th>'+
+      '<th scope="col" class="n">Files</th><th scope="col" class="n">Baseline</th>'+
+      '<th scope="col" class="n">Sent</th><th scope="col" class="n">Avoided</th>'+
+      '<th scope="col" class="n">Reduction</th>'+
+      '<th scope="col" class="n">Cost avoided</th></tr></thead><tbody>';
+    rows.slice().reverse().slice(0,50).forEach(function(r){
+      o+='<tr><td>'+esc(r.ts?new Date(r.ts*1000).toLocaleString():'—')+'</td><td>'+
+        esc(r.op||'?')+'</td><td class="n">'+(r.files==null?'—':full(r.files))+
+        '</td><td class="n">'+full(r.baseline_tokens)+'</td><td class="n">'+
+        full(r.final_tokens)+'</td><td class="n">'+full(r.saved)+
+        '</td><td class="n">'+(r.reduction_pct||0)+'%</td><td class="n">'+
+        usd(savedUsd(Number(r.saved)||0))+'</td></tr>';
+    });
+    return o+'</tbody></table></div>';
+  }
+
+  /* ---------- draw --------------------------------------------------------- */
+  function draw(){
+    var d=state.data, s=series(), t=totals(s), op=ops();
+    var lg=d.ledger||{}, ws=d.workspace_stats||{};
+
+    set('hero-value',usd(savedUsd(t.saved)));
+    set('hero-sub',fmt(t.saved)+' tokens never sent · prompts '+
+      t.reduction_pct+'% smaller · '+rangeLabel());
+    set('hero-note','Reading the same files whole would have cost '+
+      usd(savedUsd(t.baseline))+' in input tokens; the packs cost '+
+      usd(spendUsd(t.final))+'.');
+
+    set('m-saved',fmt(t.saved));
+    set('k-saved-n',full(t.saved)+' tokens · '+rangeLabel());
+    put('k-spark',sparkline(s.slice(-14).map(function(x){return x.saved||0;})));
+    set('m-sent',fmt(t.final));
+    set('k-sent-n',pct(t.final,t.baseline)+'% of a '+fmt(t.baseline)+
+      '-token baseline');
+    set('m-spend',usd(spendUsd(t.final)));
+    set('k-spend-n',state.model+' '+priceLabel());
+    set('m-red',t.reduction_pct+'%');
+    set('k-red-n','smaller than reading those files whole');
+    set('m-runs',full(t.runs||0));
+    set('k-runs-n',op.length+' operation type(s) recorded');
+    set('m-baseline',fmt(t.baseline));
+    set('m-avg',t.runs?fmt(Math.round(t.saved/t.runs)):'—');
+    set('m-leverage',t.final?((t.baseline/t.final).toFixed(1)+'×'):'—');
+    set('m-files',full(t.files||0));
+    set('unit-price',priceLabel());
+
+    put('c-gauge',gauge(t));
+    put('c-waterfall',waterfall(t));
+    put('c-area',areaChart(s));
+    put('c-heat',heatmap(d.daily||[]));
+    put('c-ops',opBars(op));
+    put('c-mix',donut(op));
+    put('c-optable',opTable(op,t));
+    put('c-models',modelChart(t));
+    put('c-modeltable',modelTable(t));
+    put('c-ws',wsCards(ws,d));
+    put('c-langs',langBars(ws));
+    put('c-rows',rowsTable(windowRows()));
+
+    set('range-note',state.range==='all'
+      ? 'Showing all '+full((d.totals||{}).runs||0)+' recorded run(s).'
+      : 'Showing the last '+state.range+' days.'+(d.rows_capped?
+        ' Per-operation and log views cover the most recent '+
+        (d.rows||[]).length+' entries.':''));
+    set('ws-chip',d.workspace||'workspace');
+    put('meta','Workspace <b>'+esc(d.workspace||'—')+'</b>'+
+      (d.generated_at?(' · generated '+esc(d.generated_at)):'')+' · '+
+      (state.live?'<span class="pill live"><span class="dot"></span>live</span>'
+                 :'<span class="pill">snapshot</span>')+
+      (state.err?' <span class="pill warn">offline · showing last snapshot</span>'
+                 :''));
+    put('onboard',t.runs?'':
+      '<div class="banner info"><div><b>No runs in this window yet.</b> '+
+      'ContextIQ appends one line to <code>.context/gain.ndjson</code> every '+
+      'time it builds a context pack — run a context, ask or measure call (or '+
+      'use the MCP tools), then refresh.</div></div>');
+    set('foot-gen',d.generated_at||'not stamped');
+    set('foot-ver','schema v'+(d.version||1));
+  }
+
+  /* ---------- controls ------------------------------------------------------ */
+  function applyTheme(){
+    var r=document.documentElement;
+    if(r){
+      if(state.theme==='auto'){if(r.removeAttribute)r.removeAttribute('data-theme');}
+      else if(r.setAttribute)r.setAttribute('data-theme',state.theme);
+    }
+    set('btn-theme',state.theme==='dark'?'☾':(state.theme==='light'?'☀':'◐'));
+    var b=el('btn-theme');
+    if(b&&b.setAttribute)b.setAttribute('aria-label',
+      'Colour theme: '+state.theme+'. Activate to change.');
+  }
+  function controls(){
+    var d=state.data, ms=el('sel-model'), rs=el('sel-range'), ck=el('chk-auto');
+    if(ms){
+      Object.keys(d.prices||{}).forEach(function(m){
+        var o=document.createElement('option');
+        o.value=m; o.textContent=m;
+        ms.appendChild(o);
+      });
+      ms.value=state.model;
+      ms.addEventListener('change',function(){
+        state.model=ms.value; writeHash(); draw();});
+    }
+    if(rs){
+      rs.value=state.range;
+      rs.addEventListener('change',function(){
+        state.range=rs.value; writeHash(); draw();});
+    }
+    if(ck){
+      ck.checked=state.auto;
+      ck.addEventListener('change',function(){
+        state.auto=ck.checked; writeHash(); startTimer();});
+    }
+    on('btn-theme','click',function(){
+      state.theme=THEMES[(THEMES.indexOf(state.theme)+1)%THEMES.length];
+      applyTheme(); writeHash();});
+    on('btn-refresh','click',function(){
+      if(location.protocol==='file:'){location.reload();return;}
+      refresh(); startTimer();});
+  }
+
+  function refresh(){
+    if(location.protocol==='file:'){draw();return;}
+    fetch('data.json',{cache:'no-store'}).then(function(r){
+      if(!r.ok)throw 0;
+      return r.json();
+    }).then(function(j){
+      state.live=true; state.err=false;
+      var s=sig(j);
+      if(s===state.sig){renderTimer();return;}   // nothing changed — no redraw
+      state.sig=s; state.data=j; draw();
+    }).catch(function(){state.err=true; draw();});
+  }
+
+  /* ---------- auto-refresh: visible countdown, pausable --------------------- */
+  function period(){return location.protocol==='file:'?15:10;}
+  function renderTimer(){
+    var c=el('countdown');
+    if(!c)return;
+    c.textContent=state.auto?('refresh in '+state.left+'s'):'auto-refresh paused';
+  }
+  function startTimer(){
+    if(tick){clearInterval(tick);tick=null;}
+    state.left=period();
+    renderTimer();
+    if(!state.auto)return;
+    tick=setInterval(function(){
+      state.left--;
+      if(state.left<=0){
+        if(location.protocol==='file:'){
+          // file:// cannot fetch the ledger — reload instead. The hash carries
+          // the current selections across, so the reload is seamless.
+          location.reload();return;
+        }
+        state.left=period();refresh();
+      }
+      renderTimer();
+    },1000);
+  }
+
+  function start(){
+    state.data=JSON.parse(el('ciq-data').textContent);
+    var h=readHash();
+    state.model=(h.model&&state.data.prices[h.model]!==undefined)
+      ?h.model:state.data.model;
+    state.range=(RANGES.indexOf(h.range)>=0)?h.range:'all';
+    state.auto=(h.auto!=='0');
+    state.theme=(THEMES.indexOf(h.theme)>=0)?h.theme:'auto';
+    state.sig=sig(state.data);
+    applyTheme();
+    controls();
+    writeHash();
+    refresh();
+    startTimer();
+  }
+  if(document.readyState!=='loading')start();
+  else document.addEventListener('DOMContentLoaded',start);
+})();
+"""
+
+# Document skeleton. Every value is filled in by the view layer, so the file is
+# meaningful with JS disabled only as a shell — the skeleton ships loading
+# placeholders rather than fake numbers, and never hard-codes a figure.
+_REPORT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="ContextIQ token usage and savings for this workspace.">
+<title>ContextIQ — token usage</title>
+<style>__CSS__</style></head><body>
+<a class="skip" href="#main">Skip to dashboard</a>
+<header class="appbar no-print">
+  <div class="wrap row">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 4.2h12M2 8h8M2 11.8h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12.6" cy="11.4" r="2.2" stroke="currentColor" stroke-width="1.6"/></svg></span>
+      ContextIQ<span class="sub">Token intelligence</span>
+    </div>
+    <nav class="appnav" aria-label="Dashboard sections">
+      <a href="#s-overview">Overview</a><a href="#s-savings">Savings</a>
+      <a href="#s-ops">Operations</a><a href="#s-cost">Cost by model</a>
+      <a href="#s-workspace">Workspace</a><a href="#s-log">Activity log</a>
+    </nav>
+    <div class="bar-end">
+      <span class="chip" title="Workspace this report covers">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.2 1.6h4.8A1.5 1.5 0 0 1 14 6.1v5.4A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5v-7Z" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span id="ws-chip">workspace</span></span>
+      <button type="button" class="btn icon" id="btn-theme"
+              aria-label="Colour theme">◐</button>
+    </div>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+  <div class="page-head">
+    <div>
+      <h1>Token usage &amp; savings</h1>
+      <p id="meta"><span class="skel line" style="width:280px;display:inline-block"></span></p>
+    </div>
+    <div class="status">
+      <span class="pill info">local only</span>
+      <span class="pill">read-only</span>
+    </div>
+  </div>
+
+  <div class="toolbar no-print" role="group" aria-label="Report filters">
+    <span class="field"><label for="sel-model">Pricing model</label>
+      <select id="sel-model" aria-describedby="unit-price"></select></span>
+    <span class="muted" id="unit-price" style="font-size:12px"></span>
+    <span class="field"><label for="sel-range">Date range</label>
+      <select id="sel-range">
+        <option value="all">All time</option>
+        <option value="7">Last 7 days</option>
+        <option value="30">Last 30 days</option>
+        <option value="90">Last 90 days</option>
+      </select></span>
+    <span class="spacer"></span>
+    <label class="switch" for="chk-auto"><input type="checkbox" id="chk-auto" checked>
+      Auto-refresh</label>
+    <span class="meta" id="countdown" role="status" aria-live="polite"></span>
+    <button type="button" class="btn" id="btn-refresh">Refresh now</button>
+  </div>
+  <p class="muted" id="range-note" style="font-size:12px;margin-bottom:16px"
+     role="status" aria-live="polite"></p>
+  <div id="onboard"></div>
+
+  <section id="s-overview" aria-labelledby="h-overview">
+    <div class="sec-head"><h2 id="h-overview">Overview</h2>
+      <span class="hint">Projected at list input-token prices — indicative, not billing.</span></div>
+    <div class="grid g-5">
+      <div class="hero">
+        <div class="hero-label">Estimated cost avoided</div>
+        <div class="hero-value" id="hero-value">—</div>
+        <div class="hero-sub" id="hero-sub"></div>
+        <div class="hero-foot"><span id="hero-note"></span></div>
+      </div>
+      <div class="card gauge-card">
+        <div class="card-head"><div><h3>Prompt reduction</h3>
+          <div class="sub">Share of baseline tokens never sent</div></div></div>
+        <div class="chart center" id="c-gauge"><div class="skel chart" style="height:150px"></div></div>
+      </div>
+    </div>
+    <div class="grid g-5" style="margin-top:16px">
+      <div class="stat"><div class="k">Tokens saved</div>
+        <div class="v num" id="m-saved">—</div>
+        <div class="n" id="k-saved-n"></div>
+        <div class="spark" id="k-spark"></div></div>
+      <div class="stat"><div class="k">Tokens sent (consumed)</div>
+        <div class="v num" id="m-sent">—</div><div class="n" id="k-sent-n"></div></div>
+      <div class="stat"><div class="k">Cost of tokens sent</div>
+        <div class="v num" id="m-spend">—</div><div class="n" id="k-spend-n"></div></div>
+      <div class="stat"><div class="k">Reduction</div>
+        <div class="v num" id="m-red">—</div><div class="n" id="k-red-n"></div></div>
+      <div class="stat"><div class="k">Runs</div>
+        <div class="v num" id="m-runs">—</div><div class="n" id="k-runs-n"></div></div>
+    </div>
+    <div class="grid g-4" style="margin-top:16px">
+      <div class="stat sm"><div class="k">Baseline tokens</div>
+        <div class="v num" id="m-baseline">—</div>
+        <div class="n">what whole-file reads would have cost</div></div>
+      <div class="stat sm"><div class="k">Avg. saved per run</div>
+        <div class="v num" id="m-avg">—</div>
+        <div class="n">tokens avoided per recorded call</div></div>
+      <div class="stat sm"><div class="k">Context leverage</div>
+        <div class="v num" id="m-leverage">—</div>
+        <div class="n">baseline ÷ tokens actually sent</div></div>
+      <div class="stat sm"><div class="k">Files covered</div>
+        <div class="v num" id="m-files">—</div>
+        <div class="n">files represented in those packs</div></div>
+    </div>
+  </section>
+
+  <section id="s-savings" aria-labelledby="h-savings">
+    <div class="sec-head"><h2 id="h-savings">Savings</h2>
+      <span class="hint">Every figure comes from the local ledger — nothing is estimated except the $ projection.</span></div>
+    <div class="grid g-2">
+      <div class="card">
+        <div class="card-head"><div><h3>Baseline → avoided → sent</h3>
+          <div class="sub">Where the tokens went, for the selected window</div></div></div>
+        <div class="legend" aria-hidden="true">
+          <span class="item"><i class="key" style="background:var(--s-base)"></i>Baseline</span>
+          <span class="item"><i class="key" style="background:var(--s-saved)"></i>Avoided</span>
+          <span class="item"><i class="key" style="background:var(--s-sent)"></i>Sent</span>
+        </div>
+        <div class="chart" id="c-waterfall"><div class="skel chart"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><h3>Avoided &amp; sent over time</h3>
+          <div class="sub">Daily totals, stacked</div></div></div>
+        <div class="legend" aria-hidden="true">
+          <span class="item"><i class="key" style="background:var(--s-saved)"></i>Avoided</span>
+          <span class="item"><i class="key" style="background:var(--s-sent)"></i>Sent</span>
+        </div>
+        <div class="chart" id="c-area"><div class="skel chart"></div></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><h3>Activity</h3>
+        <div class="sub">Tokens avoided per day, last 26 weeks</div></div></div>
+      <div class="chart center" id="c-heat"><div class="skel chart" style="height:160px"></div></div>
+    </div>
+  </section>
+
+  <section id="s-ops" aria-labelledby="h-ops">
+    <div class="sec-head"><h2 id="h-ops">Operations</h2>
+      <span class="hint">Which retrieval calls produce the savings</span></div>
+    <div class="grid g-23">
+      <div class="card">
+        <div class="card-head"><div><h3>Tokens avoided by operation</h3>
+          <div class="sub">Top 8, with share of total savings</div></div></div>
+        <div class="chart" id="c-ops"><div class="skel chart" style="height:200px"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><h3>Share of runs</h3>
+          <div class="sub">How often each operation is used</div></div></div>
+        <div id="c-mix"><div class="skel chart" style="height:200px"></div></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><h3>Operation detail</h3>
+        <div class="sub">Totals per operation for the selected window</div></div></div>
+      <div id="c-optable"><div class="skel line" style="width:100%"></div></div>
+    </div>
+  </section>
+
+  <section id="s-cost" aria-labelledby="h-cost">
+    <div class="sec-head"><h2 id="h-cost">Cost by model</h2>
+      <span class="hint">Same token counts, priced against every model in the table</span></div>
+    <div class="card">
+      <div class="card-head"><div><h3>Cost avoided per pricing model</h3>
+        <div class="sub">Saved tokens × that model's list input price</div></div></div>
+      <div class="chart center" id="c-models"><div class="skel chart" style="height:220px"></div></div>
+      <div style="margin-top:16px" id="c-modeltable"></div>
+      <p class="muted" style="font-size:12px;margin-top:12px">
+        Input-token list prices only. Output tokens, caching, batching and
+        negotiated rates are not modelled, so treat these as directional.</p>
+    </div>
+  </section>
+
+  <section id="s-workspace" aria-labelledby="h-ws">
+    <div class="sec-head"><h2 id="h-ws">Workspace</h2>
+      <span class="hint">What the local code graph covers</span></div>
+    <div id="c-ws"><div class="skel chart" style="height:110px"></div></div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div><h3>Indexed files by language</h3>
+        <div class="sub">Top 8 languages in the graph</div></div></div>
+      <div class="chart center" id="c-langs"><div class="skel chart" style="height:200px"></div></div>
+    </div>
+  </section>
+
+  <section id="s-log" aria-labelledby="h-log">
+    <div class="sec-head"><h2 id="h-log">Activity log</h2>
+      <span class="hint">Raw ledger records, newest first</span></div>
+    <details>
+      <summary>Raw ledger records</summary>
+      <div class="body" id="c-rows"></div>
+    </details>
+  </section>
+
+  <footer>
+    <div>Source <code>.context/gain.ndjson</code> · counts only, never file
+      paths or queries · stays on this machine.</div>
+    <div class="num">Generated <span id="foot-gen">—</span> · <span id="foot-ver"></span></div>
+  </footer>
+</main>
+<script type="application/json" id="ciq-data">__DATA__</script>
+<script>__JS__</script>
 </body></html>"""
+
+
+def render_report_html(payload: dict, generated_at: str | None = None) -> str:
+    """Render the self-contained report page around an inlined payload."""
+    import json
+    if generated_at and not payload.get("generated_at"):
+        payload = dict(payload, generated_at=generated_at)
+    # "</" is escaped so a value can never terminate the <script> block early.
+    data = json.dumps(payload).replace("</", "<\\/")
+    html = _REPORT_TEMPLATE.replace("__CSS__", _REPORT_CSS)
+    html = html.replace("__JS__", _REPORT_JS)
+    return html.replace("__DATA__", data)
+
+
+# --- per-workspace static usage report (co-located with the graph) ----------
+USAGE_REPORT_NAME = "token-usage.html"
+
+
+def _report_timestamp() -> str:
+    """Local 'when was this built' stamp for the report header."""
+    import datetime as _dt
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def make_report_handler(root: Path, model: str = DEFAULT_GAIN_MODEL):
+    """Build the request handler for the live report (no Streamlit, no deps).
+
+    Serves the page at `/` and the freshly-read ledger at `/data.json`, which
+    the page polls to redraw in place. Callers must bind it to loopback — this
+    is local developer state and must never listen on a public interface.
+    """
+    import json
+    from http.server import BaseHTTPRequestHandler
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _send(self, body: bytes, ctype: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802 (stdlib callback name)
+            path = self.path.split("?", 1)[0]
+            if path == "/data.json":
+                payload = build_report_payload(root, model=model,
+                                               generated_at=_report_timestamp())
+                self._send(json.dumps(payload).encode("utf-8"), "application/json")
+            elif path in ("/", "/index.html"):
+                payload = build_report_payload(root, model=model,
+                                               generated_at=_report_timestamp())
+                self._send(render_report_html(payload).encode("utf-8"),
+                           "text/html; charset=utf-8")
+            else:
+                self.send_error(404)
+
+        def log_message(self, *args):        # keep the console quiet
+            pass
+
+    return _Handler
+
+
+def serve_report(root: Path, port: int = 8787, model: str = DEFAULT_GAIN_MODEL) -> None:
+    """Run the live report on 127.0.0.1:<port> until interrupted."""
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", port), make_report_handler(root, model))
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    print(f"ContextIQ live report on {url}  (Ctrl-C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        srv.server_close()
+
+
+def usage_report_path(root: Path) -> Path:
+    """Where the self-contained per-workspace usage report is written."""
+    return Path(root) / ".tokengraph" / USAGE_REPORT_NAME
+
+
+def write_usage_report(root: Path, model: str = DEFAULT_GAIN_MODEL,
+                       generated_at: str | None = None) -> Path | None:
+    """Render this workspace's token report to .tokengraph/token-usage.html.
+
+    Self-contained (no deps, no server) so any client can just open the file.
+    Best-effort: returns the written path, or None on any failure — never
+    raises (it runs on the hot logging path). Co-located with the graph DB so
+    each workspace carries its own report next to its own state.
+    """
+    try:
+        stamp = generated_at or _report_timestamp()
+        payload = build_report_payload(root, model=model, generated_at=stamp)
+        html = render_report_html(payload)
+        out = usage_report_path(root)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(html, encoding="utf-8")
+        return out
+    except Exception:
+        return None
 
 
 # ==========================================================================
@@ -6987,9 +8846,72 @@ def build_mcp_server(root: Path, db: Path):
         """
         r = _ret()
         try:
-            return r.squeeze(text, kind=kind)
+            res = r.squeeze(text, kind=kind)
+            record_pack_savings(root, "mcp.squeeze",
+                                final_tokens=res.get("squeezed_tokens", 0),
+                                baseline_tokens=res.get("original_tokens", 0), files=0)
+            return res
         finally:
             r.close()
+
+    @mcp.tool
+    def count_tokens_model(text: str, model: str = "gpt-4o") -> dict:
+        """Model-aware token count (GPT / Claude / Gemini / Llama families)."""
+        return {"model": model, "family": model_family(model),
+                "tokens": count_tokens_for_model(text, model),
+                "base_tokens": count_tokens(text)}
+
+    @mcp.tool
+    def estimate_call_cost(prompt: str, model: str = DEFAULT_COST_MODEL,
+                           expected_output_tokens: int = 500,
+                           compare: bool = False) -> dict:
+        """Price an API call *before* sending it — per-model USD, input + output.
+
+        Counts `prompt` with the model-aware tokenizer and multiplies by list
+        prices. Set compare=true to rank every known model cheapest-first so you
+        can pick the cheapest sufficient one. Deterministic, no network.
+        """
+        if compare:
+            return compare_cost(prompt, expected_output_tokens)
+        return estimate_cost(prompt, model, expected_output_tokens)
+
+    @mcp.tool
+    def dedupe_context(blocks: list[str], threshold: float = 0.8) -> dict:
+        """Remove near-duplicate text blocks from a set of context snippets.
+
+        Feed retrieved snippets / tool outputs / pasted context; get back only
+        the non-redundant ones plus the token saving. (Context packs are already
+        deduped automatically; this is for ad-hoc blocks.)
+        """
+        res = dedupe_blocks(blocks, threshold=threshold)
+        record_pack_savings(root, "mcp.dedupe",
+                            final_tokens=res.get("tokens_after", 0),
+                            baseline_tokens=res.get("tokens_before", 0), files=0)
+        return res
+
+    @mcp.tool
+    def score_prompt_quality(prompt: str) -> dict:
+        """Score a prompt 0–100 on clarity / specificity / context / actionability.
+
+        Catches under-specified prompts before they waste a round-trip; returns
+        subscores and concrete fix suggestions. Distinct from judge(), which
+        scores whether an *answer* is grounded.
+        """
+        return score_prompt(prompt)
+
+    @mcp.tool
+    def summarize_chat(transcript: str, max_tokens: int = 400) -> dict:
+        """Compress a long chat transcript into a compact, token-cheap brief.
+
+        Extracts decisions, action items, open questions and the code entities
+        touched, capped at ~max_tokens. Use to carry a session forward without
+        replaying the whole history.
+        """
+        res = summarize_conversation(transcript, max_tokens=max_tokens)
+        record_pack_savings(root, "mcp.summarize",
+                            final_tokens=res.get("summary_tokens", 0),
+                            baseline_tokens=res.get("original_tokens", 0), files=0)
+        return res
 
     @mcp.tool
     def learn(file: str, good: bool, weight: float = 1.0) -> dict:
@@ -7500,6 +9422,10 @@ def cmd_squeeze(args):
         s = r.squeeze(text, kind=args.kind)
     finally:
         r.close()
+    record_pack_savings(Path(args.path).resolve(), "squeeze",
+                        final_tokens=s.get("squeezed_tokens", 0),
+                        baseline_tokens=s.get("original_tokens", 0), files=0,
+                        no_track=getattr(args, "no_track", False))
     if getattr(args, "json", False):
         _emit(s, True)
     else:
@@ -7507,6 +9433,86 @@ def cmd_squeeze(args):
         print(f"\n--- squeezed [{s['kind']}]: {s['original_tokens']} -> "
               f"{s['squeezed_tokens']} tokens ({s['reduction_pct']}% smaller) ---",
               file=sys.stderr)
+
+
+def _read_text_arg(args) -> str:
+    """Resolve inline --text / --text-file / stdin, in that order."""
+    if getattr(args, "text_file", None):
+        return Path(args.text_file).read_text(encoding="utf-8")
+    if getattr(args, "text", None):
+        return args.text
+    return sys.stdin.read()
+
+
+def cmd_cost(args):
+    text = _read_text_arg(args)
+    if args.compare:
+        res = compare_cost(text, args.output_tokens)
+        if getattr(args, "json", False):
+            _emit(res, True)
+        else:
+            c = res["cheapest"]
+            print(f"cheapest: {c['model']}  ${c['total_usd']:.6f}")
+            print(f"{'model':18} {'in$':>10} {'out$':>10} {'total$':>10}")
+            for row in res["by_model"]:
+                print(f"{row['model']:18} {row['input_usd']:>10.6f} "
+                      f"{row['output_usd']:>10.6f} {row['total_usd']:>10.6f}")
+    else:
+        res = estimate_cost(text, args.model, args.output_tokens)
+        if getattr(args, "json", False):
+            _emit(res, True)
+        else:
+            print(f"{res['model']}: {res['input_tokens']} in + "
+                  f"{res['output_tokens']} out = ${res['total_usd']:.6f} "
+                  f"(in ${res['input_usd']:.6f} + out ${res['output_usd']:.6f})")
+
+
+def cmd_prompt_score(args):
+    prompt = _read_text_arg(args)
+    res = score_prompt(prompt)
+    if getattr(args, "json", False):
+        _emit(res, True)
+    else:
+        s = res["subscores"]
+        print(f"score={res['score']} ({res['grade']})  "
+              f"clarity={s['clarity']} specificity={s['specificity']} "
+              f"context={s['context']} actionability={s['actionability']}")
+        for tip in res["suggestions"]:
+            print(f"  - {tip}")
+
+
+def cmd_summarize_chat(args):
+    transcript = _read_text_arg(args)
+    res = summarize_conversation(transcript, max_tokens=args.max_tokens)
+    record_pack_savings(Path(args.path).resolve(), "summarize",
+                        final_tokens=res["summary_tokens"],
+                        baseline_tokens=res["original_tokens"], files=0,
+                        no_track=getattr(args, "no_track", False))
+    if getattr(args, "json", False):
+        _emit(res, True)
+    else:
+        print(res["summary"])
+        print(f"\n--- summarized {res['turns']} turns: {res['original_tokens']} -> "
+              f"{res['summary_tokens']} tokens ({res['reduction_pct']}% smaller) ---",
+              file=sys.stderr)
+
+
+def cmd_dedupe(args):
+    raw = _read_text_arg(args)
+    blocks = [b for b in raw.split(args.sep) if b.strip()] if args.sep \
+        else [b for b in raw.split("\n\n") if b.strip()]
+    res = dedupe_blocks(blocks, threshold=args.threshold)
+    record_pack_savings(Path(args.path).resolve(), "dedupe",
+                        final_tokens=res["tokens_after"],
+                        baseline_tokens=res["tokens_before"], files=0,
+                        no_track=getattr(args, "no_track", False))
+    if getattr(args, "json", False):
+        _emit(res, True)
+    else:
+        print(("\n\n" if not args.sep else args.sep).join(res["kept"]))
+        print(f"\n--- deduped {res['input_blocks']} -> {res['kept_blocks']} blocks: "
+              f"{res['tokens_before']} -> {res['tokens_after']} tokens "
+              f"({res['reduction_pct']}% smaller) ---", file=sys.stderr)
 
 
 def cmd_learn(args):
@@ -7837,17 +9843,21 @@ def cmd_ide_plugin(args):
 
 
 def cmd_dashboard(args):
-    import importlib.util
-    import subprocess
-    if importlib.util.find_spec("streamlit") is None:
-        raise SystemExit("dashboard dependencies missing; install contextiq[dashboard]")
-    spec = importlib.util.find_spec("dashboard")
-    if spec is None or not spec.origin:
-        raise SystemExit("dashboard module is not installed")
-    root = str(Path(args.path).resolve())
-    raise SystemExit(subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", spec.origin,
-         "--", "--path", root]).returncode)
+    """Signpost for the removed Streamlit app.
+
+    `dashboard.py` (Streamlit + plotly) was superseded by the built-in report
+    and has been deleted. The subcommand survives it purely so an old habit or
+    a stale script gets a route to the replacement instead of "unknown
+    command" — it points at the report and writes it if it is missing.
+    """
+    root = Path(args.path).resolve()
+    print("note: the Streamlit `dashboard` was removed — the report is built in "
+          "now (no Streamlit, no plotly, no server).", file=sys.stderr)
+    report = usage_report_path(root)
+    if not report.exists():
+        write_usage_report(root)
+    print(f"  static:  python tokengraph_all.py gain --report   -> {report}")
+    print("  live:    python tokengraph_all.py gain --serve     -> 127.0.0.1")
 
 
 def cmd_import_scip(args):
@@ -8480,15 +10490,20 @@ def cmd_gain(args):
             p.unlink()
         print("savings ledger cleared")
         return
+    if getattr(args, "serve", False):
+        serve_report(root, port=getattr(args, "port", 8787), model=args.model)
+        return
+    if getattr(args, "report", False):
+        out = write_usage_report(root, model=args.model)
+        print(f"wrote {out}" if out else "could not write usage report")
+        return
     s = summarize_gain(root, since=getattr(args, "since", None),
                        model=args.model, top=getattr(args, "top", None),
                        trends=getattr(args, "all", False))
     if getattr(args, "html", None):
-        if not s.get("daily"):
-            s = summarize_gain(root, since=getattr(args, "since", None),
-                               model=args.model, top=getattr(args, "top", None),
-                               trends=True)
-        Path(args.html).write_text(render_gain_html(s), encoding="utf-8")
+        payload = build_report_payload(root, model=args.model,
+                                       generated_at=_report_timestamp())
+        Path(args.html).write_text(render_report_html(payload), encoding="utf-8")
         print(f"wrote {args.html}")
         return
     if getattr(args, "json", False):
@@ -8535,12 +10550,14 @@ def cmd_status(args):
         finally:
             st.close()
     gain = summarize_gain(root)
+    report = usage_report_path(root)
     out = {
         "branch": branch, "dirty_files": dirty,
         "indexed_files": store_stats.get("files", 0),
         "symbols": store_stats.get("symbols", 0),
         "index_age": fresh, "notes": notes,
         "saved_tokens": gain["saved_tokens"], "gain_runs": gain["runs"],
+        "usage_report": str(report) if report.exists() else None,
     }
     if getattr(args, "json", False):
         _emit(out, True)
@@ -8550,6 +10567,8 @@ def cmd_status(args):
           f"index={fresh}")
     print(f"notes={notes}  savings={out['saved_tokens']:,} tok over "
           f"{out['gain_runs']} run(s)")
+    if out["usage_report"]:
+        print(f"report={out['usage_report']}")
 
 
 def build_parser():
@@ -8702,6 +10721,41 @@ def build_parser():
     sq.add_argument("--no-refresh", action="store_true")
     sq.set_defaults(func=cmd_squeeze)
 
+    co = sub.add_parser("cost", help="estimate the USD cost of an API call before sending it")
+    co.add_argument("--text", default=None, help="prompt text (else --text-file or stdin)")
+    co.add_argument("--text-file", default=None)
+    co.add_argument("--model", default=DEFAULT_COST_MODEL,
+                    help=f"model to price (default: {DEFAULT_COST_MODEL})")
+    co.add_argument("--output-tokens", type=int, default=500,
+                    help="expected completion tokens (default: 500)")
+    co.add_argument("--compare", action="store_true", help="rank all models cheapest-first")
+    co.add_argument("--json", action="store_true")
+    co.set_defaults(func=cmd_cost)
+
+    ps = sub.add_parser("prompt-score",
+                        help="score a prompt's quality (clarity/specificity/context/action)")
+    ps.add_argument("--text", default=None, help="prompt text (else --text-file or stdin)")
+    ps.add_argument("--text-file", default=None)
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=cmd_prompt_score)
+
+    sc = sub.add_parser("summarize-chat",
+                        help="compress a chat transcript into a token-cheap brief")
+    sc.add_argument("--text", default=None, help="transcript (else --text-file or stdin)")
+    sc.add_argument("--text-file", default=None)
+    sc.add_argument("--max-tokens", type=int, default=400)
+    sc.add_argument("--json", action="store_true")
+    sc.set_defaults(func=cmd_summarize_chat)
+
+    dd = sub.add_parser("dedupe",
+                        help="remove near-duplicate context blocks (blank-line separated)")
+    dd.add_argument("--text", default=None, help="blocks (else --text-file or stdin)")
+    dd.add_argument("--text-file", default=None)
+    dd.add_argument("--sep", default=None, help="block separator (default: blank line)")
+    dd.add_argument("--threshold", type=float, default=0.8)
+    dd.add_argument("--json", action="store_true")
+    dd.set_defaults(func=cmd_dedupe)
+
     le = sub.add_parser("learn", help="reinforce/penalise a file's local ranking weight")
     le.add_argument("file")
     le.add_argument("--bad", action="store_true", help="penalise instead of reinforce")
@@ -8838,7 +10892,7 @@ def build_parser():
     idp.set_defaults(func=cmd_ide_plugin)
 
     dash = sub.add_parser("dashboard",
-                          help="open the token-savings dashboard for --path")
+                          help="removed — points at `gain --report` / `gain --serve`")
     dash.set_defaults(func=cmd_dashboard)
 
     scip = sub.add_parser("import-scip",
@@ -8934,6 +10988,11 @@ def build_parser():
     gn.add_argument("--all", action="store_true",
                     help="include daily/weekly/monthly trend buckets")
     gn.add_argument("--html", default=None, help="write a self-contained HTML dashboard")
+    gn.add_argument("--report", action="store_true",
+                    help="write the per-workspace report to .tokengraph/token-usage.html")
+    gn.add_argument("--serve", action="store_true",
+                    help="serve the live report on 127.0.0.1 (polls the ledger; no Streamlit)")
+    gn.add_argument("--port", type=int, default=8787, help="port for --serve")
     gn.add_argument("--reset", action="store_true", help="clear the savings ledger")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=cmd_gain)

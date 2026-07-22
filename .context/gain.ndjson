@@ -1,2 +1,0 @@
-{"ts": 1782313633.5400388, "op": "measure", "final_tokens": 5617, "baseline_tokens": 113559, "saved": 107942, "reduction_pct": 95.1, "files": 5}
-{"ts": 1784308744.6816268, "op": "mcp.ask", "final_tokens": 8153, "baseline_tokens": 119676, "saved": 111523, "reduction_pct": 93.2, "files": 5}

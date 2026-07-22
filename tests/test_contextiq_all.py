@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import unittest
@@ -1650,6 +1651,441 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         # the language pack (powers 25+ deep-parsed langs) ships in `all`
         self.assertIn("tree-sitter-language-pack", extras["all"])
         self.assertIn("Repository", pp["project"]["urls"])
+
+
+class ModelAwareTokenTests(unittest.TestCase):
+    """MA-1: model-aware token counting + Llama in the tier tables."""
+
+    def test_family_mapping(self):
+        self.assertEqual(tg.model_family("claude-opus"), "claude")
+        self.assertEqual(tg.model_family("gemini-1.5-pro"), "gemini")
+        self.assertEqual(tg.model_family("llama-3.1-70b"), "llama")
+        self.assertEqual(tg.model_family("gpt-4o"), "gpt")
+        self.assertEqual(tg.model_family("something-unknown"), "gpt")
+
+    def test_counts_scale_by_family(self):
+        text = "def add(a, b):\n    return a + b\n" * 5
+        base = tg.count_tokens(text)
+        self.assertEqual(tg.count_tokens_for_model(text, "gpt-4o"), base)
+        # Llama's ratio inflates vs base; each result is a positive int
+        self.assertGreaterEqual(tg.count_tokens_for_model(text, "llama-3.1-8b"), base)
+        self.assertGreaterEqual(tg.count_tokens_for_model("", "claude-opus"), 1)
+
+    def test_llama_in_tier_tables_and_pricing(self):
+        for tier in ("fast", "balanced", "powerful"):
+            models = tg._tier_info(tier)["models"]
+            self.assertTrue(any("llama" in m for m in models), tier)
+        self.assertIn("llama-3.1-70b", tg.GAIN_PRICES_PER_1M)
+
+
+class CostEstimationTests(unittest.TestCase):
+    """CE-1: price a call before sending it."""
+
+    def test_estimate_from_text(self):
+        res = tg.estimate_cost("write a function that adds two numbers", "claude-sonnet", 300)
+        self.assertGreater(res["input_tokens"], 0)
+        self.assertEqual(res["output_tokens"], 300)
+        self.assertAlmostEqual(
+            res["total_usd"], res["input_usd"] + res["output_usd"], places=9)
+        self.assertGreater(res["total_usd"], 0)
+
+    def test_estimate_from_int_tokens(self):
+        res = tg.estimate_cost(1000, "gpt-4o", 0)
+        self.assertEqual(res["input_tokens"], 1000)
+        self.assertEqual(res["output_usd"], 0.0)
+
+    def test_compare_ranks_cheapest_first(self):
+        res = tg.compare_cost("hello there general context", 200)
+        totals = [r["total_usd"] for r in res["by_model"]]
+        self.assertEqual(totals, sorted(totals))
+        self.assertEqual(res["cheapest"], res["by_model"][0])
+
+    def test_unknown_model_falls_back(self):
+        res = tg.estimate_cost("hi", "no-such-model", 10)
+        self.assertEqual(res["model"], "no-such-model")
+        self.assertGreater(res["total_usd"], 0)
+
+
+class DedupeTests(unittest.TestCase):
+    """DD-1: near-duplicate context removal (blocks + pack pieces)."""
+
+    def test_dedupe_blocks_drops_near_duplicate(self):
+        blocks = [
+            "the quick brown fox jumps over the lazy dog every morning",
+            "the quick brown fox jumps over the lazy dog every single morning",
+            "an entirely unrelated paragraph discussing distributed databases",
+        ]
+        res = tg.dedupe_blocks(blocks, threshold=0.6)
+        self.assertEqual(res["kept_blocks"], 2)
+        self.assertEqual(len(res["removed"]), 1)
+        self.assertGreater(res["tokens_saved"], 0)
+
+    def test_dedupe_blocks_keeps_distinct(self):
+        blocks = ["alpha beta gamma delta", "one two three four five six"]
+        res = tg.dedupe_blocks(blocks)
+        self.assertEqual(res["kept_blocks"], 2)
+        self.assertEqual(res["tokens_saved"], 0)
+
+    def test_pack_dedupes_redundant_pieces(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / ".tokengraph" / "graph.db"
+            _write(root, "mod.py", SAMPLE)
+            tg.index_repo(root, db)
+            r = tg.Retriever(root, db)
+            try:
+                pack = r.find_relevant_context("helper double number", budget_tokens=4000)
+                texts = [p.text for p in pack.pieces]
+                # no two surviving pieces are near-duplicates of each other
+                for i in range(len(texts)):
+                    for j in range(i + 1, len(texts)):
+                        sim = tg._dedup_similarity(
+                            tg._dedup_shingles(texts[i]), tg._dedup_shingles(texts[j]))
+                        self.assertLess(sim, 0.8, (texts[i], texts[j]))
+                self.assertIsInstance(pack.deduped, list)
+            finally:
+                r.close()
+
+
+class PromptQualityTests(unittest.TestCase):
+    """PQ-1: score a prompt (not an answer)."""
+
+    def test_specific_prompt_scores_high(self):
+        res = tg.score_prompt(
+            "fix the retry backoff in `count_tokens` in tokengraph_all.py")
+        self.assertGreaterEqual(res["score"], 70)
+        self.assertIn(res["grade"], ("good", "excellent"))
+
+    def test_vague_prompt_scores_low_with_suggestions(self):
+        res = tg.score_prompt("do something with the stuff")
+        self.assertLess(res["score"], 50)
+        self.assertTrue(res["suggestions"])
+
+    def test_subscores_present(self):
+        res = tg.score_prompt("explain how login works")
+        for k in ("clarity", "specificity", "context", "actionability"):
+            self.assertIn(k, res["subscores"])
+
+    def test_empty_prompt_is_weak(self):
+        res = tg.score_prompt("")
+        self.assertEqual(res["grade"], "weak")
+
+
+class ConversationSummaryTests(unittest.TestCase):
+    """CS-1: compress a chat transcript."""
+
+    TRANSCRIPT = (
+        "User: We need to add Llama support to the tokenizer.\n"
+        "Assistant: Agreed. I will use a per-family ratio in `count_tokens_for_model`.\n"
+        "  TODO: also add pricing for llama models.\n"
+        "User: what about Gemini pricing?\n"
+        "Assistant: We should use the 1.5-pro list price. The plan is to extend "
+        "`MODEL_PRICES_PER_1M`.\n"
+    )
+
+    def test_extracts_sections(self):
+        res = tg.summarize_conversation(self.TRANSCRIPT, max_tokens=300)
+        self.assertEqual(res["turns"], 4)   # 2 user + 2 assistant (TODO line continues turn 2)
+        self.assertTrue(res["decisions"])
+        self.assertTrue(res["action_items"])
+        self.assertTrue(res["open_questions"])
+        self.assertIn("count_tokens_for_model", res["entities"])
+
+    def test_reduces_tokens(self):
+        big = self.TRANSCRIPT * 8
+        res = tg.summarize_conversation(big, max_tokens=200)
+        self.assertLess(res["summary_tokens"], res["original_tokens"])
+        self.assertLessEqual(res["summary_tokens"], 260)  # near the cap
+        self.assertGreater(res["reduction_pct"], 0)
+
+    def test_empty_transcript(self):
+        res = tg.summarize_conversation("")
+        self.assertEqual(res["turns"], 0)
+        self.assertEqual(res["summary"], "")
+
+    def test_redacts_secrets(self):
+        t = ("User: here is the key\nAssistant: I will use "
+             "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 for auth\n")
+        res = tg.summarize_conversation(t)
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", res["summary"])
+
+
+class LedgerLoggingTests(unittest.TestCase):
+    """Every savings-producing optimization tool appends to the gain ledger
+    (so squeeze / dedupe / summarize show up in the dashboard, not just packs)."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        _write(self.root, "mod.py", SAMPLE)
+
+    def _ops(self):
+        return [r["op"] for r in tg.read_gain_ledger(self.root)]
+
+    def _run(self, fn, **kw):
+        import argparse
+        import contextlib
+        import io
+        base = dict(path=str(self.root), json=False, no_refresh=False,
+                    no_track=False, text_file=None)
+        base.update(kw)
+        args = argparse.Namespace(**base)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            fn(args)
+        return args
+
+    def test_dedupe_cli_logs_savings(self):
+        self._run(tg.cmd_dedupe,
+                  text="aaa bbb ccc ddd eee fff\n\naaa bbb ccc ddd eee fff\n\nzzz yyy xxx www",
+                  sep=None, threshold=0.7)
+        rows = [r for r in tg.read_gain_ledger(self.root) if r["op"] == "dedupe"]
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0]["saved"], 0)
+        self.assertEqual(rows[0]["files"], 0)
+
+    def test_summarize_cli_logs_when_it_saves(self):
+        # A genuinely long transcript nets positive savings -> logs a row.
+        turn = ("User: We should refactor the auth module and add retries. "
+                "what about caching the token in redis?\n"
+                "Assistant: Agreed. Decision: use 3 retries with jitter. "
+                "TODO: add a redis client and unit tests.\n")
+        self._run(tg.cmd_summarize_chat, text=turn * 12, max_tokens=200)
+        rows = [r for r in tg.read_gain_ledger(self.root) if r["op"] == "summarize"]
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0]["saved"], 0)
+
+    def test_summarize_short_transcript_not_logged(self):
+        # A short transcript whose section scaffolding (Decisions/Actions/…)
+        # exceeds the original nets saved<=0 — the guard keeps it out of the
+        # ledger so a burst of tiny summaries can't dilute the dashboard totals.
+        short = ("User: Decision: use cl100k. TODO: add tests. what next?\n"
+                 "Assistant: Agreed, plan is to ship. TODO: write docs.\n")
+        res = tg.summarize_conversation(short, max_tokens=300)
+        self.assertLessEqual(res["tokens_saved"], 0)          # precondition
+        self._run(tg.cmd_summarize_chat, text=short, max_tokens=300)
+        self.assertNotIn("summarize", self._ops())
+
+    def test_record_pack_savings_skips_non_savings(self):
+        tg.record_pack_savings(self.root, "unit", final_tokens=120,
+                               baseline_tokens=100, files=0)   # saved = -20
+        tg.record_pack_savings(self.root, "unit", final_tokens=100,
+                               baseline_tokens=100, files=0)   # saved = 0
+        self.assertEqual(tg.read_gain_ledger(self.root), [])
+
+    def test_squeeze_cli_logs(self):
+        self._run(tg.cmd_squeeze,
+                  text=('Traceback (most recent call last):\n'
+                        '  File "app.py", line 5, in main\n    go()\nValueError: nope\n'),
+                  kind="auto")
+        rows = [r for r in tg.read_gain_ledger(self.root) if r["op"] == "squeeze"]
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0]["saved"], 0)
+
+    def test_no_track_opt_out_is_respected(self):
+        self._run(tg.cmd_dedupe, text="aa bb cc dd\n\naa bb cc dd", sep=None,
+                  threshold=0.7, no_track=True)
+        self.assertEqual(tg.read_gain_ledger(self.root), [])
+
+
+class UsageReportTests(unittest.TestCase):
+    """Per-workspace static HTML report co-located with the graph in .tokengraph."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    @staticmethod
+    def _payload_from(html: str) -> dict:
+        """Pull the inlined snapshot back out of the rendered page."""
+        import json
+        import re
+        m = re.search(r'id="ciq-data">(.*?)</script>', html, re.S)
+        return json.loads(m.group(1).replace("<\\/", "</"))
+
+    def test_auto_generated_on_savings(self):
+        tg.record_pack_savings(self.root, "context", final_tokens=3000,
+                               baseline_tokens=100000, files=5)
+        rep = tg.usage_report_path(self.root)
+        self.assertTrue(rep.exists())
+        self.assertEqual(rep.parent.name, ".tokengraph")
+        html = rep.read_text(encoding="utf-8")
+        # every panel container + both controls are present
+        for hook in ("c-waterfall", "c-area", "c-ops", "c-rows",
+                     "sel-model", "sel-range", "Tokens sent (consumed)"):
+            self.assertIn(hook, html)
+        self.assertIn("prefers-color-scheme", html)      # theme-aware
+        # self-contained: no external hosts / CDNs
+        self.assertIsNone(re.search(r"https?://(?!127\.)", html))
+        self.assertNotIn("cdn", html.lower())
+
+    def test_not_generated_when_opted_out(self):
+        tg.record_pack_savings(self.root, "context", final_tokens=10,
+                               baseline_tokens=1000, files=1, no_track=True)
+        self.assertFalse(tg.usage_report_path(self.root).exists())
+
+    def test_write_usage_report_stamps_generated_at(self):
+        tg.record_pack_savings(self.root, "context", final_tokens=1,
+                               baseline_tokens=500, files=1)
+        p = tg.write_usage_report(self.root, generated_at="2026-01-01 00:00")
+        self.assertIsNotNone(p)
+        payload = self._payload_from(p.read_text(encoding="utf-8"))
+        self.assertEqual(payload["generated_at"], "2026-01-01 00:00")
+
+    def test_auto_report_gets_a_real_timestamp(self):
+        tg.record_pack_savings(self.root, "context", final_tokens=1,
+                               baseline_tokens=500, files=1)
+        payload = self._payload_from(
+            tg.usage_report_path(self.root).read_text(encoding="utf-8"))
+        self.assertTrue(payload["generated_at"])   # not blank on the auto path
+
+    def test_payload_schema(self):
+        tg.record_pack_savings(self.root, "context", final_tokens=100,
+                               baseline_tokens=9000, files=2)
+        p = tg.build_report_payload(self.root)
+        self.assertEqual(p["version"], tg.REPORT_SCHEMA_VERSION)
+        for key in ("workspace", "model", "prices", "totals", "by_op",
+                    "daily", "weekly", "monthly", "rows"):
+            self.assertIn(key, p)
+        for key in ("runs", "saved", "baseline", "final", "reduction_pct",
+                    "saved_usd"):
+            self.assertIn(key, p["totals"])
+        # buckets carry baseline/final so the page can recompute a window
+        for key in ("period", "saved", "runs", "baseline", "final"):
+            self.assertIn(key, p["daily"][0])
+        # prices ship with the payload so the model selector works offline
+        self.assertIn("claude-sonnet", p["prices"])
+
+    def test_payload_carries_report_only_extras(self):
+        """Fields the dashboard adds on top of the CLI summary."""
+        tg.record_pack_savings(self.root, "context", final_tokens=100,
+                               baseline_tokens=9000, files=4)
+        p = tg.build_report_payload(self.root)
+        # per-model input+output list prices drive the cost-by-model panel
+        self.assertIn("claude-sonnet", p["prices_io"])
+        self.assertIn("input", p["prices_io"]["claude-sonnet"])
+        # daily buckets carry files so a windowed "files covered" is honest
+        self.assertEqual(p["daily"][0]["files"], 4)
+        self.assertEqual(p["totals"]["files"], 4)
+        # ledger span + workspace facts (empty here: no graph db in the tmp root)
+        self.assertEqual(p["ledger"]["active_days"], 1)
+        self.assertGreater(p["ledger"]["first_ts"], 0)
+        self.assertEqual(p["workspace_stats"], {})
+        self.assertFalse(p["rows_capped"])
+
+    def test_workspace_stats_never_raise_or_create_a_db(self):
+        """Runs on the savings hot path — must degrade, not fail, and stay read-only."""
+        self.assertEqual(tg._workspace_stats(self.root), {})
+        self.assertFalse((self.root / ".tokengraph" / "graph.db").exists())
+        (self.root / ".tokengraph").mkdir(parents=True, exist_ok=True)
+        (self.root / ".tokengraph" / "graph.db").write_text("not a database")
+        self.assertEqual(tg._workspace_stats(self.root), {})
+
+    def test_report_structure_and_accessibility_hooks(self):
+        tg.record_pack_savings(self.root, "context", final_tokens=3000,
+                               baseline_tokens=100000, files=5)
+        html = tg.usage_report_path(self.root).read_text(encoding="utf-8")
+        for hook in ("c-gauge", "c-heat", "c-mix", "c-optable", "c-models",
+                     "c-modeltable", "c-ws", "c-langs"):
+            self.assertIn(hook, html)               # every new panel container
+        for hook in ('class="skip"', 'id="main"', 'aria-live="polite"',
+                     'scope="col"', 'role="img"', '<label for="sel-model">',
+                     "prefers-reduced-motion"):
+            self.assertIn(hook, html)               # a11y affordances
+        # theme is switchable both ways: OS media query + explicit stamp
+        self.assertIn(':root[data-theme="dark"]', html)
+        self.assertIn(':root:not([data-theme="light"])', html)
+
+    def test_payload_row_tail_is_bounded(self):
+        for _ in range(12):
+            tg.record_pack_savings(self.root, "context", final_tokens=1,
+                                   baseline_tokens=100, files=1)
+        p = tg.build_report_payload(self.root, max_rows=5)
+        self.assertEqual(len(p["rows"]), 5)
+
+    def test_renders_with_empty_ledger(self):
+        html = tg.render_report_html(tg.build_report_payload(self.root))
+        self.assertIn("ciq-data", html)          # no crash on an empty ledger
+
+    def _run_js_harness(self, name: str) -> str:
+        """Run the page's own JS in a fake DOM via node; skip if node is absent."""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        harness = Path(__file__).with_name("report_js_harness.js")
+        if not harness.exists():
+            self.skipTest("harness missing")
+        rendered = self.root / name
+        rendered.write_text(
+            tg.usage_report_path(self.root).read_text(encoding="utf-8"),
+            encoding="utf-8")
+        res = subprocess.run([node, str(harness), str(rendered)],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("FAIL", res.stdout, res.stdout)
+        return res.stdout
+
+    def test_report_js_behaviour(self):
+        """Covers what a string assertion can't: UI state round-tripping through
+        location.hash across a file:// reload, the pause toggle, fallback on a
+        garbage hash, and skipping the redraw when a poll returns identical data.
+        """
+        tg.record_pack_savings(self.root, "context", final_tokens=3000,
+                               baseline_tokens=100000, files=1)
+        out = self._run_js_harness("rendered.html")
+        self.assertIn("model restored after reload", out)
+
+    def test_report_js_subcent_precision_on_small_ledger(self):
+        """A young ledger must still price every model distinctly.
+
+        Regression: with fixed 2-dp formatting most models collapsed to "$0.00"
+        on a small ledger, so switching the pricing model looked like a no-op.
+        """
+        tg.record_pack_savings(self.root, "context", final_tokens=800,
+                               baseline_tokens=4000, files=1)   # only 3.2K saved
+        out = self._run_js_harness("small.html")
+        self.assertIn("no $0.00 collapse", out)
+
+    def test_live_server_serves_page_and_data(self):
+        import json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        tg.record_pack_savings(self.root, "context", final_tokens=3000,
+                               baseline_tokens=100000, files=1)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0),
+                                  tg.make_report_handler(self.root))
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{srv.server_port}"
+        self.assertEqual(srv.server_address[0], "127.0.0.1")   # loopback only
+        data = json.loads(urllib.request.urlopen(base + "/data.json").read())
+        self.assertEqual(data["version"], tg.REPORT_SCHEMA_VERSION)
+        before = data["totals"]["saved"]
+        self.assertIn("ciq-data", urllib.request.urlopen(base + "/").read().decode())
+        # /data.json re-reads the ledger, so new ops appear without a restart
+        tg.record_pack_savings(self.root, "dedupe", final_tokens=100,
+                               baseline_tokens=5000, files=0)
+        after = json.loads(
+            urllib.request.urlopen(base + "/data.json").read())["totals"]["saved"]
+        self.assertGreater(after, before)
+
+    def test_gain_report_cli_writes_default_path(self):
+        import argparse
+        import contextlib
+        import io
+        tg.record_pack_savings(self.root, "context", final_tokens=100,
+                               baseline_tokens=9000, files=2)
+        args = argparse.Namespace(path=str(self.root), model=tg.DEFAULT_GAIN_MODEL,
+                                  report=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            tg.cmd_gain(args)
+        self.assertTrue(tg.usage_report_path(self.root).exists())
 
 
 if __name__ == "__main__":

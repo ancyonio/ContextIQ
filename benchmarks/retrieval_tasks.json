@@ -12,7 +12,7 @@
     },
     {
       "task": "show cumulative prompt token savings and cost estimates as interactive charts",
-      "expected_files": ["dashboard.py"]
+      "expected_files": ["tokengraph_all.py"]
     },
     {
       "task": "verify that repository AI configuration files point to valid local resources",
