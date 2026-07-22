@@ -625,16 +625,34 @@ Each case declares the symbols and literal facts an answer would need. A pack is
 | Metric | Measured | Floor (CI) | Meaning |
 |---|--:|--:|---|
 | `recall_at_5` | **0.958** | 0.90 | the right file is in the top 5 |
-| `symbol_recall` | **0.72** | 0.65 | required symbols made it into the pack |
-| `answerable_rate` | **0.51** | 0.45 | pack carried *every* required symbol **and** fact |
-| `irrelevant_token_ratio` | 0.79 | ≤0.85 | budget spent outside the target files |
+| `symbol_recall` | **0.708** | 0.65 | required symbols made it into the pack |
+| `answerable_rate` | **0.469** | 0.45 | pack carried *every* required symbol **and** fact |
+| `irrelevant_token_ratio` | 0.743 | ≤0.85 | budget spent on neither a target file nor anything graph-connected to a target symbol |
 
 Measured at the default 6,000-token budget on the deterministic hash backend.
 
 **Read this honestly:** ContextIQ nearly always finds the right *file*, but at a
-6k budget it carries everything an answer needs only about half the time. Raising
+6k budget it carries everything an answer needs under half the time. Raising
 `answerable_rate` is the main open quality work. Give it a larger budget, or call
 `get_symbol` for anything the pack lists as dropped.
+
+### LLM-judged quality (opt-in)
+
+The gate above proves the required symbols and facts are *present*. It cannot
+prove a model *answers correctly* from them. `judge-eval` closes that gap by
+running the experiment the thesis actually needs — answer each of 36 held-out
+questions twice, once from the ContextIQ pack and once from the **full text of
+the files that contain the answer**, then have an independent judge grade both
+against a rubric:
+
+```bash
+export ANTHROPIC_API_KEY=...      # or: ant auth login
+python tokengraph_all.py judge-eval -o judge.json
+```
+
+The headline is `quality_retention = pack_score / full_score`. **1.0 means
+compression cost no answer quality.** It is opt-in and never runs in CI: it
+makes real API calls and costs real money.
 
 ### Savings
 

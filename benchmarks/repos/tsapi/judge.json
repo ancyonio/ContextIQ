@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "repo": ".",
+  "description": "tsapi held-out judge corpus: open-ended questions about the TypeScript project API (bearer-token auth, sliding-window rate limiter, hand-rolled validation schemas, keyset-paginated Postgres repository, WebSocket notification hub, router and HTTP entry point). Each question is answerable only by reading the real source; the rubric lists atomic factual claims an LLM judge grades a candidate answer against.",
+  "questions": [
+    {
+      "id": "tsapi-01",
+      "question": "How does SlidingWindowLimiter decide whether a request is allowed, and does a rejected request still count towards the caller's quota?",
+      "reference_answer": "hit() computes `progress = (now - bucket.windowStart) / windowMs` and then `weighted = bucket.previousCount * (1 - progress) + bucket.currentCount + 1` — the previous window's count decays linearly as the current window advances, and the +1 accounts for the request being decided. It is allowed when `weighted <= this.config.maxRequests`. A rejected request does not count: `bucket.currentCount += 1` happens only inside `if (allowed)`. With the shipped defaults from config.ts that budget is RATE_LIMIT_MAX_REQUESTS = 120 requests per RATE_LIMIT_WINDOW_MS = 60_000 ms.",
+      "rubric": [
+        "gives the weighted formula: previousCount * (1 - progress) + currentCount + 1",
+        "states progress is how far into the current window we are, so the previous window decays smoothly",
+        "states the request is allowed when the weighted count is <= config.maxRequests",
+        "states currentCount is incremented only when the request is allowed, so rejections do not deepen the hole",
+        "gives the defaults RATE_LIMIT_MAX_REQUESTS 120 and RATE_LIMIT_WINDOW_MS 60_000"
+      ],
+      "cites": ["src/rateLimiter.ts", "src/config.ts"]
+    },
+    {
+      "id": "tsapi-02",
+      "question": "A client POSTs /projects with name \"a\", slug \"My Project\", memberEmails [\"nope\"] and no seatCount. What comes back?",
+      "reference_answer": "createProjectSchema is an ObjectSchema, whose parse walks every key and collects all issues rather than stopping at the first, so the response lists several problems at once: name fails with code \"too_short\" (min 2), slug fails with \"pattern_mismatch\" because it does not match /^[a-z0-9-]+$/, and memberEmails[0] fails with \"pattern_mismatch\" against EMAIL_PATTERN with the path \"memberEmails[0]\". seatCount is not an error at all: it is wrapped in withDefault(1), so undefined becomes 1. handleCreateProject sees parsed.success === false and returns json(422, issuesToResponse(parsed.issues)), i.e. { error: \"validation_failed\", issues: [{path, code, message}, ...] }.",
+      "rubric": [
+        "states ObjectSchema.parse collects every issue instead of failing fast",
+        "states the missing seatCount is not an error because of withDefault(1)",
+        "states the slug is rejected for not matching /^[a-z0-9-]+$/ with code 'pattern_mismatch'",
+        "states the short name is rejected with code 'too_short'",
+        "states the route returns HTTP 422 with body { error: 'validation_failed', issues: [...] } via issuesToResponse"
+      ],
+      "cites": ["src/validation.ts", "src/routes.ts"]
+    },
+    {
+      "id": "tsapi-03",
+      "question": "Two authenticated users behind the same office NAT hit the API. Are they throttled together or separately? And does the RATE_LIMIT_EXEMPT_ROLES setting actually exempt anyone on the routes this service registers?",
+      "reference_answer": "resolveClientKey prefers `user:${ctx.principal.id}` and only falls back to `ip:...` for anonymous traffic, so in isolation authenticated users are keyed separately. But buildRouter registers the limiter as global middleware (`router.use(rateLimitMiddleware(...))`) while requireAuth is attached per-route, and Router.handle builds the chain as `[...globalMiddleware, ...route.middleware]` — so the limiter runs before authentication and ctx.principal is still undefined. In practice both users are keyed by IP and share one bucket, and the exemptRoles check (`ctx.principal?.roles ?? []`) can never match either. The forwarded-for header is consulted only when config.trustProxy is true, which comes from TRUST_PROXY === \"true\"; otherwise the key is `ip:${ctx.remoteAddress ?? \"unknown\"}`.",
+      "rubric": [
+        "states resolveClientKey uses `user:<principal.id>` when a principal exists and `ip:<address>` otherwise",
+        "states the limiter is registered with router.use as global middleware while requireAuth is per-route",
+        "concludes that because global middleware runs first, ctx.principal is undefined at limit time so callers are keyed by IP and share a bucket",
+        "states config.exemptRoles is therefore ineffective on these routes because ctx.principal?.roles is empty",
+        "states x-forwarded-for is only honoured when trustProxy is set (TRUST_PROXY === 'true')"
+      ],
+      "cites": ["src/rateLimiter.ts", "src/routes.ts", "src/router.ts", "src/config.ts"]
+    },
+    {
+      "id": "tsapi-04",
+      "question": "In what order does verifyToken check a token, and what error codes can it produce? Is a token that expired one second ago rejected?",
+      "reference_answer": "verifyToken splits on \".\" and requires exactly three segments (\"malformed_token\"), then recomputes the HMAC-SHA256 over `header.body` with config.jwtSecret and compares it with signaturesMatch — the signature is verified before the payload is even JSON-parsed, and a parse failure afterwards is also \"malformed_token\". A bad signature is \"bad_signature\". Then it checks `claims.exp + config.clockToleranceSeconds < now` (\"token_expired\"), the issuer (\"bad_issuer\") and the audience (\"bad_audience\"). All AuthErrors default to status 401. A token that expired one second ago is still accepted, because clockToleranceSeconds defaults to 30 (JWT_CLOCK_TOLERANCE). requireAuth adds one more check on top: claims.typ must be \"access\", otherwise \"wrong_token_type\" is thrown so a refresh token cannot call the API.",
+      "rubric": [
+        "states the signature is verified before the claims payload is parsed",
+        "lists the error codes malformed_token, bad_signature, token_expired, bad_issuer and bad_audience",
+        "states expiry is compared as exp + clockToleranceSeconds < now, so a token one second past exp is still accepted (default tolerance 30 seconds)",
+        "states AuthError carries a default status of 401",
+        "states requireAuth rejects a token whose typ is not 'access' with code 'wrong_token_type'"
+      ],
+      "cites": ["src/auth.ts", "src/config.ts"]
+    },
+    {
+      "id": "tsapi-05",
+      "question": "What exactly is different between the access token and the refresh token this service mints, and what does the token endpoint report as expiresIn?",
+      "reference_answer": "issueTokenPair builds one shared claim base (sub, roles, iss, aud, iat) and signs two tokens with the SAME config.jwtSecret; the only differences are the `typ` claim (\"access\" versus \"refresh\") and the expiry — `now + config.accessTokenTtl` versus `now + config.refreshTokenTtl`. The defaults in config.ts are ACCESS_TOKEN_TTL_SECONDS = 900 (15 minutes) and REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 14 (14 days), overridable with ACCESS_TOKEN_TTL and REFRESH_TOKEN_TTL. handleIssueToken returns expiresIn = tokens.expiresIn, which issueTokenPair sets to config.accessTokenTtl, plus tokenType \"Bearer\". Roles default to [\"member\"] when the request body omits them.",
+      "rubric": [
+        "states both tokens are signed with the same jwtSecret and differ by the typ claim",
+        "states the access token TTL default is ACCESS_TOKEN_TTL_SECONDS = 900 seconds",
+        "states the refresh token TTL default is REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 14 (14 days)",
+        "states expiresIn in the response is the access token TTL, not the refresh TTL",
+        "states handleIssueToken defaults roles to ['member'] when the body omits them"
+      ],
+      "cites": ["src/auth.ts", "src/config.ts", "src/routes.ts"]
+    },
+    {
+      "id": "tsapi-06",
+      "question": "The service is deployed with NODE_ENV=production, a 20-character JWT_SECRET and no DATABASE_URL. Which failure is reported, and would the same secret be accepted in development?",
+      "reference_answer": "loadConfig reads JWT_SECRET with requireEnv first, then immediately checks `environment === \"production\" && jwtSecret.length < 32` and throws ConfigError(\"JWT_SECRET\", \"must be at least 32 characters in production\"). That happens before the returned object literal is evaluated, and DATABASE_URL's requireEnv call lives inside that literal, so the reported error is the JWT_SECRET one, not the missing database URL. ConfigError's message is prefixed with the variable name (`${variable}: ${message}`) and the variable is exposed on the instance. In development the same 20-character secret is accepted, because the length rule is gated on the production environment only; NODE_ENV itself defaults to \"development\".",
+      "rubric": [
+        "states the reported error is the JWT_SECRET length rule, not the missing DATABASE_URL",
+        "explains that JWT_SECRET is validated before the object literal that reads DATABASE_URL is evaluated",
+        "quotes the 32-character minimum and that it applies only when env is 'production'",
+        "states the same secret is fine in development, and that NODE_ENV defaults to 'development'",
+        "names ConfigError and notes its message is prefixed with the variable name"
+      ],
+      "cites": ["src/config.ts"]
+    },
+    {
+      "id": "tsapi-07",
+      "question": "Two clients race to create a project with the same slug. What does the loser get back, and what happens to the rows the transaction had already written?",
+      "reference_answer": "ProjectRepository.create runs inside withTransaction. The INSERT into projects is wrapped in a try/catch that inspects `(error as {code?: string}).code === UNIQUE_VIOLATION` where UNIQUE_VIOLATION = \"23505\", and rethrows it as DuplicateSlug(input.slug) — a domain error carrying status 409 and code \"duplicate_slug\", with message `the slug \"<slug>\" is already taken`. Because the throw escapes the callback, withTransaction's catch issues ROLLBACK (so no project or project_members rows survive) and the finally block returns the client to the pool. toErrorResponse then reads the status and code off the thrown object, so the client sees HTTP 409 with body { error: { code: \"duplicate_slug\", message, requestId } }.",
+      "rubric": [
+        "names the Postgres unique-violation code 23505 / UNIQUE_VIOLATION as the trigger",
+        "states the driver error is translated into DuplicateSlug with status 409 and code 'duplicate_slug'",
+        "states withTransaction issues a ROLLBACK so the partially written rows are discarded",
+        "states the client is released back to the pool in the finally block",
+        "states toErrorResponse derives the HTTP status and code from the thrown error, producing a 409 JSON envelope containing the requestId"
+      ],
+      "cites": ["src/db.ts", "src/router.ts"]
+    },
+    {
+      "id": "tsapi-08",
+      "question": "How does GET /projects paginate, what page size does a caller get if they ask for 5000 or for nothing at all, and when is nextCursor null?",
+      "reference_answer": "Pagination is keyset, not offset: handleListProjects reads ctx.query.after and listForOwner adds `AND id > $2 ... ORDER BY id ASC LIMIT $3` when a cursor is supplied, so deep pages stay cheap and no row is skipped when a project is inserted mid-scroll. Both the route and the repository run the request through clampPageSize, which returns DEFAULT_PAGE_SIZE = 25 for an absent or NaN value and otherwise clamps into [1, MAX_PAGE_SIZE] with MAX_PAGE_SIZE = 100 — so 5000 becomes 100 and nothing becomes 25. nextCursor is `rows[rows.length - 1].id` only when rows.length === pageSize (a full page); a short page yields null. Both list variants, like findById, also filter on `deleted_at IS NULL`.",
+      "rubric": [
+        "states pagination is keyset-based using `id > $2` with ORDER BY id ASC, not OFFSET",
+        "states an absent or NaN page size falls back to DEFAULT_PAGE_SIZE = 25",
+        "states a request for 5000 is clamped to MAX_PAGE_SIZE = 100 by clampPageSize",
+        "states nextCursor is the last row's id only when a full page was returned, otherwise null",
+        "notes the list query filters out soft-deleted rows with deleted_at IS NULL"
+      ],
+      "cites": ["src/db.ts", "src/routes.ts"]
+    },
+    {
+      "id": "tsapi-09",
+      "question": "A browser tab is killed without closing its WebSocket. Roughly how long before the hub notices, and what close code does the peer get?",
+      "reference_answer": "start() schedules sweepDeadConnections on a setInterval of HEARTBEAT_INTERVAL_MS = 30_000 ms. Each sweep first tests `connection.missedPongs >= MISSED_PONGS_BEFORE_DROP` (2) and only otherwise increments missedPongs and sends a system:ping envelope. So a silent client survives the first sweep (0 -> 1) and the second (1 -> 2) and is disconnected on the third, roughly 90 seconds after it vanished. recordPong resets missedPongs to 0, so a live client never accumulates strikes. disconnect() removes the socket from every topic index, deletes it from the connections map and, if the socket state is still \"open\", calls socket.close(1001, reason) with the reason \"missed heartbeats\". A send that throws during the sweep also disconnects the socket immediately with reason \"ping failed\".",
+      "rubric": [
+        "states the sweep runs every HEARTBEAT_INTERVAL_MS = 30_000 ms",
+        "states the strike limit is MISSED_PONGS_BEFORE_DROP = 2",
+        "works out the socket is dropped on the third sweep, about 90 seconds later, because the check happens before the increment",
+        "states recordPong resets missedPongs to zero",
+        "states disconnect closes with code 1001 and removes the socket from the topic index"
+      ],
+      "cites": ["src/notifications.ts"]
+    },
+    {
+      "id": "tsapi-10",
+      "question": "Which topics is a plain 'member' allowed to subscribe to, in what order are the checks applied, and what HTTP status would a rejected subscription surface as if it reached the error funnel?",
+      "reference_answer": "canSubscribe short-circuits to true for anyone holding the \"admin\" role. Otherwise the topic must split into an `entity:id` pair; \"user\" topics are allowed only when the id equals the caller's principalId, and \"project\" and \"system\" entities are allowed for any authenticated caller — every other entity is refused. NotificationHub.subscribe checks in this order: unknown socket (SubscriptionError \"unknown_socket\"), then the per-socket cap `connection.topics.size >= MAX_TOPICS_PER_SOCKET` (20) with code \"too_many_topics\", and only then the authorisation check with code \"forbidden_topic\" — so a socket at its cap is told it has too many topics even if the new topic would have been forbidden anyway. SubscriptionError carries a `code` but no `status`, so toErrorResponse falls back to 500 while still reporting the specific code.",
+      "rubric": [
+        "states the admin role bypasses the topic check entirely",
+        "states user:<id> topics are only allowed when the id matches the caller's principal id, while project and system entities are open to any caller",
+        "states the topic cap MAX_TOPICS_PER_SOCKET = 20 is checked before the authorisation check",
+        "names the SubscriptionError codes unknown_socket, too_many_topics and forbidden_topic",
+        "states SubscriptionError has no status field, so toErrorResponse defaults the HTTP status to 500"
+      ],
+      "cites": ["src/notifications.ts", "src/router.ts"]
+    },
+    {
+      "id": "tsapi-11",
+      "question": "A client is subscribed to `project:<id>`. Will it receive an event when that project is created? What about when it is archived?",
+      "reference_answer": "No on creation, yes on archive. handleCreateProject broadcasts to `user:${project.ownerId}` with the event name \"project.created\" and a payload of { projectId, slug }, so only a subscriber watching the owner's user topic is notified — a `project:<id>` subscriber sees nothing (and could not have subscribed before the id existed anyway). handleArchiveProject broadcasts to `project:${project.id}` with the event \"project.archived\" and payload { projectId }. broadcast() returns the number of sockets actually written to, returning 0 when the topic index has no subscribers, and it reaps any connection whose socket state is not \"open\" or whose send throws.",
+      "rubric": [
+        "states creation broadcasts to the topic `user:${ownerId}`, not to a project topic",
+        "names the event strings 'project.created' and 'project.archived'",
+        "states archiving broadcasts to `project:${project.id}`",
+        "states broadcast returns the delivered count and returns 0 when nobody is subscribed",
+        "notes broadcast disconnects sockets that are not in the 'open' state or whose send throws"
+      ],
+      "cites": ["src/routes.ts", "src/notifications.ts"]
+    },
+    {
+      "id": "tsapi-12",
+      "question": "A client uploads a 5 MB JSON body. What does the server return, and does the response carry a request id?",
+      "reference_answer": "readJsonBody accumulates chunks while tracking `total`, and throws PayloadTooLarge as soon as total exceeds MAX_BODY_BYTES = 1_048_576 — the check is inside the `for await` loop, so the process never buffers the whole 5 MB. PayloadTooLarge carries status 413 and code \"payload_too_large\", and createRequestListener's catch hands it to toErrorResponse, producing 413 with body { error: { code: \"payload_too_large\", message, requestId } }. The request id, however, is the literal \"unknown\": requestId is only assigned after `await toRequestContext(req)` returns, and toRequestContext awaits readJsonBody, so the throw happens first — and because the failure path writes only response.headers, the x-request-id header is absent too. A body that is merely malformed JSON throws a plain Error with no status, which toErrorResponse degrades to 500 with code \"internal_error\".",
+      "rubric": [
+        "states the limit is MAX_BODY_BYTES = 1_048_576 bytes and is enforced while streaming rather than after buffering",
+        "states PayloadTooLarge yields HTTP 413 with code 'payload_too_large'",
+        "states the requestId reported is 'unknown' because toRequestContext throws before requestId is assigned",
+        "notes the x-request-id header is only set on the success path",
+        "states malformed JSON produces a plain Error and therefore a 500 with code 'internal_error'"
+      ],
+      "cites": ["src/server.ts", "src/router.ts"]
+    }
+  ]
+}

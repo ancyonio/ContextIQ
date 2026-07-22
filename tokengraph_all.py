@@ -86,6 +86,111 @@ def _encoder():
     return _enc
 
 
+# ---- MA-2: real per-vendor tokenizers, when they are available locally -----
+# The previous implementation multiplied one cl100k count by a hardcoded
+# per-family constant and called that "model-aware". It is not: Claude's
+# tokenizer, Gemini's SentencePiece and Llama's SentencePiece segment text
+# genuinely differently, especially on code (identifiers, indentation runs,
+# punctuation). Where a real tokenizer is installed we now use it; where one is
+# not, we say so instead of implying precision we do not have.
+_MODEL_ENCODERS: dict[str, object] = {}
+_MODEL_ENCODER_TRIED: set[str] = set()
+
+# GPT families map to a specific tiktoken encoding rather than always cl100k.
+_TIKTOKEN_ENCODINGS = {
+    "o200k": ("gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "o4"),
+}
+
+
+def _tiktoken_encoding_for(model: str):
+    """Exact tiktoken encoding for an OpenAI model, else None.
+
+    Newer encodings (o200k) are fetched on first use, so this can fail on an
+    offline or proxied machine. Every failure path falls through to the next
+    option rather than returning None early — losing tiktoken entirely because
+    one encoding could not be downloaded would silently drop OpenAI counts to
+    the char heuristic.
+    """
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    m = (model or "").lower()
+    if any(m.startswith(p) for p in _TIKTOKEN_ENCODINGS["o200k"]):
+        try:
+            return tiktoken.get_encoding("o200k_base")
+        except Exception:
+            pass                      # not cached locally; try the model map
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        pass
+    # cl100k is exact for gpt-4/3.5 and a close proxy for o200k models.
+    return _encoder()
+
+
+def _hf_tokenizer(repo_id: str):
+    """Load a local HuggingFace tokenizer without touching the network."""
+    try:
+        from transformers import AutoTokenizer  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        return AutoTokenizer.from_pretrained(repo_id, local_files_only=True)
+    except Exception:
+        return None
+
+
+def _model_encoder(model: str):
+    """Return (encoder, kind) for a model. kind is 'exact' or 'approx'.
+
+    'exact' means a real tokenizer for that vendor ran. 'approx' means we fell
+    back to cl100k (or the char heuristic) and scaled — a documented estimate,
+    not a measurement.
+    """
+    family = model_family(model)
+    # GPT models do NOT share one encoding (gpt-4 is cl100k, gpt-4o is o200k),
+    # so the cache is keyed per-model there and per-family elsewhere.
+    key = f"gpt:{(model or '').lower()}" if family == "gpt" else family
+    if key in _MODEL_ENCODER_TRIED:
+        enc = _MODEL_ENCODERS.get(key)
+        return enc, ("exact" if enc is not None else "approx")
+    _MODEL_ENCODER_TRIED.add(key)
+    enc = None
+    if family == "gpt":
+        enc = _tiktoken_encoding_for(model)
+    elif family == "claude":
+        # Anthropic ships no offline tokenizer; the count endpoint is remote and
+        # this tool is offline-by-default, so Claude stays a calibrated estimate.
+        enc = None
+    elif family == "gemini":
+        enc = _hf_tokenizer(os.environ.get("TOKENGRAPH_GEMINI_TOKENIZER",
+                                           "google/gemma-2-9b"))
+    elif family == "llama":
+        enc = _hf_tokenizer(os.environ.get("TOKENGRAPH_LLAMA_TOKENIZER",
+                                           "meta-llama/Llama-3.1-8B"))
+    if enc is not None:
+        _MODEL_ENCODERS[key] = enc
+    return enc, ("exact" if enc is not None else "approx")
+
+
+def _encode_len(enc, text: str) -> int:
+    """Length of `text` under either a tiktoken or a HuggingFace tokenizer."""
+    try:
+        return len(enc.encode(text, disallowed_special=()))
+    except TypeError:
+        pass
+    except Exception:
+        return 0
+    try:
+        return len(enc.encode(text, add_special_tokens=False))
+    except Exception:
+        try:
+            return len(enc.encode(text))
+        except Exception:
+            return 0
+
+
 def count_tokens(text: str) -> int:
     enc = _encoder()
     if enc is not None:
@@ -119,15 +224,90 @@ def model_family(model: str) -> str:
 
 
 def count_tokens_for_model(text: str, model: str = "gpt-4o") -> int:
-    """Token count adjusted for a specific model's tokenizer family (MA-1).
+    """Token count for a specific model (MA-2).
 
-    Bridges the four families the router advertises (GPT/Claude/Gemini/Llama)
-    from the single cl100k base count, so budgeting/costing is model-aware
-    without shipping four tokenizers.
+    Uses the vendor's real tokenizer when one is installed locally; otherwise
+    falls back to a calibrated estimate over the cl100k count. Call
+    `count_tokens_detail` when you need to know which of the two you got —
+    budgeting against an estimate and against a measurement are different
+    risks and the caller deserves to tell them apart.
     """
+    return count_tokens_detail(text, model)["tokens"]
+
+
+def count_tokens_detail(text: str, model: str = "gpt-4o") -> dict:
+    """Model token count plus provenance: exact tokenizer vs. estimate."""
+    family = model_family(model)
+    enc, kind = _model_encoder(model)
+    if enc is not None:
+        n = _encode_len(enc, text)
+        if n or not text:
+            return {"tokens": max(1, n) if text else 0, "model": model,
+                    "family": family, "method": "exact",
+                    "tokenizer": type(enc).__name__,
+                    "base_tokens": count_tokens(text)}
     base = count_tokens(text)
-    ratio = MODEL_TOKEN_RATIOS.get(model_family(model), 1.0)
-    return max(1, round(base * ratio))
+    ratio = MODEL_TOKEN_RATIOS.get(family, 1.0)
+    return {
+        "tokens": max(1, round(base * ratio)) if text else 0,
+        "model": model, "family": family, "method": "approx",
+        "tokenizer": "cl100k_base×ratio" if _encoder() else "chars/4×ratio",
+        "ratio": ratio, "base_tokens": base,
+        "note": _APPROX_NOTE.get(family, ""),
+    }
+
+
+_APPROX_NOTE = {
+    "claude": ("Anthropic publishes no offline tokenizer, so Claude counts are "
+               "a calibrated estimate. Treat as ±5% for budgeting."),
+    "gemini": ("Estimate. For exact counts install `transformers` and cache a "
+               "Gemma tokenizer locally (TOKENGRAPH_GEMINI_TOKENIZER)."),
+    "llama": ("Estimate. For exact counts install `transformers` and cache a "
+              "Llama tokenizer locally (TOKENGRAPH_LLAMA_TOKENIZER)."),
+    "gpt": "Estimate — install `tiktoken` for exact OpenAI counts.",
+}
+
+
+def count_tokens_claude_api(text: str, model: str = "claude-opus-4-8") -> dict:
+    """Exact Claude token count via the Anthropic count_tokens endpoint (MA-3).
+
+    Anthropic ships no offline tokenizer, so this endpoint is the only exact
+    count for Claude models. It is a *network* call and therefore opt-in: the
+    rest of ContextIQ is offline-by-default and must never block on a request.
+    Falls back to the calibrated estimate, clearly labelled, on any failure.
+    """
+    if offline_mode():
+        d = count_tokens_detail(text, model)
+        d["note"] = "offline mode; exact count not attempted"
+        return d
+    try:
+        import anthropic  # type: ignore[import-not-found]
+        client = anthropic.Anthropic()
+        resp = client.messages.count_tokens(
+            model=model, messages=[{"role": "user", "content": text or ""}])
+        return {"tokens": resp.input_tokens, "model": model,
+                "family": "claude", "method": "exact",
+                "tokenizer": "anthropic count_tokens API",
+                "base_tokens": count_tokens(text)}
+    except Exception as ex:
+        d = count_tokens_detail(text, model)
+        d["note"] = (f"exact count unavailable ({type(ex).__name__}); "
+                     f"returned the calibrated estimate instead")
+        return d
+
+
+def tokenizer_status() -> dict:
+    """Which families can be counted exactly on this machine, and which cannot."""
+    out = {}
+    for family, probe in (("gpt", "gpt-4o"), ("claude", "claude-sonnet"),
+                          ("gemini", "gemini-1.5-pro"), ("llama", "llama-3.1-70b")):
+        enc, kind = _model_encoder(probe)
+        out[family] = {
+            "method": kind,
+            "tokenizer": type(enc).__name__ if enc is not None else None,
+            "note": "" if kind == "exact" else _APPROX_NOTE.get(family, ""),
+        }
+    return out
 
 
 # Per-file signature cap (FR-2a): bound worst-case token cost so a single huge
@@ -145,6 +325,13 @@ MAX_SIGS_PER_FILE = 25
 # relevance to the task, and only the best are emitted.
 # The collection cap must sit well ABOVE the emission cap, or ranking has
 # nothing to choose between and degenerates back to discovery order.
+# Seed candidates pulled from each retrieval arm before fusion. Tuned on the
+# benchmark suite (96 cases, 4 repos): 12 → 20 lifted symbol recall 0.667 →
+# 0.708 and answerability 0.448 → 0.469 while *lowering* wasted tokens; 32 was
+# no better and wasted more. The per-file cap of 4 below is what keeps the
+# extra candidates from crowding the budget.
+SEED_CANDIDATES = 20
+
 MAX_FANOUT_PER_SYMBOL = 150     # neighbours collected from any single symbol
 MAX_NEIGHBOR_CANDIDATES = 600   # global ceiling on collected candidates
 MAX_NEIGHBOR_SIGS = 40          # neighbour signatures actually emitted
@@ -2112,6 +2299,15 @@ CREATE TABLE IF NOT EXISTS weights (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
 );
+-- PK-1: memoised context packs, valid only for the graph version that
+-- produced them.
+CREATE TABLE IF NOT EXISTS pack_cache (
+    key TEXT PRIMARY KEY, graph_version INTEGER NOT NULL,
+    task TEXT NOT NULL, markdown TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}',
+    tokens INTEGER NOT NULL DEFAULT 0, ts REAL NOT NULL DEFAULT 0.0,
+    hits INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pack_cache_ver ON pack_cache(graph_version);
 -- SD-1: per-session ledger of what has already been sent to a given agent
 -- session, so a second retrieval in the same conversation does not re-bill
 -- bodies the model is already holding.
@@ -2126,7 +2322,25 @@ CREATE INDEX IF NOT EXISTS idx_sent_session ON sent_ledger(session);
 
 # Bumped whenever the on-disk table shapes change in a way that older rows
 # cannot satisfy. Store._migrate() rebuilds what it cannot ALTER into place.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# ---- SD-2: session-ledger safety bounds -----------------------------------
+# The ledger is a bet that the model still holds text we sent it earlier. That
+# bet expires. Three independent guards, because each fails differently:
+#
+#  * TTL          — a conversation resumed tomorrow is not the same context.
+#  * entry cap    — stops unbounded growth on a long-lived session.
+#  * window watch — once cumulative delivered tokens exceed the model's usable
+#                   context, the host has almost certainly compacted or
+#                   truncated; anything older can no longer be assumed present.
+#
+# The window guard is the important one: it is the only automatic defence
+# against silently withholding content the model has already dropped.
+SESSION_TTL_SECONDS = 8 * 3600
+SESSION_MAX_ENTRIES = 4000
+SESSION_CONTEXT_WINDOW = 128_000
+# Fraction of the window we trust before assuming compaction has occurred.
+SESSION_WINDOW_SAFETY = 0.5
 
 
 class Store:
@@ -2191,6 +2405,57 @@ class Store:
         self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     # ---- key/value metadata ----
+    # ---- PK-1: context-pack memoisation ----
+    def graph_version(self) -> int:
+        """Monotonic counter bumped whenever the indexed graph changes.
+
+        Every cached pack is stamped with the version that produced it, so a
+        single reindex invalidates the whole cache without any per-file
+        dependency tracking.
+        """
+        try:
+            return int(self.get_meta("graph_version", "0") or 0)
+        except ValueError:
+            return 0
+
+    def bump_graph_version(self) -> int:
+        v = self.graph_version() + 1
+        self.set_meta("graph_version", str(v))
+        return v
+
+    def cached_pack(self, key: str) -> Optional[sqlite3.Row]:
+        row = self.conn.execute(
+            "SELECT * FROM pack_cache WHERE key=? AND graph_version=?",
+            (key, self.graph_version())).fetchone()
+        if row is not None:
+            self.conn.execute(
+                "UPDATE pack_cache SET hits=hits+1 WHERE key=?", (key,))
+        return row
+
+    def store_pack(self, key: str, task: str, markdown: str, meta: str,
+                   tokens: int) -> None:
+        import time as _t
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pack_cache"
+            "(key,graph_version,task,markdown,meta,tokens,ts,hits) "
+            "VALUES(?,?,?,?,?,?,?,0)",
+            (key, self.graph_version(), task, markdown, meta, tokens, _t.time()))
+        self.conn.commit()
+
+    def purge_stale_packs(self) -> int:
+        cur = self.conn.execute(
+            "DELETE FROM pack_cache WHERE graph_version <> ?",
+            (self.graph_version(),))
+        return cur.rowcount or 0
+
+    def pack_cache_stats(self) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(hits),0) h, "
+            "COALESCE(SUM(tokens),0) t FROM pack_cache "
+            "WHERE graph_version=?", (self.graph_version(),)).fetchone()
+        return {"entries": row["n"], "hits": row["h"],
+                "tokens_cached": row["t"], "graph_version": self.graph_version()}
+
     def get_meta(self, key: str, default: str = "") -> str:
         row = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -2429,13 +2694,66 @@ class Store:
             [(session, q, m, h, t, now) for q, m, h, t in entries])
         self.conn.commit()
 
-    def sent_map(self, session: str) -> dict[str, sqlite3.Row]:
-        """qname -> ledger row for everything already sent to this session."""
+    def sent_map(self, session: str, window: int = SESSION_CONTEXT_WINDOW
+                 ) -> tuple[dict[str, sqlite3.Row], dict]:
+        """Everything this session can still be assumed to hold (SD-2).
+
+        Returns (qname -> row, diagnostics). Reuse is a claim about the model's
+        state, not ours, so it is bounded three ways — expiry by age, by entry
+        count, and by cumulative delivered tokens against the usable context
+        window. Crossing the window strongly implies the host compacted or
+        truncated the conversation, so the ledger is dropped rather than
+        withholding content the model no longer has.
+        """
         if not session:
-            return {}
-        return {r["qname"]: r for r in self.conn.execute(
-            "SELECT qname, mode, content_hash, tokens FROM sent_ledger "
-            "WHERE session=?", (session,))}
+            return {}, {"active": False}
+        import time as _t
+        now = _t.time()
+        cutoff = now - SESSION_TTL_SECONDS
+        expired = self.conn.execute(
+            "DELETE FROM sent_ledger WHERE session=? AND ts < ?",
+            (session, cutoff)).rowcount or 0
+
+        rows = self.conn.execute(
+            "SELECT qname, mode, content_hash, tokens, ts FROM sent_ledger "
+            "WHERE session=? ORDER BY ts DESC", (session,)).fetchall()
+
+        limit = int(window * SESSION_WINDOW_SAFETY)
+        total = sum(r["tokens"] for r in rows)
+        reset_reason = ""
+        if total > limit:
+            # Past the trustworthy fraction of the window: assume compaction.
+            self.conn.execute("DELETE FROM sent_ledger WHERE session=?", (session,))
+            self.conn.commit()
+            return {}, {"active": True, "reset": True,
+                        "reset_reason": "context-window exceeded "
+                                        f"({total} > {limit} tokens); assuming "
+                                        f"the host compacted the conversation",
+                        "expired_entries": expired, "tokens_held": 0}
+
+        evicted = 0
+        if len(rows) > SESSION_MAX_ENTRIES:
+            # Keep the most recent; drop the oldest tail.
+            drop = [r["qname"] for r in rows[SESSION_MAX_ENTRIES:]]
+            self.conn.executemany(
+                "DELETE FROM sent_ledger WHERE session=? AND qname=?",
+                [(session, q) for q in drop])
+            rows = rows[:SESSION_MAX_ENTRIES]
+            evicted = len(drop)
+        if expired or evicted:
+            self.conn.commit()
+        return ({r["qname"]: r for r in rows},
+                {"active": True, "reset": False, "expired_entries": expired,
+                 "evicted_entries": evicted, "tokens_held": total,
+                 "window_limit": limit})
+
+    def prune_sessions(self) -> int:
+        """Drop every ledger entry past its TTL, across all sessions."""
+        import time as _t
+        cur = self.conn.execute("DELETE FROM sent_ledger WHERE ts < ?",
+                                (_t.time() - SESSION_TTL_SECONDS,))
+        self.conn.commit()
+        return cur.rowcount or 0
 
     def clear_session(self, session: str = "") -> int:
         """Forget one session's ledger, or all of them when session is empty."""
@@ -3527,17 +3845,99 @@ def _tier_info(tier: str, task: str = "", file: str = "") -> dict:
     return info
 
 
-def tier_for_file(file: str, token_est: int = 0, symbols: int = 0) -> dict:
-    """Per-file complexity routing (MR-2)."""
+def tier_for_file(file: str, token_est: int = 0, symbols: int = 0,
+                  fan_in: int = 0, fan_out: int = 0, max_depth: int = 0,
+                  branches: int = 0) -> dict:
+    """Per-file complexity routing from graph features (MR-3).
+
+    The original version routed on file extension and raw size alone, so a
+    3,000-token data file and a 3,000-token concurrency-critical module got the
+    same answer. Size is a weak proxy for how hard a file is to reason about;
+    what actually predicts difficulty is how entangled it is (fan-in/fan-out),
+    how deeply nested its control flow is, and how many branches it carries.
+
+    Every input beyond `file` is optional, so callers that only know the size
+    still get the old behaviour rather than an error.
+    """
     from os.path import splitext
     ext = splitext(file)[1].lower()
-    if ext in _FAST_EXTS or token_est and token_est < 300:
-        tier = "fast"
-    elif token_est > 3000 or symbols > 40:
+
+    # Config/markup never needs an expensive model regardless of size.
+    if ext in _FAST_EXTS:
+        return _tier_info("fast", file=file)
+
+    score = 0.0
+    reasons: list[str] = []
+
+    def add(points: float, why: str):
+        nonlocal score
+        score += points
+        reasons.append(why)
+
+    # Size still carries real weight: a file that is both large and
+    # symbol-dense reaches `powerful` on those signals alone, preserving the
+    # original size-only contract. What changed is that either signal *by
+    # itself* is now only suggestive, and entanglement can promote a small
+    # file that the old size-only rule would have called easy.
+    if token_est:
+        if token_est < 300:
+            add(-1.0, "very small file")
+        elif token_est > 3000:
+            add(1.5, f"large file ({token_est} tokens)")
+    if symbols > 40:
+        add(1.5, f"many definitions ({symbols})")
+    # Entanglement: a widely-depended-on file is risky to change.
+    if fan_in >= 10:
+        add(1.5, f"high fan-in ({fan_in} dependents)")
+    elif fan_in >= 4:
+        add(0.5, f"moderate fan-in ({fan_in})")
+    if fan_out >= 15:
+        add(1.0, f"high fan-out ({fan_out} dependencies)")
+    # Control-flow complexity beats size as a difficulty signal.
+    if max_depth >= 5:
+        add(1.5, f"deeply nested control flow (depth {max_depth})")
+    elif max_depth >= 4:
+        add(0.5, f"nested control flow (depth {max_depth})")
+    if branches >= 60:
+        add(1.5, f"many branches ({branches})")
+    elif branches >= 25:
+        add(0.5, f"branchy ({branches})")
+
+    if score >= 2.5:
         tier = "powerful"
+    elif score <= 0.0:
+        tier = "fast"
     else:
         tier = "balanced"
-    return _tier_info(tier, file=file)
+    info = _tier_info(tier, file=file)
+    info["complexity_score"] = round(score, 2)
+    info["signals"] = reasons or ["no strong signals; defaulted on size"]
+    return info
+
+
+def file_complexity_features(text: str) -> dict:
+    """Cheap structural signals for routing: nesting depth and branch count.
+
+    Language-agnostic on purpose — it reads indentation and branch keywords
+    rather than parsing, so it works for every language the indexer supports
+    without a per-language implementation.
+    """
+    import re as _re3
+    branch_rx = _re3.compile(
+        r"\b(if|elif|else\s+if|for|while|case|catch|except|switch|when|"
+        r"&&|\|\|)\b")
+    max_depth = depth = 0
+    branches = 0
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "//", "*", "--")):
+            continue
+        indent = len(line) - len(line.lstrip())
+        # 4 spaces (or a tab) per level is the overwhelmingly common convention.
+        depth = indent // 4 if " " in line[:4] else line.count("\t")
+        max_depth = max(max_depth, depth)
+        branches += len(branch_rx.findall(stripped))
+    return {"max_depth": max_depth, "branches": branches}
 
 
 # ==========================================================================
@@ -3886,6 +4286,11 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
     # embedding space. Normally a no-op; after a backend switch (or an
     # interrupted index) it is what restores semantic search instead of
     # leaving it silently returning nothing.
+    # PK-1: any structural change invalidates every memoised pack.
+    if report.parsed or report.removed:
+        store.bump_graph_version()
+        store.purge_stale_packs()
+
     missing = store.symbols_missing_vectors()
     if missing:
         batch = 256
@@ -4219,12 +4624,84 @@ def _cs_parse_turns(transcript: str) -> list[tuple[str, str]]:
     return [(r, t) for r, t in turns if t]
 
 
-def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
-    """Extractive summary of a chat transcript, capped at ~max_tokens (CS-1).
+_STOPWORDS = frozenset("""
+a an the and or but if then else so of to in on at by for with from as is are
+was were be been being it its this that these those i you we they he she them
+us our your their my me do does did done have has had will would can could
+should shall may might must not no yes just about into over under again very
+too also than there here what which who whom when where why how all any both
+each few more most other some such only own same s t don now
+""".split())
 
-    Pulls out decisions, action items / open questions, and the code entities
-    (files, identifiers) the conversation touched, then renders a compact brief.
-    Returns the summary text plus the token saving vs. replaying the transcript.
+
+def _sentence_tokens(sentence: str) -> set[str]:
+    return {w for w in _tokenize(sentence) if w not in _STOPWORDS and len(w) > 2}
+
+
+def _textrank(sentences: list[str], top_k: int, damping: float = 0.85,
+              iterations: int = 30) -> list[int]:
+    """Rank sentences by TextRank; return indices, most central first (CS-2).
+
+    A graph of sentences weighted by normalised term overlap, scored with
+    PageRank. This is what makes the summary reflect what the conversation was
+    *about*, rather than only the sentences that happened to contain a cue word
+    like "decided" — the previous implementation could not surface a key point
+    that was phrased plainly.
+
+    Pure Python, deterministic, no dependencies.
+    """
+    n = len(sentences)
+    if n == 0:
+        return []
+    if n <= top_k:
+        return list(range(n))
+    toks = [_sentence_tokens(s) for s in sentences]
+    # Similarity: shared terms normalised by length, the standard TextRank
+    # kernel. Sentences with no content words simply never accumulate weight.
+    weights: list[dict[int, float]] = [{} for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            shared = len(toks[i] & toks[j])
+            if not shared:
+                continue
+            denom = math.log(len(toks[i]) + 1) + math.log(len(toks[j]) + 1)
+            if denom <= 0:
+                continue
+            w = shared / denom
+            weights[i][j] = w
+            weights[j][i] = w
+    out_sum = [sum(d.values()) for d in weights]
+    score = [1.0 / n] * n
+    for _ in range(iterations):
+        nxt = []
+        for i in range(n):
+            acc = 0.0
+            for j, w in weights[i].items():
+                if out_sum[j] > 0:
+                    acc += w / out_sum[j] * score[j]
+            nxt.append((1.0 - damping) / n + damping * acc)
+        if max(abs(a - b) for a, b in zip(nxt, score)) < 1e-6:
+            score = nxt
+            break
+        score = nxt
+    # Rank by score, then by original position so ties are stable.
+    ranked = sorted(range(n), key=lambda i: (-score[i], i))[:top_k]
+    return ranked
+
+
+def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
+    """Extractive summary of a chat transcript, capped at ~max_tokens (CS-2).
+
+    Two passes over the transcript:
+
+    * **Structured extraction** — decisions, action items, open questions and
+      the code entities touched, found by cue phrases.
+    * **TextRank** — the most central sentences overall, which catches the
+      substance that no cue phrase matches. Cue-only extraction was the old
+      behaviour and it missed anything phrased plainly.
+
+    Sections are ranked by salience rather than truncated to the first N, and
+    the result is trimmed to `max_tokens` measured in real tokens.
     """
     import re
     turns = _cs_parse_turns(transcript)
@@ -4238,6 +4715,8 @@ def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
     decisions, actions, questions = [], [], []
     seen_d, seen_a, seen_q = set(), set(), set()
     ent_counts: dict[str, int] = {}
+    all_sentences: list[str] = []
+    seen_any: set[str] = set()
     for _role, text in turns:
         for raw in re.split(r"(?<=[.!?])\s+|\n", text):
             s = raw.strip(" -*•\t")
@@ -4245,6 +4724,10 @@ def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
                 continue
             low = s.lower()
             key = low[:80]
+            # Corpus for TextRank: substantive sentences only, deduplicated.
+            if 25 < len(s) < 400 and key not in seen_any:
+                seen_any.add(key)
+                all_sentences.append(s)
             if s.endswith("?") and key not in seen_q and len(s) < 200:
                 seen_q.add(key); questions.append(s)
             if any(c in low for c in _CS_DECISION_CUES) and key not in seen_d:
@@ -4260,7 +4743,17 @@ def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
                                      key=lambda kv: -kv[1])][:12]
 
     def _cap(items: list[str], n: int) -> list[str]:
-        return items[:n]
+        """Keep the n most central items, in their original order (CS-2)."""
+        if len(items) <= n:
+            return items
+        chosen = sorted(_textrank(items, n))
+        return [items[i] for i in chosen]
+
+    # Key points: the most central sentences overall, excluding anything
+    # already surfaced verbatim in a structured section.
+    claimed = {s[:80].lower() for s in decisions + actions + questions}
+    candidates = [s for s in all_sentences if s[:80].lower() not in claimed]
+    key_points = [candidates[i] for i in sorted(_textrank(candidates, 6))]
 
     lines = [f"# Conversation summary ({len(turns)} turns)"]
     if decisions:
@@ -4269,6 +4762,9 @@ def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
     if actions:
         lines.append("\n## Action items / open work")
         lines += [f"- {a}" for a in _cap(actions, 8)]
+    if key_points:
+        lines.append("\n## Key points")
+        lines += [f"- {k}" for k in key_points]
     if questions:
         lines.append("\n## Open questions")
         lines += [f"- {q}" for q in _cap(questions, 6)]
@@ -4293,8 +4789,10 @@ def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
         if orig_tokens else 0.0,
         "decisions": _cap(decisions, 8),
         "action_items": _cap(actions, 8),
+        "key_points": key_points,
         "open_questions": _cap(questions, 6),
         "entities": entities,
+        "method": "textrank+cues",
     }
 
 
@@ -4318,6 +4816,7 @@ class ContextPack:
     reused: list[str] = field(default_factory=list)    # SD-1: already in session
     budget: int = 0
     session: str = ""
+    session_state: dict = field(default_factory=dict)   # SD-2 ledger diagnostics
     tokens_reused: int = 0          # tokens NOT resent thanks to the ledger
     neighbors_considered: int = 0   # NB-1: candidates seen during expansion
     neighbors_pruned: int = 0       # NB-1: candidates dropped by ranking
@@ -4349,6 +4848,13 @@ class ContextPack:
                 f"## Already sent earlier this session — unchanged, not repeated "
                 f"(~{self.tokens_reused} tokens saved)")
             lines.append(", ".join(f"`{d}`" for d in self.reused))
+        if self.session_state.get("reset"):
+            # Say it out loud: the ledger was discarded, so this pack is a full
+            # resend rather than a delta. Silence here would look like a bug.
+            lines.append("## Session context reset")
+            lines.append(
+                f"_{self.session_state.get('reset_reason', 'ledger expired')}. "
+                f"Everything relevant is included in full above._")
         out, _ = redact_secrets("\n".join(lines))
         return out
 
@@ -4550,22 +5056,80 @@ class Retriever:
         hub = 1.0 / (1.0 + math.log2(1.0 + degree))
         return weight * hop_decay * (0.35 + overlap) * hub
 
+    def pack_cache_key(self, task: str, budget_tokens: int, expand_depth: int,
+                       max_body_tokens: int) -> str:
+        """Identity of a stateless pack request (PK-1).
+
+        Learned file weights participate because `learn()` changes seed order,
+        and the embedding backend does because it changes what is retrieved.
+        """
+        payload = "\x1f".join([
+            task.strip(), str(budget_tokens), str(expand_depth),
+            str(max_body_tokens), embed_backend_id(),
+            str(sorted(self.store.all_weights().items())),
+        ])
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=20).hexdigest()
+
+    def find_relevant_context_cached(self, task: str, budget_tokens: int = 6000,
+                                     expand_depth: int = 1,
+                                     max_body_tokens: int = 1600,
+                                     session: str = "") -> tuple[str, dict]:
+        """Rendered pack markdown, memoised across identical requests (PK-1).
+
+        Returns (markdown, info). Only *stateless* packs are cached: with a
+        session id the correct answer legitimately differs on every call
+        (already-sent symbols get dropped), so caching one would resurrect
+        content the caller was deliberately not being resent.
+        """
+        import json
+        if session:
+            pack = self.find_relevant_context(
+                task, budget_tokens=budget_tokens, expand_depth=expand_depth,
+                max_body_tokens=max_body_tokens, session=session)
+            return pack.to_markdown(), {"cached": False,
+                                        "reason": "session packs are stateful",
+                                        "pack": pack}
+        key = self.pack_cache_key(task, budget_tokens, expand_depth,
+                                  max_body_tokens)
+        row = self.store.cached_pack(key)
+        if row is not None:
+            self.store.commit()
+            return row["markdown"], {"cached": True, "key": key,
+                                     "tokens": row["tokens"],
+                                     "meta": json.loads(row["meta"] or "{}")}
+        pack = self.find_relevant_context(
+            task, budget_tokens=budget_tokens, expand_depth=expand_depth,
+            max_body_tokens=max_body_tokens)
+        md = pack.to_markdown()
+        meta = {"files": sorted({p.file for p in pack.pieces}),
+                "symbols": len(pack.pieces),
+                "dropped": pack.dropped,
+                "neighbors_considered": pack.neighbors_considered,
+                "neighbors_pruned": pack.neighbors_pruned}
+        self.store.store_pack(key, task, md, json.dumps(meta, sort_keys=True),
+                              pack.rendered_tokens)
+        return md, {"cached": False, "key": key,
+                    "tokens": pack.rendered_tokens, "meta": meta, "pack": pack}
+
     def find_relevant_context(self, task: str, budget_tokens: int = 6000,
                               expand_depth: int = 1,
                               max_body_tokens: int = 1600,
                               session: str = "") -> ContextPack:
         pack = ContextPack(task=task, budget=budget_tokens)
-        # SD-1: what this conversation has already been shown. Anything whose
-        # content is unchanged since we sent it is referenced by name instead
-        # of re-serialised, so a second retrieval in the same session does not
-        # re-bill the model for text it is already holding.
-        already: dict = self.store.sent_map(session) if session else {}
+        # SD-1/SD-2: what this conversation can still be assumed to hold.
+        # Anything unchanged since we sent it is referenced by name instead of
+        # re-serialised. The ledger self-expires (see Store.sent_map) so we
+        # never withhold content the model has probably already dropped.
+        already: dict = {}
+        if session:
+            already, pack.session_state = self.store.sent_map(session)
         pack.session = session
 
         # hybrid seeding: lexical (FTS5) + semantic (embeddings), fused by RRF.
-        lexical = self.store.search(task, limit=12)
-        semantic = self.semantic_search(task, limit=12)
-        seeds = self._fuse([lexical, semantic], limit=12) if semantic else lexical
+        lexical = self.store.search(task, limit=SEED_CANDIDATES)
+        semantic = self.semantic_search(task, limit=SEED_CANDIDATES)
+        seeds = (self._fuse([lexical, semantic], limit=SEED_CANDIDATES)
+                 if semantic else lexical)
         # de-prioritise module nodes as seeds; we want concrete defs
         seeds = [s for s in seeds if s["kind"] != "module"] or seeds
         # Spread seeds across files so one file cannot monopolise the pack.
@@ -5022,15 +5586,27 @@ class Retriever:
         hubs = sorted(
             ({"file": f, "fan_in": fan_in.get(f, 0), "fan_out": fan_out.get(f, 0),
               "degree": fan_in.get(f, 0) + fan_out.get(f, 0)} for f in nodes),
-            key=lambda x: (x["degree"], x["file"]), reverse=True)[:top]
+            key=lambda x: (x["degree"], x["file"]), reverse=True)
+        hubs = hubs[:top] if top else hubs      # top=0 → every file
         return {"kind": "hubs", "hubs": hubs, "cycles": _import_cycles(graph)}
 
     # ---- get_routing: per-file model-tier hints ----
     def get_routing(self) -> list[dict]:
+        """Per-file model tier, using real graph + control-flow features (MR-3)."""
+        # top=0 disables the ranking cut-off: routing needs fan-in/out for
+        # every file, not just the twenty biggest hubs.
+        fan = {h["file"]: h for h in self._hub_map(top=0).get("hubs", [])}
         out = []
         for r in self.store.files_with_tokens():
-            out.append(tier_for_file(r["path"], r["token_est"] or 0,
-                                     r["symbols_count"] or 0))
+            path = r["path"]
+            edges = fan.get(path, {})
+            src = "\n".join(self._lines(path))
+            feats = file_complexity_features(src) if src else {
+                "max_depth": 0, "branches": 0}
+            out.append(tier_for_file(
+                path, r["token_est"] or 0, r["symbols_count"] or 0,
+                fan_in=edges.get("fan_in", 0), fan_out=edges.get("fan_out", 0),
+                max_depth=feats["max_depth"], branches=feats["branches"]))
         return out
 
     # ---- ask: intent + coverage + risk + cost + top-K (FR-6, FR-7) ----
@@ -5962,6 +6538,97 @@ MODEL_PRICES_PER_1M: dict[str, dict[str, float]] = {
 }
 DEFAULT_COST_MODEL = "claude-sonnet"
 
+# ---- CE-2: pricing provenance and overrides -------------------------------
+# A hardcoded price table silently rots: vendors reprice, and a stale number
+# produces confidently wrong cost estimates. The table above is a *default*
+# with a known date. Anything derived from it carries that date, goes stale
+# out loud, and can be overridden without editing code.
+PRICES_AS_OF = "2025-06-01"
+PRICES_STALE_AFTER_DAYS = 180
+PRICING_FILE_ENV = "TOKENGRAPH_PRICING_FILE"
+PRICING_FILENAME = "pricing.json"
+
+_PRICING_CACHE: dict | None = None
+
+
+def pricing_file_path(root: Path | None = None) -> Path:
+    """Where a pricing override is read from, if present."""
+    override = os.environ.get(PRICING_FILE_ENV)
+    if override:
+        return Path(override)
+    return Path(root or ".") / ".context" / PRICING_FILENAME
+
+
+def load_pricing(root: Path | None = None, refresh: bool = False) -> dict:
+    """Effective price table + provenance (CE-2).
+
+    Reads `.context/pricing.json` (or $TOKENGRAPH_PRICING_FILE) when present
+    and merges it over the built-in defaults, so a user can correct prices for
+    their own contract or a vendor change without a code edit. The returned
+    dict always states where the numbers came from and whether they are stale.
+    """
+    global _PRICING_CACHE
+    if _PRICING_CACHE is not None and not refresh:
+        return _PRICING_CACHE
+    import json
+    from datetime import date
+
+    prices = {k: dict(v) for k, v in MODEL_PRICES_PER_1M.items()}
+    as_of, source, warnings = PRICES_AS_OF, "built-in defaults", []
+
+    path = pricing_file_path(root)
+    if path.exists():
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            for model, entry in (doc.get("prices") or {}).items():
+                if not isinstance(entry, dict):
+                    warnings.append(f"pricing: ignoring {model!r} (not an object)")
+                    continue
+                try:
+                    prices[model] = {"input": float(entry["input"]),
+                                     "output": float(entry["output"])}
+                except (KeyError, TypeError, ValueError):
+                    warnings.append(
+                        f"pricing: ignoring {model!r} (needs numeric "
+                        f"'input' and 'output')")
+            as_of = str(doc.get("as_of") or as_of)
+            source = str(path)
+        except (OSError, ValueError) as ex:
+            warnings.append(f"pricing: could not read {path} ({ex}); "
+                            f"using built-in defaults")
+
+    stale, age_days = False, None
+    try:
+        y, m, d = (int(x) for x in as_of.split("-"))
+        age_days = (date.today() - date(y, m, d)).days
+        stale = age_days > PRICES_STALE_AFTER_DAYS
+    except (ValueError, TypeError):
+        warnings.append(f"pricing: unparseable as_of {as_of!r}")
+    if stale:
+        warnings.append(
+            f"pricing is {age_days} days old (as of {as_of}). Vendor list "
+            f"prices change; treat costs as indicative. Override with "
+            f"{pricing_file_path(root)} or ${PRICING_FILE_ENV}.")
+
+    _PRICING_CACHE = {"prices": prices, "as_of": as_of, "source": source,
+                      "stale": stale, "age_days": age_days,
+                      "warnings": warnings}
+    return _PRICING_CACHE
+
+
+def price_for(model: str, root: Path | None = None) -> dict:
+    """Input/output price per 1M tokens for a model, from the effective table."""
+    table = load_pricing(root)["prices"]
+    if model in table:
+        return table[model]
+    # Unknown concrete model: fall back to the family's mid-tier, and say so.
+    fam = model_family(model)
+    for candidate in (f"{fam}-sonnet", "claude-sonnet", "gpt-4o",
+                      "gemini-1.5-pro", "llama-3.1-70b"):
+        if candidate in table and model_family(candidate) == fam:
+            return table[candidate]
+    return table.get(DEFAULT_COST_MODEL, {"input": 3.0, "output": 15.0})
+
 
 def estimate_cost(prompt: str | int, model: str = DEFAULT_COST_MODEL,
                   expected_output_tokens: int = 500) -> dict:
@@ -5971,15 +6638,18 @@ def estimate_cost(prompt: str | int, model: str = DEFAULT_COST_MODEL,
     pre-computed input-token integer. Returns a per-call USD breakdown so you
     can compare models / trim context before spending. Deterministic, local.
     """
+    detail = None
     if isinstance(prompt, int):
         in_tok = max(0, prompt)
     else:
-        in_tok = count_tokens_for_model(prompt or "", model)
+        detail = count_tokens_detail(prompt or "", model)
+        in_tok = detail["tokens"]
     out_tok = max(0, int(expected_output_tokens))
-    price = MODEL_PRICES_PER_1M.get(model, MODEL_PRICES_PER_1M[DEFAULT_COST_MODEL])
+    pricing = load_pricing()
+    price = price_for(model)
     in_usd = in_tok / 1_000_000 * price["input"]
     out_usd = out_tok / 1_000_000 * price["output"]
-    return {
+    out = {
         "model": model,
         "input_tokens": in_tok,
         "output_tokens": out_tok,
@@ -5988,16 +6658,34 @@ def estimate_cost(prompt: str | int, model: str = DEFAULT_COST_MODEL,
         "total_usd": round(in_usd + out_usd, 6),
         "price_per_1m_input_usd": price["input"],
         "price_per_1m_output_usd": price["output"],
+        # CE-2: never hand back a bare number. The caller needs to know how the
+        # tokens were counted and how old the prices are before trusting it.
+        "prices_as_of": pricing["as_of"],
+        "prices_source": pricing["source"],
+        "prices_stale": pricing["stale"],
+        "token_method": detail["method"] if detail else "caller-supplied",
     }
+    notes = list(pricing["warnings"])
+    if detail and detail["method"] == "approx" and detail.get("note"):
+        notes.append(detail["note"])
+    if model not in pricing["prices"]:
+        notes.append(f"no listed price for {model!r}; used the closest "
+                     f"{model_family(model)} model's rate")
+    if notes:
+        out["warnings"] = notes
+    return out
 
 
 def compare_cost(prompt: str | int, expected_output_tokens: int = 500,
                  models: list[str] | None = None) -> dict:
     """estimate_cost across several models — the cheapest sufficient pick (CE-2)."""
-    names = models or list(MODEL_PRICES_PER_1M.keys())
+    names = models or list(load_pricing()["prices"].keys())
     rows = [estimate_cost(prompt, m, expected_output_tokens) for m in names]
-    rows.sort(key=lambda r: r["total_usd"])
-    return {"cheapest": rows[0] if rows else None, "by_model": rows}
+    rows.sort(key=lambda r: (r["total_usd"], r["model"]))
+    pricing = load_pricing()
+    return {"cheapest": rows[0] if rows else None, "by_model": rows,
+            "prices_as_of": pricing["as_of"], "prices_stale": pricing["stale"],
+            "prices_source": pricing["source"]}
 
 
 def _parse_since(spec: str | None) -> float | None:
@@ -8614,6 +9302,23 @@ def ide_setup(root: Path, editors: list[str] | None = None,
                        f"a file inside the repo is ignored.",
             })
 
+    # JetBrains and Neovim previously got a printed string and nothing else.
+    # Both do read real config files, so write them.
+    for workspace_root in roots:
+        if not editors or "jetbrains" in editors:
+            # JetBrains AI Assistant / Junie read project-level MCP config from
+            # .idea/mcp.xml. Written unconditionally: a project without .idea
+            # gets one the first time the IDE opens it, and an unused file is
+            # inert.
+            _write_jetbrains_mcp(workspace_root / ".idea" / "mcp.xml", stdio)
+            written.append(".idea/mcp.xml" if len(roots) == 1
+                           else str(workspace_root / ".idea" / "mcp.xml"))
+        if not editors or "nvim" in editors:
+            path = workspace_root / ".nvim" / "contextiq.lua"
+            _write_nvim_config(path, stdio)
+            written.append(".nvim/contextiq.lua" if len(roots) == 1
+                           else str(path))
+
     nvim = ('require("mcphub").setup({ servers = { tokengraph = { command = "%s", '
             'args = { %s } } } })' % (stdio["command"],
             ", ".join(f'"{a}"' for a in stdio["args"])))
@@ -8624,8 +9329,10 @@ def ide_setup(root: Path, editors: list[str] | None = None,
         "editors": chosen,
         "launch": stdio,
         "neovim_snippet": nvim,
-        "jetbrains_note": ("JetBrains AI Assistant: Settings → Tools → MCP → Add → "
-                           f"command `{stdio['command']} {' '.join(stdio['args'])}`"),
+        "jetbrains_note": ("JetBrains: .idea/mcp.xml written. If AI Assistant "
+                           "does not pick it up, add it manually via "
+                           "Settings → Tools → AI Assistant → MCP → Add → "
+                           f"`{stdio['command']} {' '.join(stdio['args'])}`"),
         "workspace_roots": [str(p) for p in roots],
         "note": (f"wired {len(written)} project config(s)"
                  + (f" and {len(global_written)} per-user config(s)"
@@ -8634,6 +9341,73 @@ def ide_setup(root: Path, editors: list[str] | None = None,
                      if global_pending else ""))
                  + "; restart the editor to load"),
     }
+
+
+def _write_jetbrains_mcp(path: Path, stdio: dict) -> None:
+    """Write .idea/mcp.xml, preserving any other servers already configured.
+
+    JetBrains stores project settings as IntelliJ XML components, so this is a
+    real config file rather than the copy-paste instruction we used to print.
+    """
+    import xml.etree.ElementTree as ET
+    args = "".join(f'<option value="{_xml_escape(a)}" />' for a in stdio["args"])
+    entry = (f'<server name="tokengraph">'
+             f'<option name="command" value="{_xml_escape(stdio["command"])}" />'
+             f'<option name="args"><array>{args}</array></option>'
+             f'</server>')
+    existing = ""
+    if path.exists():
+        try:
+            tree = ET.parse(path)
+            servers = tree.getroot().find(".//servers")
+            if servers is not None:
+                keep = [ET.tostring(s, encoding="unicode").strip()
+                        for s in servers.findall("server")
+                        if s.get("name") != "tokengraph"]
+                existing = "".join(keep)
+        except (ET.ParseError, OSError):
+            existing = ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<project version="4">\n'
+        '  <component name="McpServerSettings">\n'
+        f'    <servers>{existing}{entry}</servers>\n'
+        '  </component>\n'
+        '</project>\n', encoding="utf-8")
+
+
+def _xml_escape(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _write_nvim_config(path: Path, stdio: dict) -> None:
+    """Write a real, sourceable Lua module for Neovim MCP clients.
+
+    Returns the server spec rather than calling setup() itself, so it composes
+    with whatever plugin manager and MCP client the user already runs.
+    """
+    args = ", ".join(f'"{a}"' for a in stdio["args"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "-- ContextIQ MCP server (generated by `tokengraph ide-setup`).\n"
+        "-- Source from your config, e.g.:\n"
+        "--   local contextiq = dofile(vim.fn.getcwd() .. '/.nvim/contextiq.lua')\n"
+        "--   require('mcphub').setup({ servers = contextiq.servers })\n"
+        "local M = {}\n\n"
+        "M.servers = {\n"
+        "  tokengraph = {\n"
+        f'    command = "{stdio["command"]}",\n'
+        f"    args = {{ {args} }},\n"
+        "  },\n"
+        "}\n\n"
+        "-- Convenience for mcphub.nvim users.\n"
+        "function M.setup(opts)\n"
+        "  opts = vim.tbl_deep_extend('force', { servers = M.servers }, opts or {})\n"
+        "  require('mcphub').setup(opts)\n"
+        "end\n\n"
+        "return M\n", encoding="utf-8")
 
 
 def _write_continue_config(path: Path, stdio: dict) -> None:
@@ -9324,15 +10098,18 @@ def build_mcp_server(root: Path, db: Path):
         """
         r = _ret()
         try:
-            pack = r.find_relevant_context(task, budget_tokens=budget_tokens,
-                                           expand_depth=depth,
-                                           max_body_tokens=max_body_tokens,
-                                           session=session)
-            files = sorted({p.file for p in pack.pieces})
-            record_pack_savings(root, "mcp.context", final_tokens=pack.rendered_tokens,
-                                baseline_tokens=r._targeted_baseline(pack),
-                                files=len(files))
-            return pack.to_markdown()
+            md, info = r.find_relevant_context_cached(
+                task, budget_tokens=budget_tokens, expand_depth=depth,
+                max_body_tokens=max_body_tokens, session=session)
+            pack = info.get("pack")
+            if pack is not None:
+                # Only bill/record work we actually performed; a cache hit
+                # costs nothing and must not inflate the savings ledger.
+                record_pack_savings(
+                    root, "mcp.context", final_tokens=pack.rendered_tokens,
+                    baseline_tokens=r._targeted_baseline(pack),
+                    files=len({p.file for p in pack.pieces}))
+            return md
         finally:
             r.close()
 
@@ -9416,6 +10193,22 @@ def build_mcp_server(root: Path, db: Path):
             return stats
         finally:
             store.close()
+
+    @mcp.tool
+    def cache_stats() -> dict:
+        """Context-pack cache: entries, hits, and the graph version they pin to.
+
+        Identical stateless requests are served from this cache and cost no
+        retrieval work; any reindex that changes the graph invalidates it.
+        """
+        r = _ret()
+        try:
+            stats = r.store.pack_cache_stats()
+            stats["note"] = ("Session-scoped packs are never cached — with a "
+                             "session id the correct pack differs per call.")
+            return stats
+        finally:
+            r.close()
 
     @mcp.tool
     def reset_session(session: str = "") -> dict:
@@ -10733,6 +11526,41 @@ def cmd_ide_setup(args):
             print(f"  {res['plugins']['note']}")
 
 
+def cmd_judge_eval(args):
+    """Run the LLM-judged answer-quality evaluation (QG-2)."""
+    import json
+    root = Path(args.path).resolve()
+    corpora = ([Path(c) for c in args.corpus] if args.corpus
+               else load_judge_corpora(root))
+    if not corpora:
+        sys.exit("judge-eval: no judge.json corpora found under benchmarks/repos/")
+    res = run_llm_judge(corpora, model=args.model, budget_tokens=args.budget,
+                        limit=args.limit or 0,
+                        compare_full=not args.no_compare)
+    if not res.get("ok"):
+        print(f"judge-eval: {res['error']}", file=sys.stderr)
+        print(f"  {res.get('hint','')}", file=sys.stderr)
+        sys.exit(2)
+    if args.out:
+        Path(args.out).write_text(json.dumps(res, indent=2), encoding="utf-8")
+    if getattr(args, "json", False):
+        _emit(res, True)
+        return
+    a = res["aggregate"]
+    print(f"judge-eval: {a['graded']}/{a['questions']} graded "
+          f"across {len(a['repos'])} repos (model {a['model']})")
+    print(f"  pack score      {a['pack_mean_score']}  "
+          f"(fully correct: {a['pack_correct_rate']})")
+    print(f"  pack tokens     {a['mean_pack_tokens']:.0f} avg")
+    if "quality_retention" in a:
+        print(f"  full-file score {a['full_mean_score']}  "
+              f"({a['mean_full_tokens']:.0f} tokens avg)")
+        print(f"  QUALITY RETENTION {a['quality_retention']}  "
+              f"at {a['token_ratio']:.1%} of the tokens")
+    if a["errors"]:
+        print(f"  {a['errors']} question(s) errored")
+
+
 def cmd_embed_warm(args):
     """Fetch and verify the semantic embedding model, then invalidate vectors."""
     res = embed_warm()
@@ -11450,9 +12278,29 @@ def run_retrieval_benchmark(r: Retriever, cases: list[dict],
         if rank:
             hits += 1
             reciprocal_rank += 1.0 / rank
+        # MS-2: "waste" used to mean any token from a file outside
+        # expected_files — which counted legitimate cross-file context (the
+        # callee that explains the seed, the base class it inherits) as waste.
+        # That made the metric punish the graph expansion that is the whole
+        # point of the tool. A piece now counts as on-target if it is in an
+        # expected file, IS an expected symbol, or is graph-connected to one.
+        want_syms = set(case.get("expected_symbols") or [])
+        related: set[str] = set()
+        for q in want_syms:
+            sid = r.store.id_for_qname(q)
+            if sid is None:
+                continue
+            for direction in ("out", "in"):
+                for nb in r.store.neighbors(
+                        sid, ["CALLS", "REFERENCES", "INHERITS"], direction,
+                        limit=MAX_FANOUT_PER_SYMBOL):
+                    related.add(nb["qname"])
         row_pack_tokens = sum(piece.token_est for piece in pack.pieces)
-        row_irrelevant = sum(piece.token_est for piece in pack.pieces
-                             if piece.file not in expected)
+        row_irrelevant = sum(
+            piece.token_est for piece in pack.pieces
+            if piece.file not in expected
+            and piece.qname not in want_syms
+            and piece.qname not in related)
         pack_tokens += row_pack_tokens
         irrelevant_tokens += row_irrelevant
 
@@ -11480,6 +12328,242 @@ def run_retrieval_benchmark(r: Retriever, cases: list[dict],
         "mean_latency_ms": round(sum(latencies_ms) / count, 2),
         "rows": rows,
     }
+
+
+# ==========================================================================
+# QG-2: LLM-judged answer quality
+# ==========================================================================
+# The deterministic gate (score_pack_answerability) proves the required symbols
+# and facts are *present* in the pack. It cannot prove a model *answers
+# correctly* from it. This harness closes that gap with the experiment the
+# project's thesis actually needs: answer each held-out question twice — once
+# from the ContextIQ pack, once from the full text of the files that contain
+# the answer — and have an independent judge grade both against a rubric.
+#
+# `quality_retention = pack_score / full_score` is the headline: 1.0 means
+# compression cost nothing. It is opt-in and never runs in CI, because it needs
+# API access and real spend.
+
+JUDGE_MODEL = "claude-opus-4-8"
+
+_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "criteria": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "met": {"type": "boolean"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["claim", "met", "evidence"],
+                "additionalProperties": False,
+            },
+        },
+        "score": {"type": "number"},
+        "verdict": {"type": "string", "enum": ["correct", "partial", "incorrect"]},
+    },
+    "required": ["criteria", "score", "verdict"],
+    "additionalProperties": False,
+}
+
+_ANSWER_SYSTEM = (
+    "You are a senior engineer answering a question about an unfamiliar "
+    "codebase. Answer ONLY from the context provided below. If the context "
+    "does not contain what you need, say exactly what is missing rather than "
+    "guessing. Be specific: name the identifiers, constants and control flow "
+    "you are relying on. Keep the answer under 200 words."
+)
+
+_JUDGE_SYSTEM = (
+    "You grade answers about a codebase against a rubric of atomic factual "
+    "claims. For each rubric claim decide whether the candidate answer "
+    "actually contains it — not whether the answer sounds plausible. Quote the "
+    "supporting span in `evidence`, or explain the gap when it is absent. "
+    "`score` is the fraction of claims met, 0.0 to 1.0. `verdict` is "
+    "'correct' when every claim is met, 'partial' when some are, 'incorrect' "
+    "when essentially none are. Be strict: a claim that is merely implied is "
+    "not met."
+)
+
+
+def _anthropic_client():
+    """Anthropic client, or None with a reason when unavailable."""
+    try:
+        import anthropic  # type: ignore[import-not-found]
+    except Exception:
+        return None, ("the `anthropic` package is not installed "
+                      "(pip install anthropic)")
+    try:
+        return anthropic.Anthropic(), ""
+    except Exception as ex:
+        return None, f"could not construct the client: {type(ex).__name__}: {ex}"
+
+
+def _ask_model(client, model: str, context: str, question: str) -> tuple[str, dict]:
+    """Answer `question` from `context` alone. Returns (answer, usage)."""
+    resp = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=_ANSWER_SYSTEM,
+        messages=[{"role": "user", "content":
+                   f"# Context\n\n{context}\n\n# Question\n\n{question}"}],
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    u = resp.usage
+    return text, {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens}
+
+
+def _judge_answer(client, model: str, question: str, reference: str,
+                  rubric: list[str], answer: str) -> dict:
+    """Grade `answer` against `rubric` with a structured verdict."""
+    claims = "\n".join(f"{i+1}. {c}" for i, c in enumerate(rubric))
+    resp = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=_JUDGE_SYSTEM,
+        output_config={"format": {"type": "json_schema", "schema": _JUDGE_SCHEMA}},
+        messages=[{"role": "user", "content":
+                   f"# Question\n{question}\n\n"
+                   f"# Reference answer\n{reference}\n\n"
+                   f"# Rubric claims\n{claims}\n\n"
+                   f"# Candidate answer to grade\n{answer}"}],
+    )
+    import json
+    text = next(b.text for b in resp.content if b.type == "text")
+    out = json.loads(text)
+    out["judge_usage"] = {"input_tokens": resp.usage.input_tokens,
+                          "output_tokens": resp.usage.output_tokens}
+    return out
+
+
+def load_judge_corpora(root: Path) -> list[Path]:
+    """Every judge.json alongside a fixture repo."""
+    repos = Path(root) / "benchmarks" / "repos"
+    return sorted(repos.glob("*/judge.json")) if repos.is_dir() else []
+
+
+def run_llm_judge(corpus_paths: list[Path], model: str = JUDGE_MODEL,
+                  budget_tokens: int = 6000, limit: int = 0,
+                  compare_full: bool = True) -> dict:
+    """Score answers from a ContextIQ pack against answers from full files (QG-2).
+
+    For every question: retrieve a pack, answer from it, and (unless
+    `compare_full` is off) also answer from the complete text of the cited
+    files. An independent judge grades both against the rubric. The ratio of
+    the two scores is the number that actually tests "fewer tokens, same
+    answer quality".
+    """
+    import json
+    client, why = _anthropic_client()
+    if client is None:
+        return {"ok": False, "error": why,
+                "hint": "Set ANTHROPIC_API_KEY (or run `ant auth login`), then "
+                        "re-run. This eval makes real API calls and costs money, "
+                        "which is why it never runs in CI."}
+
+    rows, suites = [], []
+    for cpath in corpus_paths:
+        cpath = Path(cpath)
+        if not cpath.exists():
+            continue
+        doc = json.loads(cpath.read_text(encoding="utf-8"))
+        repo = (cpath.parent / doc.get("repo", ".")).resolve()
+        if not repo.exists():
+            continue
+        questions = doc.get("questions", [])
+        if limit:
+            questions = questions[:limit]
+        db = _db_path(repo)
+        index_repo(repo, db)
+        r = Retriever(repo, db)
+        try:
+            for q in questions:
+                pack = r.find_relevant_context(q["question"],
+                                               budget_tokens=budget_tokens)
+                pack_md = pack.to_markdown()
+                row = {"id": q.get("id", ""), "repo": cpath.parent.name,
+                       "question": q["question"],
+                       "pack_tokens": pack.rendered_tokens}
+                try:
+                    answer, usage = _ask_model(client, model, pack_md,
+                                               q["question"])
+                    graded = _judge_answer(client, model, q["question"],
+                                           q.get("reference_answer", ""),
+                                           q.get("rubric", []), answer)
+                    row.update({"pack_score": graded["score"],
+                                "pack_verdict": graded["verdict"],
+                                "pack_answer": answer,
+                                "pack_criteria": graded["criteria"],
+                                "pack_answer_tokens": usage["input_tokens"]})
+                except Exception as ex:
+                    row["error"] = f"{type(ex).__name__}: {ex}"
+                    rows.append(row)
+                    continue
+
+                if compare_full:
+                    # Generous baseline: the whole text of every cited file.
+                    parts = []
+                    for f in q.get("cites", []):
+                        try:
+                            parts.append(f"## {f}\n```\n"
+                                         + (repo / f).read_text(encoding="utf-8",
+                                                                errors="replace")
+                                         + "\n```")
+                        except OSError:
+                            continue
+                    full_ctx = "\n\n".join(parts)
+                    if full_ctx:
+                        try:
+                            fa, fu = _ask_model(client, model, full_ctx,
+                                                q["question"])
+                            fg = _judge_answer(client, model, q["question"],
+                                               q.get("reference_answer", ""),
+                                               q.get("rubric", []), fa)
+                            row.update({"full_score": fg["score"],
+                                        "full_verdict": fg["verdict"],
+                                        "full_tokens": count_tokens(full_ctx),
+                                        "full_answer_tokens": fu["input_tokens"]})
+                        except Exception as ex:
+                            row["full_error"] = f"{type(ex).__name__}: {ex}"
+                rows.append(row)
+        finally:
+            r.close()
+        suites.append(cpath.parent.name)
+
+    scored = [x for x in rows if "pack_score" in x]
+    paired = [x for x in scored if "full_score" in x]
+    n = len(scored) or 1
+    pack_mean = sum(x["pack_score"] for x in scored) / n
+    agg = {
+        "questions": len(rows),
+        "graded": len(scored),
+        "errors": len(rows) - len(scored),
+        "repos": suites,
+        "model": model,
+        "pack_mean_score": round(pack_mean, 3),
+        "pack_correct_rate": round(
+            sum(1 for x in scored if x["pack_verdict"] == "correct") / n, 3),
+        "mean_pack_tokens": round(
+            sum(x["pack_tokens"] for x in scored) / n, 1),
+    }
+    if paired:
+        m = len(paired)
+        full_mean = sum(x["full_score"] for x in paired) / m
+        agg.update({
+            "paired": m,
+            "full_mean_score": round(full_mean, 3),
+            "mean_full_tokens": round(
+                sum(x["full_tokens"] for x in paired) / m, 1),
+            # The headline: 1.0 means compression cost no answer quality.
+            "quality_retention": round(pack_mean / full_mean, 3) if full_mean else None,
+            "token_ratio": round(
+                sum(x["pack_tokens"] for x in paired)
+                / max(1, sum(x["full_tokens"] for x in paired)), 3),
+        })
+    return {"ok": True, "aggregate": agg, "rows": rows}
 
 
 def check_benchmark_thresholds(result: dict,
@@ -11928,6 +13012,22 @@ def build_parser():
     ew.add_argument("--json", action="store_true")
     ew.set_defaults(func=cmd_embed_warm)
 
+    jd = sub.add_parser("judge-eval",
+                        help="LLM-judged answer quality: pack context vs. full "
+                             "files (opt-in; makes real API calls)")
+    jd.add_argument("--model", default=JUDGE_MODEL)
+    jd.add_argument("--budget", type=int, default=6000)
+    jd.add_argument("-n", "--limit", type=int, default=0,
+                    help="questions per repo (0 = all)")
+    jd.add_argument("--no-compare", action="store_true",
+                    help="skip the full-file baseline (halves cost, loses the "
+                         "quality-retention number)")
+    jd.add_argument("--corpus", action="append",
+                    help="explicit judge.json path; repeatable")
+    jd.add_argument("-o", "--out", default=None, help="write full JSON results")
+    jd.add_argument("--json", action="store_true")
+    jd.set_defaults(func=cmd_judge_eval)
+
     dx = sub.add_parser("diagnose-extractors",
                         help="self-test every language extractor (CI gate; exit 1 on failure)")
     dx.add_argument("--json", action="store_true")
@@ -12171,7 +13271,7 @@ def build_parser():
                          help="wire the MCP server into every major editor (VS Code/Cursor/Windsurf/Zed/Claude)")
     ide.add_argument("--editor", action="append",
                      choices=["claude", "vscode", "cursor", "zed", "continue",
-                              "windsurf", "cline"],
+                              "jetbrains", "nvim", "windsurf", "cline"],
                      help="limit to specific editor(s); default = all project-local "
                           "ones. windsurf/cline are per-user configs and need --global")
     ide.add_argument("--global", dest="write_global", action="store_true",

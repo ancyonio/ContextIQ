@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "repo": ".",
+  "description": "pyshop held-out judge corpus: open-ended questions about the Python e-commerce order service (HTTP handlers, order state machine, retrying payment client with a circuit breaker, repository layer, pricing rules, fulfilment worker). Each question is answerable only by reading the real source; the rubric lists atomic factual claims an LLM judge grades a candidate answer against.",
+  "questions": [
+    {
+      "id": "pyshop-01",
+      "question": "The payment provider starts answering every charge with HTTP 429. Walk through what PaymentGateway.charge does from the first call to the exception the caller finally sees.",
+      "reference_answer": "429 is a member of RETRYABLE_STATUS, so each response is treated as transient: charge records a breaker failure via self.breaker.record_failure() and loops again. The loop runs `for attempt in range(1, self.settings.max_payment_attempts + 1)`, i.e. up to max_payment_attempts tries, which defaults to MAX_PAYMENT_ATTEMPTS = 5 in app/config.py. Between attempts (only while `attempt < self.settings.max_payment_attempts`) it sleeps for compute_backoff(attempt, retry_base_delay, retry_max_delay), an exponential window with full jitter capped at retry_max_delay. Once the budget is exhausted the method raises PaymentUnavailable with the message \"giving up after {max_payment_attempts} attempts: {last_error}\".",
+      "rubric": [
+        "states that 429 is in RETRYABLE_STATUS and is therefore retried",
+        "states the attempt budget is settings.max_payment_attempts, which defaults to MAX_PAYMENT_ATTEMPTS = 5",
+        "says each failed attempt calls self.breaker.record_failure()",
+        "mentions compute_backoff is used to sleep between attempts, and that no sleep happens after the final attempt",
+        "states the final outcome is a PaymentUnavailable exception whose message begins 'giving up after'"
+      ],
+      "cites": ["app/payments/gateway.py", "app/config.py"]
+    },
+    {
+      "id": "pyshop-02",
+      "question": "How does the payment gateway distinguish a card that was refused from a provider that is broken, and what does it do to the circuit breaker in each case?",
+      "reference_answer": "A provider status of 402 or 403 means the provider answered and said no: charge calls self.breaker.record_success() (the provider is healthy, the card is not) and raises PaymentDeclined built from body['code'] (default \"card_declined\") and body['message'] (default \"issuer refused the charge\"). It is never retried. Any status not in RETRYABLE_STATUS also counts as a healthy provider: record_success() is called and PaymentError(\"unexpected provider status {status}\") is raised. Only the statuses in RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504} and OSError transport failures call record_failure() and retry; 409 is deliberately excluded so a duplicate charge is never blindly retried.",
+      "rubric": [
+        "states that HTTP 402 and 403 raise PaymentDeclined and are never retried",
+        "states that a decline calls self.breaker.record_success(), not record_failure()",
+        "names RETRYABLE_STATUS and notes 409 is deliberately absent from it",
+        "says a status outside RETRYABLE_STATUS raises PaymentError with 'unexpected provider status'",
+        "mentions the default decline code 'card_declined' taken from the response body"
+      ],
+      "cites": ["app/payments/gateway.py"]
+    },
+    {
+      "id": "pyshop-03",
+      "question": "A client calls POST /orders/{order_id}/pay. Enumerate the HTTP status codes and error codes the handler can return and what triggers each.",
+      "reference_answer": "OrderHandlers.pay_order returns 404 'not_found' when repository.get raises RecordNotFound, 409 'illegal_transition' when the state machine refuses the move to PENDING_PAYMENT, 402 'payment_declined' when the gateway raises PaymentDeclined, 503 'provider_unavailable' for CircuitOpen and 503 'payment_unavailable' for PaymentUnavailable. Because CircuitOpen subclasses PaymentUnavailable, its except clause is listed first so the two cases stay distinguishable. On the decline path the handler additionally calls self.machine.cancel(order, reason=f\"declined: {exc.code}\") and persists the order before answering. On success it transitions PENDING_PAYMENT (reason \"checkout started\"), charges, calls machine.mark_paid with the gateway reference and returns 200 with the order plus {\"reference\", \"attempts\"}.",
+      "rubric": [
+        "maps RecordNotFound to 404 'not_found'",
+        "maps IllegalTransition to 409 'illegal_transition'",
+        "maps PaymentDeclined to 402 'payment_declined' and notes the order is cancelled and persisted on that path",
+        "distinguishes CircuitOpen ('provider_unavailable') from PaymentUnavailable ('payment_unavailable'), both 503, and explains the except ordering is required because CircuitOpen subclasses PaymentUnavailable",
+        "states the success path calls machine.mark_paid with the charge reference and returns 200"
+      ],
+      "cites": ["app/api/handlers.py", "app/payments/gateway.py", "app/orders/state_machine.py"]
+    },
+    {
+      "id": "pyshop-04",
+      "question": "With default configuration, how many consecutive payment failures does it take to trip the circuit breaker open, and how long does it stay open? Does the answer match the defaults declared in the payments module?",
+      "reference_answer": "The wiring in app/main.py overrides the module defaults: build_gateway constructs CircuitBreaker(failure_threshold=settings.max_payment_attempts, reset_timeout=settings.retry_max_delay * 4). With the defaults from app/config.py that is failure_threshold=5 (MAX_PAYMENT_ATTEMPTS) and reset_timeout=32.0 seconds (retry_max_delay of 8.0 times four), so the reset timeout does NOT match the module constant CIRCUIT_RESET_TIMEOUT = 30.0, while the threshold happens to equal CIRCUIT_FAILURE_THRESHOLD = 5. Since a single exhausted charge burns exactly max_payment_attempts retries, one fully failed charge is enough to trip the breaker, and the next call raises CircuitOpen until 32 seconds have passed, when allow() flips the state to 'half_open' and lets one probe through.",
+      "rubric": [
+        "states build_gateway in app/main.py sets failure_threshold=settings.max_payment_attempts and reset_timeout=settings.retry_max_delay * 4",
+        "computes the effective reset timeout as 32.0 seconds from retry_max_delay = 8.0",
+        "notes this differs from the module default CIRCUIT_RESET_TIMEOUT = 30.0 while the threshold equals CIRCUIT_FAILURE_THRESHOLD = 5",
+        "observes that one exhausted charge (5 failed attempts) is enough to trip the breaker",
+        "says the breaker then moves to 'half_open' and allows a single probe once the timeout elapses"
+      ],
+      "cites": ["app/main.py", "app/payments/gateway.py", "app/config.py"]
+    },
+    {
+      "id": "pyshop-05",
+      "question": "If an order qualifies for a promo code, the loyalty discount and the bulk-line discount at the same time, how are the three combined, and against what amount is each one calculated?",
+      "reference_answer": "PricingEngine sorts its rules by priority in __init__, so they run PromoCodeRule (priority 10), LoyaltyRule (20), then BulkLineRule (30). Every rule is handed the same untouched `subtotal` — price() calls rule.discount(order, subtotal) and never feeds the running total back in — so the discounts are computed on the original subtotal and stack additively into `discount`. If the accumulated discount exceeds the subtotal it is clamped to the subtotal so the discounted amount can never go negative. Shipping is then computed from the discounted amount and tax is (discounted + shipping) * tax_rate, defaulting to DEFAULT_TAX_RATE = Decimal(\"0.0825\").",
+      "rubric": [
+        "states rules run in priority order (PromoCodeRule 10, LoyaltyRule 20, BulkLineRule 30)",
+        "states every rule receives the original subtotal, not a progressively reduced running total",
+        "says the discounts stack additively",
+        "says the total discount is clamped to the subtotal so the discounted amount cannot go below zero",
+        "states tax is applied to the discounted subtotal plus shipping at DEFAULT_TAX_RATE 0.0825"
+      ],
+      "cites": ["app/pricing/rules.py"]
+    },
+    {
+      "id": "pyshop-06",
+      "question": "A standard customer with no prior orders puts $80.00 of goods (no line has quantity 10 or more) in the basket and applies the code WELCOME10. Do they get free shipping?",
+      "reference_answer": "No. WELCOME10 is worth Decimal(\"0.10\") in PROMO_CODES, so the $80.00 subtotal is reduced by $8.00. PricingEngine.shipping_for is given the *discounted* subtotal of $72.00, which is below FREE_SHIPPING_THRESHOLD = Decimal(\"75.00\"), so the flat FLAT_SHIPPING_RATE of $6.95 is charged. Had the threshold been checked against the pre-discount subtotal the order would have shipped free, so the discount is what costs the customer the carriage.",
+      "rubric": [
+        "answers that shipping is charged, not waived",
+        "states WELCOME10 is a 10% discount taken from PROMO_CODES, giving a discounted subtotal of 72.00",
+        "states the threshold is FREE_SHIPPING_THRESHOLD = 75.00",
+        "states shipping_for is evaluated against the discounted subtotal rather than the original subtotal",
+        "names the charge as FLAT_SHIPPING_RATE = 6.95"
+      ],
+      "cites": ["app/pricing/rules.py"]
+    },
+    {
+      "id": "pyshop-07",
+      "question": "The queue redelivers a message and the worker asks the state machine to make a transition it has already applied. Is that an error? And is asking to cancel an already-cancelled order also harmless?",
+      "reference_answer": "A replayed transition is harmless: OrderStateMachine.transition checks `if source == target` first and returns a TransitionEvent with reason \"idempotent replay\" (when no reason is supplied) without consulting ALLOWED_TRANSITIONS, without reassigning order.status and without calling order.touch(), so updated_at is untouched. Cancelling an already-cancelled order is NOT harmless: cancel() first tests `order.status in TERMINAL_STATUSES` (CANCELLED and REFUNDED) and raises IllegalTransition before it can reach the same-status shortcut in transition().",
+      "rubric": [
+        "states a same-status transition returns a TransitionEvent instead of raising",
+        "quotes the reason string 'idempotent replay'",
+        "notes the replay path does not call order.touch() / does not update updated_at",
+        "states cancel() raises IllegalTransition for an order already in TERMINAL_STATUSES, including an already-cancelled order",
+        "names TERMINAL_STATUSES as CANCELLED and REFUNDED"
+      ],
+      "cites": ["app/orders/state_machine.py", "app/models.py"]
+    },
+    {
+      "id": "pyshop-08",
+      "question": "The fulfilment worker's cycle keeps throwing. How many failures does it tolerate before it changes behaviour, and what does it do then? How long does it wait when there is simply no work?",
+      "reference_answer": "run_forever wraps run_once in a try/except: any exception increments self._consecutive_errors and self.stats.errors and logs via LOGGER.exception. Once _consecutive_errors reaches MAX_CONSECUTIVE_ERRORS = 3 the loop logs \"backing off for %.1fs\", sleeps ERROR_BACKOFF_SECONDS = 15.0 seconds and then resets _consecutive_errors back to 0, so the pattern repeats every three failures rather than escalating. A successful cycle also resets the counter to 0. When the cycle succeeds but processed == 0 the loop instead sleeps settings.worker_poll_interval, which defaults to 1.5 seconds in app/config.py.",
+      "rubric": [
+        "states the threshold is MAX_CONSECUTIVE_ERRORS = 3",
+        "states the hard backoff sleeps ERROR_BACKOFF_SECONDS = 15.0 seconds",
+        "notes _consecutive_errors is reset to 0 after the backoff (and after any successful cycle)",
+        "states the idle sleep uses settings.worker_poll_interval, default 1.5 seconds",
+        "mentions stats.errors is incremented for each failed cycle"
+      ],
+      "cites": ["app/workers/fulfillment.py", "app/config.py"]
+    },
+    {
+      "id": "pyshop-09",
+      "question": "How many worker cycles does it take for a freshly paid order to reach SHIPPED, and how do several worker processes avoid fighting over the same rows?",
+      "reference_answer": "Two cycles. process_order advances an order exactly one step: a PAID order is transitioned to FULFILLING with reason \"picked by worker\" and flushed, and only on the next cycle (once it is claimed again as FULFILLING) is shipper.dispatch called and the order moved to SHIPPED with reason f\"tracking {tracking}\". Contention is handled in the repository: claim_batch only selects rows whose status is in CLAIMABLE_STATUSES = (PAID, FULFILLING) with claimed_by IS NULL, and its subquery uses `FOR UPDATE SKIP LOCKED`, so concurrent workers step over each other's locked rows instead of blocking. run_once releases each claim in a finally block by calling repository.release(order.id).",
+      "rubric": [
+        "answers that two cycles are required because process_order performs only one transition per pass",
+        "states PAID moves to FULFILLING first, then FULFILLING to SHIPPED",
+        "states claim_batch restricts to CLAIMABLE_STATUSES (paid and fulfilling) with claimed_by IS NULL",
+        "names FOR UPDATE SKIP LOCKED as the mechanism that keeps concurrent workers off the same rows",
+        "notes the claim is dropped via repository.release in run_once"
+      ],
+      "cites": ["app/workers/fulfillment.py", "app/storage/repository.py"]
+    },
+    {
+      "id": "pyshop-10",
+      "question": "Suppose process_order raises an unexpected TypeError on the second order of a 25-order batch. What happens to that order's claim, and what happens to the 23 orders after it?",
+      "reference_answer": "run_once only catches PaymentUnavailable (logs a warning, stats.skipped += 1) and IllegalTransition (logs an error, stats.errors += 1); anything else propagates. The failing order's claim is still dropped because release(order.id) sits in a `finally` block, but the loop over `batch` never reaches the remaining orders, so their claimed_by column stays set and they are only recovered by the janitor query the class docstring describes. The exception then unwinds into run_forever, which catches it, increments _consecutive_errors and stats.errors, logs the traceback and sets processed = 0.",
+      "rubric": [
+        "states run_once only catches PaymentUnavailable and IllegalTransition, so a TypeError propagates",
+        "states the failing order is still released because release() is in a finally block",
+        "states the remaining orders in the batch are never processed and stay claimed",
+        "states run_forever catches the exception and increments _consecutive_errors and stats.errors",
+        "notes the batch was obtained from repository.claim_batch, so recovery of the stranded claims is external (janitor / another worker)"
+      ],
+      "cites": ["app/workers/fulfillment.py", "app/storage/repository.py"]
+    },
+    {
+      "id": "pyshop-11",
+      "question": "Which environment variables must be set for the service to boot, what does it print if one is missing, and what exit code does the process return?",
+      "reference_answer": "load_settings treats DATABASE_URL and PAYMENT_API_KEY as mandatory: it collects the missing names and raises ConfigError(\"missing required environment: \" + \", \".join(missing)). Everything else has a default — PAYMENT_BASE_URL falls back to \"https://payments.internal/v2\", currency to DEFAULT_CURRENCY \"USD\", and the numeric knobs go through _env_float/_env_int, which raise ConfigError when the value is unparsable. main() catches ConfigError around load_settings/open_session, logs \"startup failed: %s\" and returns exit code 2. An unrecognised mode argument (neither \"api\" nor \"worker\") returns 64 instead.",
+      "rubric": [
+        "names DATABASE_URL and PAYMENT_API_KEY as the only mandatory variables",
+        "quotes the ConfigError message 'missing required environment:'",
+        "states main() returns exit code 2 on a ConfigError",
+        "states an unknown mode returns exit code 64",
+        "mentions PAYMENT_BASE_URL defaults to https://payments.internal/v2"
+      ],
+      "cites": ["app/config.py", "app/main.py"]
+    },
+    {
+      "id": "pyshop-12",
+      "question": "A mobile client submits the same checkout twice. Trace both defences the codebase has against double-billing.",
+      "reference_answer": "First, at the HTTP layer: create_order reads the idempotency_key off the request body and, when present, calls repository.find_by_idempotency_key before doing any work. If a row comes back it returns 200 with the serialized existing order instead of 201, and neither prices nor saves anything a second time. Second, at the provider layer: idempotency_key_for returns order.idempotency_key when the order carries one, and otherwise derives a stable key as \"idem_\" + sha256(f\"{order.id}:{amount.to_minor_units()}:{amount.currency}\")[:24], which is sent in the charge payload so a replayed charge for the same order and amount collapses on the provider side.",
+      "rubric": [
+        "states create_order calls find_by_idempotency_key and returns the existing order",
+        "notes that replay returns status 200 rather than 201 and skips persisting/pricing again",
+        "states idempotency_key_for prefers order.idempotency_key when it is set",
+        "states the fallback key is 'idem_' plus a truncated sha256 hash",
+        "states the hashed seed combines the order id, the amount in minor units and the currency"
+      ],
+      "cites": ["app/api/handlers.py", "app/storage/repository.py", "app/payments/gateway.py"]
+    }
+  ]
+}

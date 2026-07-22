@@ -1602,7 +1602,8 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         # under global_pending instead and written only with --global.
         self.assertEqual(set(res["written"]),
                          {".mcp.json", ".vscode/mcp.json", ".cursor/mcp.json",
-                          ".zed/settings.json"})
+                          ".zed/settings.json", ".idea/mcp.xml",
+                          ".nvim/contextiq.lua"})
         self.assertIn("windsurf", {g["host"] for g in res["global_pending"]})
         # each config is valid JSON wiring the tokengraph server
         vsc = json.loads((self.root / ".vscode" / "mcp.json").read_text("utf-8"))
@@ -1721,7 +1722,10 @@ class ModelAwareTokenTests(unittest.TestCase):
         self.assertEqual(tg.count_tokens_for_model(text, "gpt-4o"), base)
         # Llama's ratio inflates vs base; each result is a positive int
         self.assertGreaterEqual(tg.count_tokens_for_model(text, "llama-3.1-8b"), base)
-        self.assertGreaterEqual(tg.count_tokens_for_model("", "claude-opus"), 1)
+        # Empty text is zero tokens. The old implementation floored every
+        # count at 1, which reported a token cost for nothing at all.
+        self.assertEqual(tg.count_tokens_for_model("", "claude-opus"), 0)
+        self.assertGreaterEqual(tg.count_tokens_for_model("x", "claude-opus"), 1)
 
     def test_llama_in_tier_tables_and_pricing(self):
         for tier in ("fast", "balanced", "powerful"):
@@ -2672,6 +2676,408 @@ class QualityGateTests(_RepoCase):
                                 f"quality corpus too small ({total} cases)")
         self.assertGreaterEqual(len(corpora), 3,
                                 "quality gate must span multiple repositories")
+
+
+class PackCacheTests(_RepoCase):
+    """PK-1: memoised packs, invalidated by graph version."""
+
+    def _repo(self):
+        _write(self.root, "svc.py",
+               "def charge(token, amount):\n"
+               "    '''Charge a card.'''\n"
+               "    return submit(token, amount)\n\n"
+               "def submit(t, a):\n    return {'t': t}\n")
+
+    def test_hit_returns_identical_markdown(self):
+        self._repo()
+        r = self._index()
+        md1, i1 = r.find_relevant_context_cached("charge a card")
+        md2, i2 = r.find_relevant_context_cached("charge a card")
+        self.assertFalse(i1["cached"])
+        self.assertTrue(i2["cached"])
+        self.assertEqual(md1, md2)
+
+    def test_reindex_invalidates(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context_cached("charge a card")
+        _write(self.root, "other.py", "def unrelated():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        r.invalidate()
+        _, info = r.find_relevant_context_cached("charge a card")
+        self.assertFalse(info["cached"])
+
+    def test_session_packs_are_never_cached(self):
+        """A session pack legitimately differs per call — caching it is wrong."""
+        self._repo()
+        r = self._index()
+        md1, i1 = r.find_relevant_context_cached("charge a card", session="s")
+        md2, i2 = r.find_relevant_context_cached("charge a card", session="s")
+        self.assertFalse(i1["cached"])
+        self.assertFalse(i2["cached"])
+        # Second call is a delta, so it must NOT equal the first.
+        self.assertNotEqual(md1, md2)
+
+    def test_key_varies_with_budget(self):
+        self._repo()
+        r = self._index()
+        a = r.pack_cache_key("t", 6000, 1, 1600)
+        b = r.pack_cache_key("t", 3000, 1, 1600)
+        self.assertNotEqual(a, b)
+
+    def test_stats_report_hits(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context_cached("charge a card")
+        r.find_relevant_context_cached("charge a card")
+        self.assertGreaterEqual(r.store.pack_cache_stats()["hits"], 1)
+
+
+class SessionGuardTests(_RepoCase):
+    """SD-2: the ledger must expire rather than withhold dropped content."""
+
+    def _repo(self):
+        _write(self.root, "a.py", "def alpha():\n    return 1\n")
+
+    def test_ttl_expiry(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("alpha", budget_tokens=2000, session="s")
+        # Backdate every entry beyond the TTL.
+        r.store.conn.execute(
+            "UPDATE sent_ledger SET ts = ts - ?", (tg.SESSION_TTL_SECONDS + 60,))
+        r.store.commit()
+        held, state = r.store.sent_map("s")
+        self.assertEqual(held, {})
+        self.assertGreater(state["expired_entries"], 0)
+
+    def test_context_window_overflow_resets(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("alpha", budget_tokens=2000, session="s")
+        # Claim we sent far more than the model could still be holding.
+        r.store.conn.execute("UPDATE sent_ledger SET tokens = 999999")
+        r.store.commit()
+        held, state = r.store.sent_map("s")
+        self.assertEqual(held, {})
+        self.assertTrue(state["reset"])
+        self.assertIn("compacted", state["reset_reason"])
+
+    def test_reset_is_announced_in_the_pack(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("alpha", budget_tokens=2000, session="s")
+        r.store.conn.execute("UPDATE sent_ledger SET tokens = 999999")
+        r.store.commit()
+        pack = r.find_relevant_context("alpha", budget_tokens=2000, session="s")
+        self.assertIn("Session context reset", pack.to_markdown())
+        self.assertTrue(pack.session_state.get("reset"))
+
+    def test_entry_cap_evicts_oldest(self):
+        self._repo()
+        r = self._index()
+        import time as _t
+        now = _t.time()
+        rows = [("s", f"q{i}", "body", "h", 1, now - (5000 - i))
+                for i in range(tg.SESSION_MAX_ENTRIES + 25)]
+        r.store.conn.executemany(
+            "INSERT OR REPLACE INTO sent_ledger"
+            "(session,qname,mode,content_hash,tokens,ts) VALUES(?,?,?,?,?,?)",
+            rows)
+        r.store.commit()
+        held, state = r.store.sent_map("s")
+        self.assertLessEqual(len(held), tg.SESSION_MAX_ENTRIES)
+        self.assertGreater(state["evicted_entries"], 0)
+
+    def test_prune_sessions_is_global(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("alpha", budget_tokens=2000, session="s1")
+        r.find_relevant_context("alpha", budget_tokens=2000, session="s2")
+        r.store.conn.execute(
+            "UPDATE sent_ledger SET ts = ts - ?", (tg.SESSION_TTL_SECONDS + 60,))
+        r.store.commit()
+        self.assertGreater(r.store.prune_sessions(), 0)
+
+
+class TokenizerTests(unittest.TestCase):
+    """MA-2: real tokenizers where available, honest labels where not."""
+
+    def test_detail_reports_method_and_tokenizer(self):
+        d = tg.count_tokens_detail("def add(a, b):\n    return a + b\n", "gpt-4o")
+        self.assertIn(d["method"], ("exact", "approx"))
+        self.assertTrue(d["tokenizer"])
+        self.assertEqual(d["family"], "gpt")
+
+    def test_claude_is_labelled_an_estimate(self):
+        d = tg.count_tokens_detail("hello world", "claude-sonnet")
+        self.assertEqual(d["family"], "claude")
+        # No offline Anthropic tokenizer exists, so this must not claim exact.
+        self.assertEqual(d["method"], "approx")
+        self.assertIn("estimate", d["note"].lower())
+
+    def test_count_tokens_for_model_matches_detail(self):
+        text = "class Foo:\n    def bar(self):\n        return 1\n"
+        for m in ("gpt-4o", "claude-opus", "gemini-1.5-pro", "llama-3.1-70b"):
+            self.assertEqual(tg.count_tokens_for_model(text, m),
+                             tg.count_tokens_detail(text, m)["tokens"])
+
+    def test_status_covers_every_family(self):
+        st = tg.tokenizer_status()
+        for fam in ("gpt", "claude", "gemini", "llama"):
+            self.assertIn(fam, st)
+            self.assertIn(st[fam]["method"], ("exact", "approx"))
+
+    def test_empty_text_is_zero(self):
+        self.assertEqual(tg.count_tokens_for_model("", "gpt-4o"), 0)
+
+    def test_gpt_models_do_not_share_a_cache_entry(self):
+        """gpt-4 is cl100k, gpt-4o is o200k — they must resolve separately."""
+        tg.count_tokens_detail("x", "gpt-4")
+        tg.count_tokens_detail("x", "gpt-4o")
+        keys = [k for k in tg._MODEL_ENCODER_TRIED if k.startswith("gpt:")]
+        self.assertGreaterEqual(len(keys), 2)
+
+
+class PricingTests(unittest.TestCase):
+    """CE-2: dated, overridable prices that go stale out loud."""
+
+    def setUp(self):
+        tg._PRICING_CACHE = None
+        self.addCleanup(lambda: setattr(tg, "_PRICING_CACHE", None))
+
+    def test_defaults_carry_a_date(self):
+        p = tg.load_pricing(refresh=True)
+        self.assertEqual(p["as_of"], tg.PRICES_AS_OF)
+        self.assertIn("prices", p)
+        self.assertIsInstance(p["stale"], bool)
+
+    def test_file_override_wins(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / ".context").mkdir(parents=True)
+        (root / ".context" / "pricing.json").write_text(json.dumps({
+            "as_of": "2099-01-01",
+            "prices": {"claude-sonnet": {"input": 99.0, "output": 199.0}},
+        }), encoding="utf-8")
+        p = tg.load_pricing(root, refresh=True)
+        self.assertEqual(p["prices"]["claude-sonnet"]["input"], 99.0)
+        self.assertEqual(p["as_of"], "2099-01-01")
+        self.assertFalse(p["stale"])
+
+    def test_malformed_entry_is_skipped_not_fatal(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / ".context").mkdir(parents=True)
+        (root / ".context" / "pricing.json").write_text(json.dumps({
+            "prices": {"bad-model": {"input": "not-a-number"}},
+        }), encoding="utf-8")
+        p = tg.load_pricing(root, refresh=True)
+        self.assertNotIn("bad-model", p["prices"])
+        self.assertTrue(any("bad-model" in w for w in p["warnings"]))
+
+    def test_estimate_cost_reports_provenance(self):
+        c = tg.estimate_cost("def f():\n    return 1\n" * 20, "claude-sonnet")
+        self.assertIn("prices_as_of", c)
+        self.assertIn("token_method", c)
+        self.assertGreater(c["total_usd"], 0)
+
+    def test_unknown_model_falls_back_within_family(self):
+        p = tg.price_for("claude-some-future-model")
+        self.assertIn("input", p)
+        self.assertGreater(p["input"], 0)
+
+
+class RoutingTests(_RepoCase):
+    """MR-3: routing on graph + control-flow features, not just size."""
+
+    def test_complexity_features_detect_nesting_and_branches(self):
+        src = ("def f(x):\n"
+               "    if x:\n"
+               "        for i in range(3):\n"
+               "            while i:\n"
+               "                if i > 1:\n"
+               "                    return i\n")
+        feats = tg.file_complexity_features(src)
+        self.assertGreaterEqual(feats["max_depth"], 4)
+        self.assertGreaterEqual(feats["branches"], 4)
+
+    def test_entangled_file_routes_higher_than_a_plain_one(self):
+        plain = tg.tier_for_file("a.py", token_est=1000, symbols=10)
+        hub = tg.tier_for_file("b.py", token_est=1000, symbols=10,
+                               fan_in=30, fan_out=20, max_depth=6, branches=80)
+        self.assertGreater(hub["complexity_score"], plain["complexity_score"])
+        self.assertEqual(hub["tier"], "powerful")
+
+    def test_config_files_stay_cheap_regardless_of_size(self):
+        info = tg.tier_for_file("big.json", token_est=90000, symbols=500)
+        self.assertEqual(info["tier"], "fast")
+
+    def test_signals_are_explained(self):
+        info = tg.tier_for_file("x.py", token_est=5000, symbols=60,
+                                fan_in=12, max_depth=5)
+        self.assertTrue(info["signals"])
+        self.assertTrue(any("fan-in" in s for s in info["signals"]))
+
+    def test_get_routing_uses_real_features(self):
+        _write(self.root, "deep.py",
+               "def f(x):\n"
+               "    if x:\n"
+               "        for i in range(3):\n"
+               "            while i:\n"
+               "                if i > 1:\n"
+               "                    return i\n")
+        r = self._index()
+        rows = {row["file"]: row for row in r.get_routing()}
+        self.assertIn("deep.py", rows)
+        self.assertIn("complexity_score", rows["deep.py"])
+
+
+class SummarizerTests(unittest.TestCase):
+    """CS-2: TextRank surfaces substance that cue phrases miss."""
+
+    TRANSCRIPT = (
+        "User: The payment retries keep hammering the provider during outages.\n"
+        "Assistant: The gateway retries five times with exponential backoff and "
+        "no circuit breaker at all.\n"
+        "User: Every worker retries independently so the provider sees a "
+        "thundering herd of requests.\n"
+        "Assistant: We decided to add a shared circuit breaker in front of the "
+        "payment gateway.\n"
+        "User: What about the timeout budget for the breaker?\n"
+        "Assistant: The breaker opens after twenty failures and resets after "
+        "thirty seconds of quiet.\n"
+    )
+
+    def test_textrank_ranks_central_sentences_first(self):
+        sents = ["The payment gateway retries on failure.",
+                 "Payment retries hammer the gateway during an outage.",
+                 "Unrelated note about lunch plans tomorrow."]
+        ranked = tg._textrank(sents, 2)
+        self.assertNotIn(2, ranked)
+
+    def test_textrank_handles_degenerate_input(self):
+        self.assertEqual(tg._textrank([], 3), [])
+        self.assertEqual(tg._textrank(["only one"], 3), [0])
+
+    def test_summary_has_key_points_beyond_cue_phrases(self):
+        res = tg.summarize_conversation(self.TRANSCRIPT, max_tokens=300)
+        self.assertEqual(res["method"], "textrank+cues")
+        self.assertTrue(res["key_points"])
+        # The thundering-herd sentence has no decision/action cue word, so only
+        # TextRank can surface it.
+        joined = " ".join(res["key_points"]).lower()
+        self.assertIn("thundering herd", joined)
+
+    def test_respects_token_budget(self):
+        res = tg.summarize_conversation(self.TRANSCRIPT * 6, max_tokens=120)
+        self.assertLessEqual(res["summary_tokens"], 140)
+
+    def test_empty_transcript_is_safe(self):
+        res = tg.summarize_conversation("", max_tokens=100)
+        self.assertEqual(res["turns"], 0)
+        self.assertEqual(res["summary"], "")
+
+
+class WasteMetricTests(_RepoCase):
+    """MS-2: graph-connected context is not waste."""
+
+    def test_related_symbols_are_not_counted_as_waste(self):
+        _write(self.root, "core.py",
+               "def helper(x):\n    '''Shared helper.'''\n    return x * 2\n")
+        _write(self.root, "api.py",
+               "from core import helper\n\n"
+               "def handle_request(payload):\n"
+               "    '''Handle an inbound request.'''\n"
+               "    return helper(payload)\n")
+        r = self._index()
+        out = tg.run_retrieval_benchmark(r, [{
+            "task": "handle an inbound request",
+            "expected_files": ["api.py"],
+            "expected_symbols": ["api.handle_request"],
+        }], budget_tokens=4000)
+        # core.helper is a callee of the expected symbol — legitimate context,
+        # so it must not be scored as wasted budget.
+        self.assertLess(out["irrelevant_token_ratio"], 1.0)
+
+
+class JudgeHarnessTests(unittest.TestCase):
+    """QG-2: the LLM-judge harness — structure, not live API calls."""
+
+    def test_corpora_are_discovered_and_well_formed(self):
+        root = Path(tg.__file__).resolve().parent
+        corpora = tg.load_judge_corpora(root)
+        self.assertGreaterEqual(len(corpora), 3)
+        total = 0
+        for c in corpora:
+            doc = json.loads(c.read_text(encoding="utf-8"))
+            self.assertTrue(doc.get("questions"))
+            for q in doc["questions"]:
+                self.assertTrue(q.get("question"))
+                self.assertTrue(q.get("reference_answer"))
+                self.assertGreaterEqual(len(q.get("rubric") or []), 3)
+                for cite in q.get("cites", []):
+                    self.assertTrue((c.parent / cite).exists(),
+                                    f"{c.name}:{q.get('id')} cites missing {cite}")
+                total += 1
+        self.assertGreaterEqual(total, 30)
+
+    def test_missing_credentials_fail_cleanly(self):
+        """No API access must produce a clear message, never a traceback."""
+        import unittest.mock as mock
+        with mock.patch.object(tg, "_anthropic_client",
+                               return_value=(None, "no credentials")):
+            res = tg.run_llm_judge([], model="claude-opus-4-8")
+        self.assertFalse(res["ok"])
+        self.assertIn("no credentials", res["error"])
+        self.assertIn("hint", res)
+
+    def test_judge_schema_is_valid_structured_output(self):
+        s = tg._JUDGE_SCHEMA
+        self.assertFalse(s["additionalProperties"])
+        self.assertEqual(set(s["required"]), {"criteria", "score", "verdict"})
+        item = s["properties"]["criteria"]["items"]
+        self.assertFalse(item["additionalProperties"])
+
+    def test_uses_a_current_model_id(self):
+        self.assertEqual(tg.JUDGE_MODEL, "claude-opus-4-8")
+
+
+class JetBrainsNvimTests(_RepoCase):
+    def test_jetbrains_xml_is_written_and_idempotent(self):
+        tg.ide_setup(self.root)
+        p = self.root / ".idea" / "mcp.xml"
+        self.assertTrue(p.exists())
+        text = p.read_text(encoding="utf-8")
+        self.assertIn('name="tokengraph"', text)
+        self.assertIn("McpServerSettings", text)
+        tg.ide_setup(self.root)
+        self.assertEqual(
+            p.read_text(encoding="utf-8").count('name="tokengraph"'), 1)
+
+    def test_jetbrains_preserves_other_servers(self):
+        p = self.root / ".idea" / "mcp.xml"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('<?xml version="1.0" encoding="UTF-8"?>\n'
+                     '<project version="4"><component name="McpServerSettings">'
+                     '<servers><server name="other">'
+                     '<option name="command" value="x" /></server></servers>'
+                     '</component></project>\n', encoding="utf-8")
+        tg.ide_setup(self.root)
+        text = p.read_text(encoding="utf-8")
+        self.assertIn('name="other"', text)
+        self.assertIn('name="tokengraph"', text)
+
+    def test_nvim_lua_is_written_and_parseable_shape(self):
+        tg.ide_setup(self.root)
+        p = self.root / ".nvim" / "contextiq.lua"
+        self.assertTrue(p.exists())
+        text = p.read_text(encoding="utf-8")
+        self.assertIn("M.servers", text)
+        self.assertIn("tokengraph", text)
+        self.assertIn("return M", text)
 
 
 if __name__ == "__main__":

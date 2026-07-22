@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "repo": ".",
+  "description": "gosvc held-out judge corpus: open-ended questions about the Go shipment service (rolling-window circuit breaker, bounded connection pool, at-least-once Kafka-style consumer, optimistic-concurrency store, RPC handlers, environment configuration and the shutdown path in main). Each question is answerable only by reading the real source; the rubric lists atomic factual claims an LLM judge grades a candidate answer against.",
+  "questions": [
+    {
+      "id": "gosvc-01",
+      "question": "The downstream store starts failing one call in three. Will the circuit breaker trip, and what exactly does it measure?",
+      "reference_answer": "No — a one-in-three failure rate is below the default threshold. breaker.RecordFailure sums the whole rolling window with totals() and trips only when `float64(failures)/float64(total) >= b.failureRatio`, which defaults to 0.5 (config's FAILURE_RATIO default, and New() also forces any ratio <= 0 or > 1 back to 0.5). The window is not a consecutive-failure counter: it is BucketCount = 10 buckets of BucketDuration = 6 * time.Second each, i.e. a rolling minute, rotated by rotate() so old buckets are zeroed. It also refuses to act on thin evidence: if successes+failures is below MinimumSamples = 20 the method returns without evaluating the ratio at all.",
+      "rubric": [
+        "answers that the breaker does not trip at a 1-in-3 failure rate under the default ratio",
+        "states the trip condition is failures/total >= failureRatio with a default of 0.5",
+        "states the window is 10 buckets (BucketCount) of 6 seconds (BucketDuration), i.e. one rolling minute",
+        "states MinimumSamples = 20 observations are required before the ratio is evaluated",
+        "notes the design measures a ratio rather than consecutive failures"
+      ],
+      "cites": ["internal/breaker/breaker.go", "internal/config/config.go"]
+    },
+    {
+      "id": "gosvc-02",
+      "question": "Once the breaker is open, how does it get back to closed, and what happens if the very first probe fails?",
+      "reference_answer": "Allow() is what performs the transition: while the state is StateOpen it returns false until `now.Sub(b.openedAt) >= b.cooldown`, at which point it flips to StateHalfOpen and sets probesLeft = HalfOpenProbes = 3. Each subsequent Allow in half-open decrements probesLeft and returns false once it hits zero. The cooldown comes from config: DefaultBreakerCooldown = 30 * time.Second, overridable with BREAKER_COOLDOWN. A success while half-open closes the breaker and wipes every bucket (`b.buckets[i] = bucket{startedAt: now}`) so the pre-outage failures cannot immediately re-trip it. A failure while half-open short-circuits straight back to StateOpen with a fresh openedAt, without any ratio or MinimumSamples check.",
+      "rubric": [
+        "states Allow() moves Open to HalfOpen once cooldown has elapsed since openedAt",
+        "states HalfOpenProbes = 3 probes are permitted in the half-open state",
+        "states a failure while half-open immediately reopens the breaker without consulting the ratio",
+        "states a success while half-open closes the breaker and resets all buckets",
+        "gives the cooldown default DefaultBreakerCooldown = 30 seconds"
+      ],
+      "cites": ["internal/breaker/breaker.go", "internal/config/config.go"]
+    },
+    {
+      "id": "gosvc-03",
+      "question": "A caller cancels its context mid-query, and separately a query blows through the store's own timeout. Do either of those count against the breaker?",
+      "reference_answer": "Neither is booked as a dependency failure. Breaker.Do switches on the error: nil calls RecordSuccess, `errors.Is(err, context.Canceled)` or `errors.Is(err, context.DeadlineExceeded)` deliberately leave the window untouched (the caller giving up says nothing about downstream health), and only other errors reach RecordFailure. That matters for the store timeout too, because Store.withConn wraps the caller's context with `context.WithTimeout(ctx, s.timeout)`, where s.timeout is cfg.RequestTimeout (DefaultRequestTimeout = 10 * time.Second) — so a query that runs long surfaces as DeadlineExceeded and is ignored by the window. A pool acquisition failure never reaches the breaker at all, since withConn returns \"acquire: %w\" before calling breaker.Do. When the breaker is already open, Do returns ErrOpen without invoking fn.",
+      "rubric": [
+        "states Breaker.Do skips recording for context.Canceled and context.DeadlineExceeded",
+        "states nil errors call RecordSuccess and all other errors call RecordFailure",
+        "states Store.withConn imposes its own context.WithTimeout using s.timeout / cfg.RequestTimeout (default 10 seconds)",
+        "notes a failed pool.Acquire is returned as 'acquire: ...' before the breaker is consulted",
+        "states Do returns ErrOpen without calling fn when Allow() is false"
+      ],
+      "cites": ["internal/breaker/breaker.go", "internal/store/store.go", "internal/config/config.go", "cmd/gosvc/main.go"]
+    },
+    {
+      "id": "gosvc-04",
+      "question": "Fifty goroutines call Pool.Acquire on a pool of size 16 at once. What bounds the concurrency, and what does a goroutine get if its context expires while queued?",
+      "reference_answer": "The bound is a buffered channel used as a semaphore: New fills `slots := make(chan struct{}, size)` with exactly `size` tokens (a size below one is raised to one), and Acquire's first act is a select that takes one token, so the pool can never exceed its configured size no matter how many callers arrive. If the caller's context fires first, Acquire increments p.waited under the mutex and returns an error wrapping ErrAcquireTimeout together with ctx.Err(); no slot is consumed. After taking a token it returns ErrPoolClosed (handing the token back) if the pool is closed, then pops idle entries from the tail, closing and counting as discarded any whose lastUsed is older than MaxIdleTime = 5 * time.Minute, and finally dials. A dial error decrements inUse, returns the token to the channel and reports \"dial failed: %w\".",
+      "rubric": [
+        "identifies the buffered `slots` channel as a counting semaphore sized to the pool size",
+        "states Acquire takes a slot before doing anything else, which is what caps concurrency",
+        "states a context expiry returns ErrAcquireTimeout and increments the waited counter",
+        "states idle connections older than MaxIdleTime (5 minutes) are closed rather than handed out",
+        "states a dial failure returns the slot to the channel and wraps the error as 'dial failed'"
+      ],
+      "cites": ["internal/pool/pool.go"]
+    },
+    {
+      "id": "gosvc-05",
+      "question": "A pooled connection is silently killed by a firewall. Which background machinery discovers it, how often does that run, and how is it wired up?",
+      "reference_answer": "main.startMaintenance spawns a goroutine with a time.NewTicker(pool.HealthCheckEvery), i.e. every 30 seconds, that runs until the context is cancelled. On each tick it first calls deps.pool.Reap(), which closes idle entries whose lastUsed predates the MaxIdleTime cutoff and returns the count so a non-zero sweep is logged as \"reaped idle connections\". Then it calls deps.pool.HealthCheck(ctx), which snapshots the idle list under the mutex, pings each connection with a context bounded by acquireSpinGuard = 250 * time.Millisecond, drops every failure via p.drop (removing it from the idle slice, bumping discarded and closing it) and returns the first error it saw, which main logs as a warning. The goroutine is tracked by the shared sync.WaitGroup so shutdown can wait for it.",
+      "rubric": [
+        "states the sweep is driven by a ticker of pool.HealthCheckEvery = 30 seconds in main.startMaintenance",
+        "states Reap closes idle connections older than MaxIdleTime and returns how many were discarded",
+        "states HealthCheck pings each idle connection and drops the failures, returning the first error",
+        "states the per-ping timeout is acquireSpinGuard = 250 milliseconds",
+        "notes the goroutine returns on ctx.Done() and is registered with the WaitGroup"
+      ],
+      "cites": ["cmd/gosvc/main.go", "internal/pool/pool.go"]
+    },
+    {
+      "id": "gosvc-06",
+      "question": "A record on the topic contains invalid JSON. How many times is it retried before it is dead-lettered, and how does that differ from a record that fails because the database is down?",
+      "reference_answer": "Invalid JSON is not retried at all. decode() wraps the unmarshal failure as `%w: invalid json` around ErrPoisonMessage (as it does for a missing shipment_id or status), and handleWithRetries checks `errors.Is(err, ErrPoisonMessage) || attempt == MaxDeliveryTries` on the very first pass, so the record goes straight to c.dead.Publish(ctx, msg, err.Error()) with metrics.DeadLetter incremented. A transient database error takes the other branch: metrics.Retried is incremented and the loop sleeps backoffFor(attempt) before trying again, up to MaxDeliveryTries = 5 attempts, after which it is dead-lettered too. If Publish itself fails, handleWithRetries returns that error, RunOnce aborts the rest of the batch, and Run logs \"poll cycle failed\" and sleeps RetryBaseDelay before the next poll.",
+      "rubric": [
+        "states a malformed record is classified as ErrPoisonMessage by decode and dead-lettered on the first attempt with no retries",
+        "states decode also rejects records missing shipment_id or status as poison",
+        "states a transient failure is retried up to MaxDeliveryTries = 5 attempts before dead-lettering",
+        "states the dead-letter path calls dead.Publish with the error text as the reason and increments metrics.DeadLetter",
+        "notes retries increment metrics.Retried and sleep backoffFor(attempt) between attempts"
+      ],
+      "cites": ["internal/consumer/consumer.go"]
+    },
+    {
+      "id": "gosvc-07",
+      "question": "What are the actual delays between redelivery attempts for a failing message, and is the retry cap ever reached in practice?",
+      "reference_answer": "backoffFor starts at RetryBaseDelay = 200 * time.Millisecond and doubles once per attempt beyond the first, returning RetryMaxDelay = 10 * time.Second as soon as the doubling reaches or exceeds it. handleWithRetries sleeps backoffFor(attempt) after attempts 1 through 4 only — on attempt 5 the `attempt == MaxDeliveryTries` branch dead-letters the record instead of sleeping — so the delays actually applied are 200ms, 400ms, 800ms and 1.6s, about three seconds of total backoff. The 10-second cap is therefore unreachable with MaxDeliveryTries = 5: it would need roughly seven attempts. The sleep is done with a select over time.After and ctx.Done(), so a cancelled context aborts the wait and returns ctx.Err().",
+      "rubric": [
+        "states the base delay is RetryBaseDelay = 200ms and it doubles each attempt",
+        "lists the delays actually used as 200ms, 400ms, 800ms and 1.6s",
+        "explains no sleep happens after the final attempt because that attempt dead-letters instead",
+        "concludes RetryMaxDelay = 10s is never reached because MaxDeliveryTries is 5",
+        "notes the wait is a select on time.After versus ctx.Done() so cancellation interrupts it"
+      ],
+      "cites": ["internal/consumer/consumer.go"]
+    },
+    {
+      "id": "gosvc-08",
+      "question": "The broker redelivers a shipment event that another worker already applied. Why does that not corrupt the record or fail the batch, and what happens if the shipment does not exist yet?",
+      "reference_answer": "Store.UpdateStatus is an optimistic update: its SQL is `UPDATE shipments SET status = $1, version = version + 1, updated_at = now() WHERE id = $2 AND version = $3`, so the second writer matches zero rows and gets `%w: shipment %s at version %d` wrapping ErrConflict. Consumer.Handle treats that specific error as success — it logs \"skipping already-applied event\" at debug level and returns nil, because a duplicate delivery is the expected outcome of at-least-once delivery, not a failure. If UpdateStatus reports store.ErrNotFound instead, Handle inserts the record by calling c.store.UpsertBatch with a single *store.Shipment, whose statement ends in `ON CONFLICT (id) DO UPDATE SET ... version = shipments.version + 1`, so even the insert path is safe to run twice.",
+      "rubric": [
+        "quotes the optimistic WHERE clause pinning both id and version, and that a lost race affects zero rows",
+        "states zero affected rows produces store.ErrConflict",
+        "states Consumer.Handle swallows ErrConflict and returns nil so the record counts as processed",
+        "states an ErrNotFound result makes Handle fall back to store.UpsertBatch to insert the shipment",
+        "notes UpsertBatch uses ON CONFLICT (id) DO UPDATE, bumping version, so it is itself idempotent"
+      ],
+      "cites": ["internal/consumer/consumer.go", "internal/store/store.go"]
+    },
+    {
+      "id": "gosvc-09",
+      "question": "How often are offsets committed, and what stops a graceful restart from replaying the whole commit interval?",
+      "reference_answer": "RunOnce records the highest offset seen per partition in c.pending, then calls maybeCommit(ctx, false), which returns early when pending is empty or when `c.clock().Sub(c.lastCommit) < c.interval`. The interval is cfg.CommitInterval, DefaultCommitInterval = 5 * time.Second (COMMIT_INTERVAL). A real commit calls reader.Commit(ctx, c.pending), bumps metrics.Commits, resets lastCommit and replaces pending with a fresh map. On shutdown, Run's `case <-ctx.Done()` builds a brand-new context via context.WithTimeout(context.Background(), 5*time.Second) — deliberately not the cancelled one — calls maybeCommit(flushCtx, true) so the interval check is bypassed, then returns reader.Close(). A hard kill skips that flush and the records are replayed, which the idempotent handlers absorb.",
+      "rubric": [
+        "states pending holds the highest offset per partition",
+        "states commits are skipped unless force is set or the elapsed time since lastCommit reaches the interval",
+        "gives the default commit interval DefaultCommitInterval = 5 seconds",
+        "states shutdown performs a forced commit with force=true before closing the reader",
+        "notes the final commit uses a fresh context.Background() with a 5-second timeout because the loop context is already cancelled"
+      ],
+      "cites": ["internal/consumer/consumer.go", "internal/config/config.go", "cmd/gosvc/main.go"]
+    },
+    {
+      "id": "gosvc-10",
+      "question": "A client calls AdvanceShipment and the underlying store loses the optimistic race, or the breaker is open. What status code does each case produce, and why does errors.Is still match after the error has passed through the store?",
+      "reference_answer": "statusFromError does the mapping: store.ErrNotFound becomes CodeNotFound (\"shipment does not exist\"), store.ErrConflict becomes CodeAborted (\"shipment was modified concurrently\") — a lost optimistic update, which tells the caller to redo the work against fresh state — breaker.ErrOpen becomes CodeUnavailable (\"downstream store is unavailable\"), pool.ErrAcquireTimeout becomes CodeUnavailable (\"no connection available\"), context.DeadlineExceeded becomes CodeUnavailable, and anything unrecognised becomes CodeInternal (\"unexpected server error\"). The Is checks keep working because every layer wraps with %w rather than reformatting: UpdateStatus returns `%w: shipment %s at version %d` around ErrConflict, withConn returns `acquire: %w`, and Acquire itself wraps ErrAcquireTimeout. AdvanceShipment logs \"advance rejected\" at warn level and returns the *Status, which satisfies error through its Error() method.",
+      "rubric": [
+        "states ErrConflict maps to CodeAborted rather than an internal error",
+        "states breaker.ErrOpen and pool.ErrAcquireTimeout both map to CodeUnavailable, with distinct messages",
+        "states unrecognised errors fall through to CodeInternal 'unexpected server error'",
+        "explains that %w wrapping (e.g. 'acquire: %w' in withConn) is what keeps errors.Is matching across layers",
+        "notes Status implements the error interface via its Error() method"
+      ],
+      "cites": ["internal/server/handlers.go", "internal/store/store.go", "internal/breaker/breaker.go", "internal/pool/pool.go"]
+    },
+    {
+      "id": "gosvc-11",
+      "question": "What shipment identifiers does the RPC surface accept, and what does a caller get back for one containing a slash?",
+      "reference_answer": "validateShipmentID trims the input first, rejects an empty result with CodeInvalidArgument \"shipment id is required\", and rejects anything longer than MaxTrackingIDLength = 64 with \"shipment id may not exceed 64 characters\". The allowed alphabet is checked rune by rune: a-z, A-Z, 0-9, '-' and '_' only, so a slash produces a Status with Code CodeInvalidArgument, Message \"shipment id contains an unsupported character\" and a Details map carrying {\"shipment_id\": trimmed}. Both GetShipment and AdvanceShipment run this check before touching the store; AdvanceShipment additionally rejects an empty NextStatus with \"next status is required\", and on success re-reads the record by calling GetShipment so the response reflects the new version.",
+      "rubric": [
+        "states the id is trimmed and may not exceed MaxTrackingIDLength = 64 characters",
+        "states the permitted characters are letters, digits, '-' and '_'",
+        "states a slash yields CodeInvalidArgument with the message 'shipment id contains an unsupported character'",
+        "notes that rejection populates the Details map with the shipment_id key",
+        "states AdvanceShipment also requires a non-empty NextStatus and re-reads via GetShipment after a successful update"
+      ],
+      "cites": ["internal/server/handlers.go"]
+    },
+    {
+      "id": "gosvc-12",
+      "question": "Which environment variables must be set for gosvc to start, which invalid combinations are rejected, and what exit code does a bad configuration produce?",
+      "reference_answer": "Load() uses mustGet for exactly two variables, DATABASE_DSN and TOPIC, each failing with an ErrMissing-wrapped error. BROKERS is not enforced by mustGet — it is read with getList and only caught later by Config.Validate, which returns `%w: BROKERS` when the slice is empty. Validate also rejects a PoolSize below 1 and, notably, a DialTimeout greater than RequestTimeout (\"dial timeout %s exceeds request timeout %s\"; the defaults 3s and 10s satisfy this), plus a FailureRatio outside (0,1]. run() logs \"configuration is invalid\" through a stderr logger and returns exit code 78, which main passes to os.Exit. Before anything else is logged, cfg.Redacted() runs the DSN through maskDSN so the credentials never reach the log.",
+      "rubric": [
+        "names DATABASE_DSN and TOPIC as the only variables read with mustGet / ErrMissing",
+        "states BROKERS is enforced by Config.Validate rather than by mustGet",
+        "states Validate rejects DialTimeout greater than RequestTimeout (defaults 3s and 10s) and a PoolSize below 1",
+        "states run() returns exit code 78 for an invalid configuration",
+        "notes Redacted uses maskDSN to strip credentials out of the DSN before logging"
+      ],
+      "cites": ["internal/config/config.go", "cmd/gosvc/main.go"]
+    }
+  ]
+}
