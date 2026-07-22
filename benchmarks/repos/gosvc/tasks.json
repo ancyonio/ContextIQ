@@ -1,0 +1,140 @@
+{
+  "version": 2,
+  "repo": ".",
+  "languages": ["go"],
+  "description": "gosvc fixture: a Go shipment microservice (RPC-style handlers with status-code mapping, bounded connection pool, rolling-window circuit breaker, environment config loading, structured JSON logging, at-least-once broker consumer loop). Tasks are written as a developer would phrase the problem, avoiding the identifier names so the corpus measures semantic retrieval.",
+  "cases": [
+    {
+      "task": "take a dependency out of rotation when it starts failing a large share of calls, not only when it fails several times back to back",
+      "expected_files": ["internal/breaker/breaker.go"],
+      "expected_symbols": [
+        "internal.breaker.breaker.Breaker.RecordFailure",
+        "internal.breaker.breaker.Breaker.totals"
+      ],
+      "must_contain": ["MinimumSamples"]
+    },
+    {
+      "task": "after we have stopped calling something for a while, let a couple of requests through to find out whether it came back",
+      "expected_files": ["internal/breaker/breaker.go"],
+      "expected_symbols": ["internal.breaker.breaker.Breaker.Allow"],
+      "must_contain": ["HalfOpenProbes"]
+    },
+    {
+      "task": "a caller giving up on its own deadline says nothing about how healthy the downstream is, so it should not be held against it",
+      "expected_files": ["internal/breaker/breaker.go"],
+      "expected_symbols": ["internal.breaker.breaker.Breaker.Do"],
+      "must_contain": ["DeadlineExceeded"]
+    },
+    {
+      "task": "never open more simultaneous connections than we configured, no matter how many goroutines pile in at once, and give up cleanly when the caller's deadline passes while waiting",
+      "expected_files": ["internal/pool/pool.go"],
+      "expected_symbols": ["internal.pool.pool.Pool.Acquire"],
+      "must_contain": ["ErrAcquireTimeout"]
+    },
+    {
+      "task": "throw away connections that have been sitting unused for a long time because a firewall has probably already forgotten about them",
+      "expected_files": ["internal/pool/pool.go"],
+      "expected_symbols": ["internal.pool.pool.Pool.Reap"],
+      "must_contain": ["MaxIdleTime"]
+    },
+    {
+      "task": "find out that a socket died quietly during a background sweep instead of letting a customer request discover it",
+      "expected_files": ["internal/pool/pool.go"],
+      "expected_symbols": [
+        "internal.pool.pool.Pool.HealthCheck",
+        "internal.pool.pool.Pool.drop"
+      ],
+      "must_contain": ["acquireSpinGuard"]
+    },
+    {
+      "task": "refuse to boot with a precise message when a mandatory setting was never supplied to the container",
+      "expected_files": ["internal/config/config.go"],
+      "expected_symbols": [
+        "internal.config.config.Load",
+        "internal.config.config.mustGet"
+      ],
+      "must_contain": ["DATABASE_DSN"]
+    },
+    {
+      "task": "keep the password out of the connection string we print in the start-up banner",
+      "expected_files": ["internal/config/config.go"],
+      "expected_symbols": [
+        "internal.config.config.maskDSN",
+        "internal.config.config.Config.Redacted"
+      ],
+      "must_contain": ["***"]
+    },
+    {
+      "task": "the same event arriving twice from the broker must leave the record in the right state instead of double-applying the change",
+      "expected_files": ["internal/consumer/consumer.go"],
+      "expected_symbols": ["internal.consumer.consumer.Consumer.Handle"],
+      "must_contain": ["ErrConflict"]
+    },
+    {
+      "task": "a record that can never be parsed should be set aside after a bounded number of attempts rather than blocking its partition forever",
+      "expected_files": ["internal/consumer/consumer.go"],
+      "expected_symbols": [
+        "internal.consumer.consumer.Consumer.handleWithRetries",
+        "internal.consumer.consumer.decode"
+      ],
+      "must_contain": ["MaxDeliveryTries"]
+    },
+    {
+      "task": "wait a little longer before each redelivery, but stop growing the wait once it gets silly",
+      "expected_files": ["internal/consumer/consumer.go"],
+      "expected_symbols": ["internal.consumer.consumer.backoffFor"],
+      "must_contain": ["RetryMaxDelay"]
+    },
+    {
+      "task": "avoid a round trip to the broker for every single record by acknowledging our position on a timer instead",
+      "expected_files": ["internal/consumer/consumer.go"],
+      "expected_symbols": [
+        "internal.consumer.consumer.Consumer.maybeCommit",
+        "internal.consumer.consumer.Consumer.RunOnce"
+      ],
+      "must_contain": ["lastCommit"]
+    },
+    {
+      "task": "answer the caller with a code that tells their client library whether trying again is worth it or whether they must re-read and redo the change",
+      "expected_files": ["internal/server/handlers.go"],
+      "expected_symbols": ["internal.server.handlers.statusFromError"],
+      "must_contain": ["CodeUnavailable"]
+    },
+    {
+      "task": "turn away an identifier that is blank, absurdly long, or full of characters that have no business in a key",
+      "expected_files": ["internal/server/handlers.go"],
+      "expected_symbols": ["internal.server.handlers.validateShipmentID"],
+      "must_contain": ["MaxTrackingIDLength"]
+    },
+    {
+      "task": "stop two workers handling the same event from both writing their version of the row",
+      "expected_files": ["internal/store/store.go"],
+      "expected_symbols": ["internal.store.store.Store.UpdateStatus"],
+      "must_contain": ["version = version + 1"]
+    },
+    {
+      "task": "write a whole flush of records in one statement instead of paying a round trip per row",
+      "expected_files": ["internal/store/store.go"],
+      "expected_symbols": ["internal.store.store.Store.UpsertBatch"],
+      "must_contain": ["MaxBatchSize"]
+    },
+    {
+      "task": "emit one machine-parsable object per line with a clock reading and severity so the log shipper does not need a pattern to index it",
+      "expected_files": ["internal/logging/logger.go"],
+      "expected_symbols": [
+        "internal.logging.logger.Logger.log",
+        "internal.logging.logger.Level.String"
+      ],
+      "must_contain": ["TimestampKey"]
+    },
+    {
+      "task": "give the background loops a bounded window to finish what they are holding when the container is asked to stop",
+      "expected_files": ["cmd/gosvc/main.go"],
+      "expected_symbols": [
+        "cmd.gosvc.main.run",
+        "cmd.gosvc.main.awaitSignal"
+      ],
+      "must_contain": ["ShutdownGrace"]
+    }
+  ]
+}

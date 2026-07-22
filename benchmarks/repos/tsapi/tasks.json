@@ -1,0 +1,134 @@
+{
+  "version": 2,
+  "repo": ".",
+  "languages": ["typescript"],
+  "description": "tsapi fixture: a TypeScript Node/Express-style REST API (router with middleware chains, JWT auth, sliding-window rate limiter, Postgres access layer, zod-flavoured request validation, WebSocket notification hub). Tasks describe the developer's intent rather than naming the symbols, so the corpus scores semantic retrieval rather than substring matching.",
+  "cases": [
+    {
+      "task": "smooth out request throttling so a caller is not handed a full fresh allowance the instant the counting period rolls over",
+      "expected_files": ["src/rateLimiter.ts"],
+      "expected_symbols": ["src.rateLimiter.SlidingWindowLimiter.hit"],
+      "must_contain": ["previousCount"]
+    },
+    {
+      "task": "decide who a throttling counter belongs to so a whole office behind one shared address is not punished together",
+      "expected_files": ["src/rateLimiter.ts"],
+      "expected_symbols": ["src.rateLimiter.resolveClientKey"],
+      "must_contain": ["x-forwarded-for"]
+    },
+    {
+      "task": "stop the throttling bookkeeping from growing without bound as new callers appear and old ones go away",
+      "expected_files": ["src/rateLimiter.ts"],
+      "expected_symbols": ["src.rateLimiter.SlidingWindowLimiter.sweep"],
+      "must_contain": ["BUCKET_TTL_MS"]
+    },
+    {
+      "task": "compare a credential digest against the expected one without letting the time it takes reveal how much of it was right",
+      "expected_files": ["src/auth.ts"],
+      "expected_symbols": ["src.auth.signaturesMatch"],
+      "must_contain": ["timingSafeEqual"]
+    },
+    {
+      "task": "reject a credential that has aged out, was issued by the wrong party, or was meant for a different service, while tolerating a couple of seconds of clock drift between hosts",
+      "expected_files": ["src/auth.ts"],
+      "expected_symbols": ["src.auth.verifyToken", "src.auth.AuthError"],
+      "must_contain": ["clockToleranceSeconds"]
+    },
+    {
+      "task": "make sure the long-lived credential used only for renewal cannot be presented to a normal endpoint as if it were the short-lived one",
+      "expected_files": ["src/auth.ts"],
+      "expected_symbols": ["src.auth.requireAuth"],
+      "must_contain": ["wrong_token_type"]
+    },
+    {
+      "task": "report every bad field in one round trip instead of stopping at the first problem so a form can highlight all of them at once",
+      "expected_files": ["src/validation.ts"],
+      "expected_symbols": [
+        "src.validation.ObjectSchema.parse",
+        "src.validation.issuesToResponse"
+      ],
+      "must_contain": ["validation_failed"]
+    },
+    {
+      "task": "turn away a name that is too short and an address that is not shaped like a mailbox before anything reaches storage",
+      "expected_files": ["src/validation.ts"],
+      "expected_symbols": [
+        "src.validation.StringSchema.parse",
+        "src.validation.StringSchema.email"
+      ],
+      "must_contain": ["EMAIL_PATTERN", "too_short"]
+    },
+    {
+      "task": "let a client walk through a long list page by page without deep pages getting slower and without skipping rows when new ones are inserted mid-scroll",
+      "expected_files": ["src/db.ts"],
+      "expected_symbols": [
+        "src.db.ProjectRepository.listForOwner",
+        "src.db.clampPageSize"
+      ],
+      "must_contain": ["MAX_PAGE_SIZE"]
+    },
+    {
+      "task": "return a friendly conflict message when the short URL name someone picked is already taken, instead of leaking the driver's error code",
+      "expected_files": ["src/db.ts"],
+      "expected_symbols": [
+        "src.db.ProjectRepository.create",
+        "src.db.DuplicateSlug"
+      ],
+      "must_contain": ["UNIQUE_VIOLATION"]
+    },
+    {
+      "task": "undo every write in a multi-statement operation when one of the later statements blows up, and always hand the connection back",
+      "expected_files": ["src/db.ts"],
+      "expected_symbols": ["src.db.ProjectRepository.withTransaction"],
+      "must_contain": ["ROLLBACK"]
+    },
+    {
+      "task": "pull the identifier out of a URL like /projects/abc123 without using a regular expression that could blow up on a hostile input",
+      "expected_files": ["src/router.ts"],
+      "expected_symbols": ["src.router.matchSegments", "src.router.splitPath"],
+      "must_contain": ["decodeURIComponent"]
+    },
+    {
+      "task": "run the chain of wrappers around a handler in order, letting one of them stop everything after it, and catch the mistake of continuing twice",
+      "expected_files": ["src/router.ts"],
+      "expected_symbols": ["src.router.Router.handle", "src.router.Router.resolve"],
+      "must_contain": ["next() called more"]
+    },
+    {
+      "task": "notice a browser that disappeared without saying goodbye and clean up the connection instead of holding it open forever",
+      "expected_files": ["src/notifications.ts"],
+      "expected_symbols": [
+        "src.notifications.NotificationHub.sweepDeadConnections",
+        "src.notifications.NotificationHub.recordPong"
+      ],
+      "must_contain": ["MISSED_PONGS_BEFORE_DROP"]
+    },
+    {
+      "task": "stop one signed-in user from listening in on another user's live event stream",
+      "expected_files": ["src/notifications.ts"],
+      "expected_symbols": [
+        "src.notifications.canSubscribe",
+        "src.notifications.NotificationHub.subscribe"
+      ],
+      "must_contain": ["forbidden_topic"]
+    },
+    {
+      "task": "refuse an enormous upload while it is still arriving so the process never allocates the whole thing",
+      "expected_files": ["src/server.ts"],
+      "expected_symbols": ["src.server.readJsonBody"],
+      "must_contain": ["MAX_BODY_BYTES"]
+    },
+    {
+      "task": "refuse to start in the live environment when the signing secret is too weak to be safe",
+      "expected_files": ["src/config.ts"],
+      "expected_symbols": ["src.config.loadConfig"],
+      "must_contain": ["JWT_SECRET"]
+    },
+    {
+      "task": "after a record is stored, push a live update to whoever is watching that owner's feed",
+      "expected_files": ["src/routes.ts"],
+      "expected_symbols": ["src.routes.handleCreateProject"],
+      "must_contain": ["project.created"]
+    }
+  ]
+}

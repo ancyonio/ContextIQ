@@ -137,6 +137,22 @@ def count_tokens_for_model(text: str, model: str = "gpt-4o") -> int:
 # working over the dropped symbols.
 MAX_SIGS_PER_FILE = 25
 
+# NB-1: neighbour-expansion bounds. Before these existed, graph expansion
+# emitted every caller/callee it found, in BFS discovery order, until the
+# budget ran out — so one hub symbol with hundreds of callers could flood a
+# pack with irrelevant signatures and evict the content that was actually
+# asked for. Neighbours are now collected under a fan-out cap, scored for
+# relevance to the task, and only the best are emitted.
+# The collection cap must sit well ABOVE the emission cap, or ranking has
+# nothing to choose between and degenerates back to discovery order.
+MAX_FANOUT_PER_SYMBOL = 150     # neighbours collected from any single symbol
+MAX_NEIGHBOR_CANDIDATES = 600   # global ceiling on collected candidates
+MAX_NEIGHBOR_SIGS = 40          # neighbour signatures actually emitted
+# Relevance weight by edge kind. A callee explains how the seed works; a base
+# class explains what it is; a caller is context about who needs it — useful,
+# but the least explanatory of the three.
+NEIGHBOR_REASON_WEIGHT = {"callee": 1.0, "base": 0.95, "caller": 0.7}
+
 
 # ==========================================================================
 # python parser (stdlib ast)
@@ -2075,7 +2091,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
 CREATE TABLE IF NOT EXISTS vectors (
-    symbol_id INTEGER PRIMARY KEY, dim INTEGER NOT NULL, vec BLOB NOT NULL
+    symbol_id INTEGER PRIMARY KEY, dim INTEGER NOT NULL, vec BLOB NOT NULL,
+    backend TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS summaries (
     path TEXT PRIMARY KEY, summary TEXT NOT NULL, kind TEXT DEFAULT 'module',
@@ -2092,14 +2109,37 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE TABLE IF NOT EXISTS weights (
     file TEXT PRIMARY KEY, weight REAL NOT NULL DEFAULT 0.0
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
+);
+-- SD-1: per-session ledger of what has already been sent to a given agent
+-- session, so a second retrieval in the same conversation does not re-bill
+-- bodies the model is already holding.
+CREATE TABLE IF NOT EXISTS sent_ledger (
+    session TEXT NOT NULL, qname TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'body',
+    content_hash TEXT NOT NULL DEFAULT '', tokens INTEGER NOT NULL DEFAULT 0,
+    ts REAL NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (session, qname)
+);
+CREATE INDEX IF NOT EXISTS idx_sent_session ON sent_ledger(session);
 """
+
+# Bumped whenever the on-disk table shapes change in a way that older rows
+# cannot satisfy. Store._migrate() rebuilds what it cannot ALTER into place.
+SCHEMA_VERSION = 3
 
 
 class Store:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        # check_same_thread=False: the MCP server pools a Retriever per thread
+        # but tears the pool down from whichever thread calls shutdown, and
+        # sqlite otherwise refuses a cross-thread close(). Each connection is
+        # still only *used* by its owning thread, so this does not introduce
+        # sharing — it only permits the close.
+        self.conn = sqlite3.connect(str(self.db_path), timeout=10.0,
+                                    check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # Concurrency hardening: WAL lets a reader (a query) and a writer
         # (a freshen-on-query reindex) coexist without "database is locked".
@@ -2115,6 +2155,21 @@ class Store:
         self.conn.commit()
 
     def _migrate(self) -> None:
+        """Bring an older database up to SCHEMA_VERSION, or rebuild if newer.
+
+        Additive column changes are applied with ALTER TABLE. A database
+        written by a *newer* ContextIQ is not readable safely, so it is
+        rebuilt from scratch rather than silently mis-read.
+        """
+        found = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            # Forward-incompatible: drop the derived tables and re-index.
+            for tbl in ("vectors", "chunks", "edges", "symbols", "files",
+                        "summaries"):
+                self.conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            self.conn.executescript(SCHEMA)
+            found = 0
+
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
         for name, ddl in {
             "language": "ALTER TABLE files ADD COLUMN language TEXT DEFAULT ''",
@@ -2124,6 +2179,28 @@ class Store:
         }.items():
             if name not in cols:
                 self.conn.execute(ddl)
+
+        # EM-2: vectors carry the identity of the backend that produced them,
+        # so switching embedding backends invalidates rather than silently
+        # mixing incompatible spaces.
+        vcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(vectors)")}
+        if vcols and "backend" not in vcols:
+            self.conn.execute(
+                "ALTER TABLE vectors ADD COLUMN backend TEXT NOT NULL DEFAULT ''")
+
+        self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    # ---- key/value metadata ----
+    def get_meta(self, key: str, default: str = "") -> str:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        self.conn.commit()
 
     def _init_fts(self) -> bool:
         try:
@@ -2292,19 +2369,90 @@ class Store:
                 "INSERT INTO chunks_fts(rowid,file,text) VALUES(?,?,?)",
                 (row["id"], file, text))
 
-    def set_vector(self, symbol_id: int, vec: list[float]) -> None:
+    def set_vector(self, symbol_id: int, vec: list[float],
+                   backend: str = "") -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO vectors(symbol_id,dim,vec) VALUES(?,?,?)",
-            (symbol_id, len(vec), vec_to_blob(vec)))
+            "INSERT OR REPLACE INTO vectors(symbol_id,dim,vec,backend) VALUES(?,?,?,?)",
+            (symbol_id, len(vec), vec_to_blob(vec), backend or embed_backend_id()))
 
     def iter_vectors(self):
-        return self.conn.execute("SELECT symbol_id, dim, vec FROM vectors")
+        """Only vectors from the *current* backend — mixing spaces is meaningless."""
+        return self.conn.execute(
+            "SELECT symbol_id, dim, vec FROM vectors WHERE backend=?",
+            (embed_backend_id(),))
 
     def vector_count(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) n FROM vectors").fetchone()["n"]
+        return self.conn.execute(
+            "SELECT COUNT(*) n FROM vectors WHERE backend=?",
+            (embed_backend_id(),)).fetchone()["n"]
 
     def has_vectors(self) -> bool:
-        return self.conn.execute("SELECT 1 FROM vectors LIMIT 1").fetchone() is not None
+        return self.conn.execute(
+            "SELECT 1 FROM vectors WHERE backend=? LIMIT 1",
+            (embed_backend_id(),)).fetchone() is not None
+
+    def drop_stale_vectors(self) -> int:
+        """Delete vectors produced by any other embedding backend (EM-2).
+
+        Returns the number removed. Callers follow this with a re-embed of the
+        affected files, so semantic search never silently degrades to empty
+        after a backend switch.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM vectors WHERE backend<>?", (embed_backend_id(),))
+        return cur.rowcount or 0
+
+    def symbols_missing_vectors(self, limit: int = 0) -> list[sqlite3.Row]:
+        """Indexed symbols that have no vector for the current backend."""
+        sql = ("SELECT s.id, s.qname, s.name, s.signature, s.docstring, s.file "
+               "FROM symbols s LEFT JOIN vectors v "
+               "ON v.symbol_id = s.id AND v.backend = ? "
+               "WHERE v.symbol_id IS NULL AND s.kind <> 'module'")
+        params: list = [embed_backend_id()]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return self.conn.execute(sql, params).fetchall()
+
+    # ---- SD-1: per-session sent ledger (cross-turn dedup) ----
+    def mark_sent(self, session: str, entries: list[tuple[str, str, str, int]]) -> None:
+        """Record (qname, mode, content_hash, tokens) as delivered to `session`."""
+        if not session or not entries:
+            return
+        import time as _t
+        now = _t.time()
+        self.conn.executemany(
+            "INSERT INTO sent_ledger(session,qname,mode,content_hash,tokens,ts) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(session,qname) DO UPDATE SET "
+            "mode=excluded.mode, content_hash=excluded.content_hash, "
+            "tokens=excluded.tokens, ts=excluded.ts",
+            [(session, q, m, h, t, now) for q, m, h, t in entries])
+        self.conn.commit()
+
+    def sent_map(self, session: str) -> dict[str, sqlite3.Row]:
+        """qname -> ledger row for everything already sent to this session."""
+        if not session:
+            return {}
+        return {r["qname"]: r for r in self.conn.execute(
+            "SELECT qname, mode, content_hash, tokens FROM sent_ledger "
+            "WHERE session=?", (session,))}
+
+    def clear_session(self, session: str = "") -> int:
+        """Forget one session's ledger, or all of them when session is empty."""
+        if session:
+            cur = self.conn.execute(
+                "DELETE FROM sent_ledger WHERE session=?", (session,))
+        else:
+            cur = self.conn.execute("DELETE FROM sent_ledger")
+        self.conn.commit()
+        return cur.rowcount or 0
+
+    def session_stats(self, session: str) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(tokens),0) t FROM sent_ledger "
+            "WHERE session=?", (session,)).fetchone()
+        return {"session": session, "symbols_sent": row["n"],
+                "tokens_sent": row["t"]}
 
     def set_summary(self, path: str, summary: str, kind: str = "module",
                     source: str = "auto") -> None:
@@ -2477,7 +2625,26 @@ class Store:
                     seen.add(r["id"]); rows.append(r)
         return rows[:limit]
 
-    def neighbors(self, sid: int, types: Iterable[str], direction: str) -> list[sqlite3.Row]:
+    def degrees(self, ids: Iterable[int]) -> dict[int, int]:
+        """Total edge degree for each id, in one round trip (NB-1).
+
+        Used to damp hub symbols: something referenced from everywhere carries
+        little task-specific signal, so it should not outrank a close match.
+        """
+        idl = list(dict.fromkeys(ids))
+        if not idl:
+            return {}
+        out: dict[int, int] = {i: 0 for i in idl}
+        q = ",".join("?" * len(idl))
+        for col in ("src_id", "dst_id"):
+            for r in self.conn.execute(
+                    f"SELECT {col} AS i, COUNT(*) AS n FROM edges "
+                    f"WHERE {col} IN ({q}) GROUP BY {col}", idl):
+                out[r["i"]] = out.get(r["i"], 0) + r["n"]
+        return out
+
+    def neighbors(self, sid: int, types: Iterable[str], direction: str,
+                  limit: int = 0) -> list[sqlite3.Row]:
         """Return symbols connected to `sid` by the given edge types.
 
         direction: 'out' (sid is src) returns callees/bases;
@@ -2491,7 +2658,13 @@ class Store:
         else:
             sql = (f"SELECT s.* FROM edges e JOIN symbols s ON s.id=e.src_id "
                    f"WHERE e.dst_id=? AND e.type IN ({q})")
-        return self.conn.execute(sql, [sid] + tlist).fetchall()
+        params: list = [sid] + tlist
+        if limit:
+            # Deterministic truncation for hub symbols (NB-1): ordering by id
+            # keeps the candidate set stable across runs.
+            sql += " ORDER BY s.id LIMIT ?"
+            params.append(limit)
+        return self.conn.execute(sql, params).fetchall()
 
     def file_symbols(self, file: str) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -2568,6 +2741,7 @@ import math
 EMBED_DIM = 256
 _EMBED_MODEL = None
 _EMBED_TRIED = False
+_EMBED_STATUS = "not probed"
 
 
 def offline_mode() -> bool:
@@ -2576,23 +2750,141 @@ def offline_mode() -> bool:
     }
 
 
+_EMBED_DISABLED = {"0", "false", "no", "off", "none", "hash", "hashing"}
+_EMBED_ENABLED = {"1", "true", "yes", "on", "auto", "st", "sbert",
+                  "sentence-transformers"}
+
+
+def embed_model_name() -> str:
+    return os.environ.get("TOKENGRAPH_EMBED_MODEL", "all-MiniLM-L6-v2")
+
+
 def _embed_model():
-    """Lazily load sentence-transformers IFF explicitly opted in; else None."""
-    global _EMBED_MODEL, _EMBED_TRIED
+    """Load sentence-transformers when it is installed (EM-1).
+
+    Previously this required an opt-in env var, so `pip install
+    contextiq[embeddings]` bought nothing and users believed they had a
+    neural model while running the hashing fallback. Now presence of the
+    package is the signal; `TOKENGRAPH_EMBEDDINGS=off` (or offline mode)
+    forces the deterministic hash backend.
+    """
+    global _EMBED_MODEL, _EMBED_TRIED, _EMBED_STATUS
     if offline_mode():
+        _EMBED_STATUS = "offline mode (TOKENGRAPH_OFFLINE)"
         return None
     if _EMBED_TRIED:
         return _EMBED_MODEL
     _EMBED_TRIED = True
-    if os.environ.get("TOKENGRAPH_EMBEDDINGS", "").lower() in (
-            "st", "sbert", "sentence-transformers"):
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            name = os.environ.get("TOKENGRAPH_EMBED_MODEL", "all-MiniLM-L6-v2")
-            _EMBED_MODEL = SentenceTransformer(name)
-        except Exception:
-            _EMBED_MODEL = None
+    setting = os.environ.get("TOKENGRAPH_EMBEDDINGS", "auto").strip().lower()
+    if setting in _EMBED_DISABLED:
+        _EMBED_STATUS = "disabled via TOKENGRAPH_EMBEDDINGS"
+        return None
+    if setting and setting not in _EMBED_ENABLED | {"download"}:
+        _EMBED_STATUS = f"unrecognised TOKENGRAPH_EMBEDDINGS={setting!r}"
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception:
+        _EMBED_STATUS = ("sentence-transformers not installed — "
+                         "`pip install contextiq[embeddings]`")
+        return None
+    # Never fetch over the network implicitly: a first MCP call must not stall
+    # for minutes on a model download. `TOKENGRAPH_EMBEDDINGS=download` (or
+    # `contextiq embed-warm`) opts into the one-time fetch.
+    allow_download = setting == "download"
+    try:
+        kwargs = {} if allow_download else {"local_files_only": True}
+        model = SentenceTransformer(embed_model_name(), **kwargs)
+        # sentence-transformers silently improvises an *untrained* mean-pooling
+        # model when it cannot read a proper ST config. That is strictly worse
+        # than the deterministic hash backend, so reject it: a real model
+        # reports a sentence-embedding dimension and encodes stably.
+        dim = model.get_sentence_embedding_dimension()
+        if not dim or dim <= 0:
+            raise RuntimeError("no sentence-embedding dimension")
+        probe = model.encode(["def add(a, b): return a + b"],
+                             normalize_embeddings=True)
+        if len(probe[0]) != dim:
+            raise RuntimeError("embedding dimension mismatch")
+        _EMBED_MODEL = model
+        _EMBED_STATUS = f"loaded {embed_model_name()} ({dim}d)"
+    except Exception as ex:
+        _EMBED_MODEL = None
+        _EMBED_STATUS = (
+            f"{embed_model_name()} not available locally ({type(ex).__name__}); "
+            f"run `contextiq embed-warm` once to download it, or set "
+            f"TOKENGRAPH_EMBEDDINGS=download")
     return _EMBED_MODEL
+
+
+def embed_backend_id() -> str:
+    """Stable identity of the embedding space currently in use (EM-2).
+
+    Stored on every vector row so a backend switch invalidates the old
+    vectors instead of silently comparing incompatible spaces.
+    """
+    model = _embed_model()
+    if model is None:
+        return f"hash-v1-d{EMBED_DIM}"
+    return f"st:{embed_model_name()}"
+
+
+def embed_backend_info() -> dict:
+    """Human-facing description of the active embedding backend.
+
+    Surfaced by `doctor`, `search_semantic` and `embedding_status` so nobody
+    has to guess whether they are getting true semantic matching or the
+    lexical hash fallback.
+    """
+    model = _embed_model()
+    semantic = model is not None
+    return {
+        "backend": embed_backend_id(),
+        "semantic": semantic,
+        "kind": "sentence-transformers" if semantic else "hashing",
+        "model": embed_model_name() if semantic else None,
+        "status": _EMBED_STATUS,
+        "note": (
+            "True neural embeddings: matches by meaning."
+            if semantic else
+            "Deterministic hashing over tokens + character trigrams. Captures "
+            "lexical and structural overlap robustly, but does NOT match by "
+            "meaning across unrelated vocabulary. Install "
+            "`contextiq[embeddings]` and run `contextiq embed-warm`."
+        ),
+    }
+
+
+def embed_warm() -> dict:
+    """Download + verify the semantic embedding model, once, explicitly.
+
+    Separated from the query path so no MCP tool call ever blocks on a model
+    fetch. After this succeeds, `auto` picks the model up from local cache.
+    """
+    global _EMBED_MODEL, _EMBED_TRIED, _EMBED_STATUS
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception:
+        return {"ok": False, "backend": embed_backend_id(),
+                "error": "sentence-transformers not installed. "
+                         "Install with: pip install 'contextiq[embeddings]'"}
+    name = embed_model_name()
+    try:
+        model = SentenceTransformer(name)
+        dim = model.get_sentence_embedding_dimension()
+        if not dim or dim <= 0:
+            raise RuntimeError(
+                f"{name} has no sentence-transformers config; it would load as "
+                f"an untrained mean-pooling model")
+        _EMBED_MODEL, _EMBED_TRIED = model, True
+        _EMBED_STATUS = f"loaded {name} ({dim}d)"
+        return {"ok": True, "model": name, "dim": dim,
+                "backend": embed_backend_id(),
+                "next": "Re-index to rebuild vectors in the new space: "
+                        "`contextiq index`"}
+    except Exception as ex:
+        return {"ok": False, "model": name, "backend": embed_backend_id(),
+                "error": f"{type(ex).__name__}: {ex}"}
 
 
 def _trigrams(token: str):
@@ -3320,6 +3612,7 @@ class IndexReport:
     parsed: int = 0
     skipped: int = 0
     removed: int = 0
+    reembedded: int = 0
     errors: list[str] = None
     stats: dict = None
 
@@ -3484,11 +3777,30 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
     report.scanned = len(files)
     current = {p.relative_to(root).as_posix() for p in files}
 
-    # drop deleted files
+    # drop deleted files.
+    # A targeted refresh (paths=[...], used by the notify_* MCP tools) cannot
+    # see repo-wide deletions, but it CAN reconcile the paths it was handed:
+    # anything explicitly named that no longer exists on disk is forgotten.
+    # Without this, IDE-pushed change events accumulated ghost symbols forever.
     if paths is None:
         for gone in store.all_indexed_files() - current:
             store.forget_file(gone)
             report.removed += 1
+    else:
+        indexed = store.all_indexed_files()
+        for rel in paths:
+            rel_posix = Path(rel).as_posix().lstrip("./")
+            if rel_posix in indexed and rel_posix not in current:
+                store.forget_file(rel_posix)
+                report.removed += 1
+
+    # EM-2: if the embedding backend changed since the last index, every stored
+    # vector belongs to a different space. Drop them and force a re-embed of
+    # all files rather than letting semantic search silently return nothing.
+    backend = embed_backend_id()
+    if store.get_meta("embed_backend") != backend:
+        store.drop_stale_vectors()
+        store.set_meta("embed_backend", backend)
 
     pending: list[tuple[str, PendingEdge]] = []
     import_maps: dict[str, dict[str, str]] = {}
@@ -3569,6 +3881,21 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
         if resolved:
             store.add_edge(resolved[0], resolved[1], e.type)
             resolved_n += 1
+
+    # EM-2: backfill vectors for any symbol lacking one in the *current*
+    # embedding space. Normally a no-op; after a backend switch (or an
+    # interrupted index) it is what restores semantic search instead of
+    # leaving it silently returning nothing.
+    missing = store.symbols_missing_vectors()
+    if missing:
+        batch = 256
+        for i in range(0, len(missing), batch):
+            group = missing[i:i + batch]
+            texts = [symbol_embedding_text(r["qname"], r["signature"], r["docstring"])
+                     for r in group]
+            for row, vec in zip(group, embed_texts(texts)):
+                store.set_vector(row["id"], vec, backend)
+        report.reembedded = len(missing)
 
     store.commit()
     report.stats = store.stats()
@@ -3730,6 +4057,16 @@ def dedupe_blocks(blocks: list[str], threshold: float = 0.8) -> dict:
         "tokens_saved": before - after,
         "reduction_pct": round((before - after) / before * 100.0, 1) if before else 0.0,
     }
+
+
+def _piece_hash(text: str) -> str:
+    """Content identity of a pack piece, for the session ledger (SD-1).
+
+    Whitespace-normalised so cosmetic reformatting does not force a resend,
+    but any real edit does.
+    """
+    norm = " ".join((text or "").split())
+    return hashlib.blake2b(norm.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def _dedupe_pieces(pieces: list["Piece"], threshold: float = 0.8) -> tuple[list, list]:
@@ -3978,7 +4315,12 @@ class ContextPack:
     pieces: list[Piece] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
     deduped: list[str] = field(default_factory=list)   # DD-1: redundant pieces removed
+    reused: list[str] = field(default_factory=list)    # SD-1: already in session
     budget: int = 0
+    session: str = ""
+    tokens_reused: int = 0          # tokens NOT resent thanks to the ledger
+    neighbors_considered: int = 0   # NB-1: candidates seen during expansion
+    neighbors_pruned: int = 0       # NB-1: candidates dropped by ranking
 
     @property
     def tokens(self) -> int:
@@ -4002,6 +4344,11 @@ class ContextPack:
         if self.deduped:
             lines.append("## Deduplicated (redundant with content already shown)")
             lines.append(", ".join(f"`{d}`" for d in self.deduped))
+        if self.reused:
+            lines.append(
+                f"## Already sent earlier this session — unchanged, not repeated "
+                f"(~{self.tokens_reused} tokens saved)")
+            lines.append(", ".join(f"`{d}`" for d in self.reused))
         out, _ = redact_secrets("\n".join(lines))
         return out
 
@@ -4016,6 +4363,7 @@ class Retriever:
         self.store = Store(db_path)
         self._src_cache: dict[str, list[str]] = {}
         self._ann_index = None
+        self.pooled = False        # RP-1: set by the MCP pool; makes close() a no-op
 
     # ---- source access ----
     def _lines(self, file: str) -> list[str]:
@@ -4108,9 +4456,14 @@ class Retriever:
 
     # ---- semantic + hybrid seeding ----
     def semantic_search(self, query: str, limit: int = 12) -> list:
-        """Cosine ranking of symbols by embedding similarity to the query."""
+        """Cosine ranking of symbols by embedding similarity to the query.
+
+        Never returns empty just because the vector table is unusable — an
+        un-vectorised or mid-migration database degrades to lexical search
+        rather than silently yielding nothing (EM-3).
+        """
         if not self.store.has_vectors():
-            return []
+            return list(self.store.search(query, limit=limit))
         qv = embed_text(query)
         backend = os.environ.get("TOKENGRAPH_VECTOR_BACKEND", "exact").lower()
         threshold = int(os.environ.get("TOKENGRAPH_ANN_THRESHOLD", "5000"))
@@ -4138,14 +4491,23 @@ class Retriever:
             except (ImportError, RuntimeError, ValueError):
                 pass
         scored: list[tuple[float, int]] = []
+        mismatched = 0
         for r in self.store.iter_vectors():
             v = blob_to_vec(r["vec"])
             if len(v) != len(qv):
+                mismatched += 1
                 continue
             s = cosine(qv, v)
             if s > 0:
                 scored.append((s, r["symbol_id"]))
-        scored.sort(key=lambda t: t[0], reverse=True)
+        if not scored and mismatched:
+            # Every stored vector is from another embedding space and the
+            # re-embed pass has not run yet. Lexical results beat none.
+            return list(self.store.search(query, limit=limit))
+        # Deterministic order: score desc, then symbol id — so equal-scoring
+        # symbols do not reshuffle between runs (needed for stable prompt
+        # prefixes and reproducible evidence packs).
+        scored.sort(key=lambda t: (-t[0], t[1]))
         rows = []
         for _, sid in scored[:limit]:
             row = self.store.symbol(sid)
@@ -4163,14 +4525,42 @@ class Retriever:
                 rid = row["id"]
                 rowmap[rid] = row
                 scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
-        order = sorted(scores, key=lambda i: scores[i], reverse=True)
+        # Deterministic: fused score desc, then symbol id asc as a stable
+        # tie-break so identical DB state always yields byte-identical packs.
+        order = sorted(scores, key=lambda i: (-scores[i], i))
         return [rowmap[i] for i in order[:limit]]
 
     # ---- the main entrypoint ----
+    @staticmethod
+    def _neighbor_score(row, reason: str, hop: int, task_terms: set[str],
+                        degree: int) -> float:
+        """Rank a candidate neighbour against the task (NB-1).
+
+        Combines four signals: which kind of edge reached it, how far it is
+        from a seed, how much its identity overlaps the task wording, and how
+        hub-like it is. Pure arithmetic on already-loaded rows — no I/O.
+        """
+        weight = NEIGHBOR_REASON_WEIGHT.get(reason, 0.6)
+        hop_decay = 1.0 / (1.0 + hop)
+        text = " ".join(str(row[k] or "") for k in ("qname", "name", "signature",
+                                                    "docstring"))
+        terms = set(_tokenize(text))
+        overlap = (len(task_terms & terms) / len(task_terms)) if task_terms else 0.0
+        # Hub damping: degree 0 -> 1.0, degree 100 -> ~0.15.
+        hub = 1.0 / (1.0 + math.log2(1.0 + degree))
+        return weight * hop_decay * (0.35 + overlap) * hub
+
     def find_relevant_context(self, task: str, budget_tokens: int = 6000,
                               expand_depth: int = 1,
-                              max_body_tokens: int = 1600) -> ContextPack:
+                              max_body_tokens: int = 1600,
+                              session: str = "") -> ContextPack:
         pack = ContextPack(task=task, budget=budget_tokens)
+        # SD-1: what this conversation has already been shown. Anything whose
+        # content is unchanged since we sent it is referenced by name instead
+        # of re-serialised, so a second retrieval in the same session does not
+        # re-bill the model for text it is already holding.
+        already: dict = self.store.sent_map(session) if session else {}
+        pack.session = session
 
         # hybrid seeding: lexical (FTS5) + semantic (embeddings), fused by RRF.
         lexical = self.store.search(task, limit=12)
@@ -4178,6 +4568,11 @@ class Retriever:
         seeds = self._fuse([lexical, semantic], limit=12) if semantic else lexical
         # de-prioritise module nodes as seeds; we want concrete defs
         seeds = [s for s in seeds if s["kind"] != "module"] or seeds
+        # Spread seeds across files so one file cannot monopolise the pack.
+        # The cap of 4 is load-bearing, not arbitrary: raising it measurably
+        # *lowered* symbol recall on the benchmark suite, because extra
+        # same-file seeds consume the budget with full bodies and evict the
+        # symbol the task was actually about.
         diversified = []
         per_file: dict[str, int] = {}
         for seed in seeds:
@@ -4194,24 +4589,43 @@ class Retriever:
         seed_ids = [s["id"] for s in seeds]
         chunk_rows = self.store.search_chunks(task, limit=8)
 
-        # collect neighbors via BFS over CALLS (both directions) + INHERITS
-        neighbor_rows: dict[int, tuple] = {}  # id -> (row, reason)
+        # Collect neighbours via BFS over CALLS/REFERENCES (both directions)
+        # and INHERITS, under a per-symbol fan-out cap and a global ceiling so
+        # a hub symbol cannot dominate the candidate set (NB-1).
+        candidates: dict[int, tuple] = {}  # id -> (row, reason, hop)
         frontier = list(seed_ids)
         seen = set(seed_ids)
-        for _ in range(max(0, expand_depth)):
+        for hop in range(max(0, expand_depth)):
             nxt = []
             for sid in frontier:
-                for r in self.store.neighbors(sid, ["CALLS", "REFERENCES"], "out"):
-                    if r["id"] not in seen:
-                        neighbor_rows.setdefault(r["id"], (r, "callee")); nxt.append(r["id"])
-                for r in self.store.neighbors(sid, ["INHERITS"], "out"):
-                    if r["id"] not in seen:
-                        neighbor_rows.setdefault(r["id"], (r, "base")); nxt.append(r["id"])
-                for r in self.store.neighbors(sid, ["CALLS", "REFERENCES"], "in"):
-                    if r["id"] not in seen:
-                        neighbor_rows.setdefault(r["id"], (r, "caller")); nxt.append(r["id"])
+                if len(candidates) >= MAX_NEIGHBOR_CANDIDATES:
+                    break
+                for types, direction, reason in (
+                        (["CALLS", "REFERENCES"], "out", "callee"),
+                        (["INHERITS"], "out", "base"),
+                        (["CALLS", "REFERENCES"], "in", "caller")):
+                    for r in self.store.neighbors(sid, types, direction,
+                                                  limit=MAX_FANOUT_PER_SYMBOL):
+                        if r["id"] in seen or r["id"] in candidates:
+                            continue
+                        if len(candidates) >= MAX_NEIGHBOR_CANDIDATES:
+                            break
+                        candidates[r["id"]] = (r, reason, hop)
+                        nxt.append(r["id"])
             seen.update(nxt)
             frontier = nxt
+
+        # Rank candidates by task relevance; only the best are emitted.
+        task_terms = set(_tokenize(task))
+        degree_map = self.store.degrees(candidates.keys())
+        ranked = sorted(
+            candidates.values(),
+            key=lambda t: (-self._neighbor_score(t[0], t[1], t[2], task_terms,
+                                                 degree_map.get(t[0]["id"], 0)),
+                           t[0]["id"]))
+        pack.neighbors_considered = len(candidates)
+        neighbor_rows = [(r, reason) for r, reason, _ in ranked[:MAX_NEIGHBOR_SIGS]]
+        pack.neighbors_pruned = max(0, len(candidates) - len(neighbor_rows))
 
         # --- budget assembly ---
         # 1. seeds get full bodies (highest value), in search-rank order
@@ -4219,6 +4633,14 @@ class Retriever:
         for s in seeds:
             body = self._body(s)
             est = count_tokens(body)
+            # SD-1: if this session already holds this exact text, spend a
+            # one-line reference instead of the whole body.
+            prior = already.get(s["qname"])
+            if prior is not None and prior["content_hash"] == _piece_hash(body):
+                pack.reused.append(s["qname"])
+                pack.tokens_reused += prior["tokens"]
+                full_body_files.add(s["file"])
+                continue
             if est > max_body_tokens or (pack.tokens + est > budget_tokens and pack.pieces):
                 # demote large bodies to signatures; indexed chunks below provide detail.
                 sig = self._sig_block(s)
@@ -4232,11 +4654,17 @@ class Retriever:
                                          "body", body, est, "seed"))
                 full_body_files.add(s["file"])
 
-        # 2. neighbors get signatures only (cheap context that resolves refs)
-        for sid, (r, reason) in neighbor_rows.items():
+        # 2. neighbors get signatures only (cheap context that resolves refs),
+        #    already ranked by task relevance above.
+        for r, reason in neighbor_rows:
             if r["kind"] == "module":
                 continue
             sig = self._sig_block(r)
+            prior = already.get(r["qname"])
+            if prior is not None and prior["content_hash"] == _piece_hash(sig):
+                pack.reused.append(r["qname"])
+                pack.tokens_reused += prior["tokens"]
+                continue
             est = count_tokens(sig)
             if pack.tokens + est > budget_tokens:
                 pack.dropped.append(r["qname"]); continue
@@ -4246,7 +4674,7 @@ class Retriever:
         # 2b. module summaries: a few tokens to gesture at a referenced file
         #     whose body we didn't pull in full.
         summarized: set[str] = set()
-        for sid, (r, reason) in neighbor_rows.items():
+        for r, reason in neighbor_rows:
             f = r["file"]
             if f in full_body_files or f in summarized:
                 continue
@@ -4288,28 +4716,106 @@ class Retriever:
             pack.dropped.append(removed.qname)
         while pack.dropped and pack.rendered_tokens > budget_tokens:
             pack.dropped.pop()
+        # SD-1: record exactly what survived into the pack, so the next
+        # retrieval in this session can reference it instead of resending it.
+        if session:
+            self.store.mark_sent(session, [
+                (p.qname, p.detail, _piece_hash(p.text), p.token_est)
+                for p in pack.pieces
+                if p.detail in ("body", "signature")])
         return pack
 
-    def measure(self, task: str, **kw) -> dict:
-        """Quantify the saving: pack tokens vs. reading the referenced files whole.
+    # A competent agent that greps then reads around each hit does not read a
+    # whole file. These model that behaviour for the honest baseline (MS-1).
+    GREP_WINDOW_LINES = 40      # lines of context read either side of a hit
+    GREP_LINE_OVERHEAD = 12     # tokens per grep result line the agent sees
 
-        The baseline is the token cost of opening every distinct file the pack
-        draws from — what a naive agent would do to get the same coverage.
+    def _targeted_baseline(self, pack: "ContextPack") -> int:
+        """Tokens a *competent* agent would spend to reach the same coverage.
+
+        Models the realistic alternative to this tool: grep for the relevant
+        symbols, then read a window around each hit — merging overlapping
+        windows, because one read covers neighbouring hits. This is the
+        baseline the headline savings number is reported against, since almost
+        no agent reads a large file end to end.
+        """
+        # Collect the line spans the pack actually covers, per file.
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for p in pack.pieces:
+            lo = hi = None
+            if p.detail == "chunk" and ":" in p.qname and "-" in p.qname:
+                try:
+                    rng = p.qname.rsplit(":", 1)[1]
+                    lo, hi = (int(x) for x in rng.split("-", 1))
+                except ValueError:
+                    lo = hi = None
+            if lo is None:
+                sid = self.store.id_for_qname(p.qname)
+                row = self.store.symbol(sid) if sid is not None else None
+                if row is None:
+                    continue
+                lo = row["lineno"] or 1
+                hi = row["end_lineno"] or lo
+            spans.setdefault(p.file, []).append((lo, hi))
+
+        total = 0
+        for f, raw in spans.items():
+            lines = self._lines(f)
+            n = len(lines)
+            if not n:
+                total += self.store.token_est_for(f)
+                continue
+            # Expand each hit by the read window, then merge overlaps — an
+            # agent reading lines 10-90 does not read them twice.
+            windows = sorted((max(1, lo - self.GREP_WINDOW_LINES),
+                              min(n, hi + self.GREP_WINDOW_LINES))
+                             for lo, hi in raw)
+            merged: list[list[int]] = []
+            for lo, hi in windows:
+                if merged and lo <= merged[-1][1] + 1:
+                    merged[-1][1] = max(merged[-1][1], hi)
+                else:
+                    merged.append([lo, hi])
+            for lo, hi in merged:
+                total += count_tokens("\n".join(lines[lo - 1:hi]))
+            # The grep that located those hits also costs tokens.
+            total += self.GREP_LINE_OVERHEAD * len(raw)
+        return total
+
+    def measure(self, task: str, **kw) -> dict:
+        """Quantify the saving against a realistic agent baseline (MS-1).
+
+        Two baselines are reported and neither is hidden:
+
+        * ``baseline_tokens`` (headline) — grep-and-read-around-hits, what a
+          competent agent actually does. This is the honest comparison.
+        * ``baseline_whole_file_tokens`` — opening every referenced file end to
+          end. Kept for continuity, but it flatters the tool badly on repos
+          with large files and should not be quoted as the saving.
         """
         pack = self.find_relevant_context(task, **kw)
         files = sorted({p.file for p in pack.pieces})
-        baseline = sum(self.store.token_est_for(f) for f in files)
+        whole = sum(self.store.token_est_for(f) for f in files)
+        targeted = self._targeted_baseline(pack)
         pack_tokens = pack.rendered_tokens
-        saved = baseline - pack_tokens
-        pct = (saved / baseline * 100.0) if baseline else 0.0
+        saved = targeted - pack_tokens
+        pct = (saved / targeted * 100.0) if targeted else 0.0
+        whole_saved = whole - pack_tokens
+        whole_pct = (whole_saved / whole * 100.0) if whole else 0.0
         return {
             "task": task,
             "pack_tokens": pack_tokens,
-            "baseline_tokens": baseline,
+            "baseline_tokens": targeted,
+            "baseline_kind": "grep+targeted-read",
+            "baseline_whole_file_tokens": whole,
             "files_referenced": len(files),
             "symbols_in_pack": len(pack.pieces),
             "tokens_saved": saved,
             "savings_pct": round(pct, 1),
+            "savings_pct_vs_whole_file": round(whole_pct, 1),
+            "session_tokens_reused": pack.tokens_reused,
+            "neighbors_considered": pack.neighbors_considered,
+            "neighbors_pruned": pack.neighbors_pruned,
         }
 
     def report(self, tasks: list[str], **kw) -> dict:
@@ -4899,7 +5405,11 @@ class Retriever:
     # ---- signature-map helpers for context generation (TB-4 strategies) ----
     def all_files(self, src_dirs: list[str] | None = None) -> list[str]:
         files = sorted(r["path"] for r in self.store.files_with_tokens())
-        if not src_dirs:
+        # "." means the repository root, i.e. everything — including files that
+        # sit at the top level and therefore have no directory prefix to match.
+        # Without this, a config of srcDirs=["."] silently selected no files at
+        # all for any root-level source file.
+        if not src_dirs or any(d in (".", "./", "") for d in src_dirs):
             return files
         keep = []
         for f in files:
@@ -4913,7 +5423,25 @@ class Retriever:
         return sum(count_tokens(self.file_skeleton(f))
                    for f in self.all_files(src_dirs))
 
+    def invalidate(self) -> None:
+        """Drop derived caches after the graph changed (RP-1).
+
+        The sqlite connection stays open — only the in-memory source lines and
+        the ANN index, both of which would otherwise answer from stale state.
+        """
+        self._src_cache.clear()
+        self._ann_index = None
+
     def close(self):
+        # A pooled retriever outlives any single tool call, so the usual
+        # `finally: r.close()` must not tear down the shared connection.
+        # close_now() is the real shutdown path.
+        if getattr(self, "pooled", False):
+            return
+        self.store.close()
+
+    def close_now(self):
+        """Unconditionally close, ignoring pooling. Used at server shutdown."""
         self.store.close()
 
 
@@ -5049,16 +5577,67 @@ def effective_budget(total_sig_tokens: int, coverage_target: float = 0.80,
 CLAUDE_BEGIN = "<!-- tokengraph:begin (generated — do not edit) -->"
 CLAUDE_END = "<!-- tokengraph:end -->"
 
+# Steering-file adapters: where each agent host looks for repo instructions.
+#
+# Every adapter is marker-scoped (see write_adapter) — the generated block is
+# replaced in place and any hand-written text around it survives. The old
+# `mode` key was dead data: nothing read it and every adapter behaved as
+# marker-scoped regardless, so it has been removed rather than left implying
+# a behaviour that did not exist.
+#
+# `budget` is the per-host token ceiling for the generated map. Hosts differ
+# by an order of magnitude in how much steering text they will actually carry,
+# and writing one identical blob everywhere either wasted a large window or
+# blew a small one. `header` is emitted verbatim above the marker block, for
+# formats that require frontmatter (Cursor .mdc).
 ADAPTERS: dict[str, dict] = {
-    "copilot":  {"path": ".github/copilot-instructions.md", "mode": "replace"},
-    "claude":   {"path": "CLAUDE.md", "mode": "append-marker"},
-    "cursor":   {"path": ".cursorrules", "mode": "replace"},
-    "windsurf": {"path": ".windsurfrules", "mode": "replace"},
-    "openai":   {"path": ".github/openai-context.md", "mode": "replace"},
-    "gemini":   {"path": ".github/gemini-context.md", "mode": "replace"},
-    "agents":   {"path": "AGENTS.md", "mode": "append-marker"},
-    "windsurf-next": {"path": ".windsurf/rules.md", "mode": "replace"},
+    # --- current, verified formats ---
+    "copilot":  {"path": ".github/copilot-instructions.md", "budget": 6000,
+                 "host": "GitHub Copilot (VS Code / JetBrains / Visual Studio)"},
+    "claude":   {"path": "CLAUDE.md", "budget": 12000,
+                 "host": "Claude Code"},
+    "agents":   {"path": "AGENTS.md", "budget": 8000,
+                 "host": "AGENTS.md standard (Codex, Aider, Zed, Cursor, Jules…)"},
+    "cursor":   {"path": ".cursor/rules/contextiq.mdc", "budget": 6000,
+                 "host": "Cursor (project rules)",
+                 "header": ("---\n"
+                            "description: Token-efficient code retrieval via the "
+                            "ContextIQ MCP server\n"
+                            "alwaysApply: true\n"
+                            "---\n")},
+    "windsurf": {"path": ".windsurf/rules/contextiq.md", "budget": 6000,
+                 "host": "Windsurf / Cascade (project rules directory)"},
+    "cline":    {"path": ".clinerules/contextiq.md", "budget": 6000,
+                 "host": "Cline"},
+    "roo":      {"path": ".roo/rules/contextiq.md", "budget": 6000,
+                 "host": "Roo Code"},
+    "continue": {"path": ".continue/rules/contextiq.md", "budget": 6000,
+                 "host": "Continue"},
+    "gemini":   {"path": "GEMINI.md", "budget": 8000,
+                 "host": "Gemini CLI / Code Assist"},
+    "codex":    {"path": "AGENTS.md", "budget": 8000,
+                 "host": "OpenAI Codex (reads AGENTS.md)"},
+    "aider":    {"path": "CONVENTIONS.md", "budget": 6000,
+                 "host": "Aider (--read CONVENTIONS.md)"},
+    "zed":      {"path": ".rules", "budget": 6000,
+                 "host": "Zed (.rules)"},
+    # --- deprecated formats, still written on request for older installs ---
+    "cursor-legacy":   {"path": ".cursorrules", "budget": 6000,
+                        "host": "Cursor (legacy .cursorrules)", "deprecated": True},
+    "windsurf-legacy": {"path": ".windsurfrules", "budget": 6000,
+                        "host": "Windsurf (legacy .windsurfrules)",
+                        "deprecated": True},
 }
+
+# Written by `generate` when no explicit adapter list is configured. Covers the
+# three hosts that between them account for almost all real usage, without
+# scattering files for tools the repo may not use.
+DEFAULT_ADAPTERS = ["copilot", "claude", "agents"]
+
+
+def adapter_budget(adapter: str, fallback: int) -> int:
+    """Per-host token ceiling for the generated steering block."""
+    return int(ADAPTERS.get(adapter, {}).get("budget") or fallback)
 
 
 def _modules_table(modules: list[dict]) -> str:
@@ -5113,14 +5692,20 @@ def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
         _modules_table(modules),
         "",
     ]
+    # PC-1: git-volatile enrichment goes AFTER the signature body, not before
+    # it. These two sections change on every commit and every TODO edit; when
+    # they led the document they invalidated the entire provider prompt-cache
+    # prefix each time, which defeats the point of caching. Everything stable
+    # now sits in front of the cache breakpoint.
+    volatile: list[str] = []
     if enrich.get("changes", True):
         recent = git_recent_files(root, hot_commits)[:10]
         if recent:
-            head += ["## Recently changed", ", ".join(f"`{x}`" for x in recent), ""]
+            volatile += ["## Recently changed", ", ".join(f"`{x}`" for x in recent), ""]
     if enrich.get("todos", True):
         todos = _scan_todos(root, files)
         if todos:
-            head += ["## TODO / FIXME", *[f"- {t}" for t in todos], ""]
+            volatile += ["## TODO / FIXME", *[f"- {t}" for t in todos], ""]
 
     body: list[str] = []
     hot_files: list[str] = []
@@ -5173,14 +5758,25 @@ def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
             body += [f"### {f}", "```" + _fence(f), sk, "```", ""]
             used += est
 
-    markdown = "\n".join(head + body).rstrip() + "\n"
+    # Split at the cache breakpoint: everything before it is stable across
+    # commits and is what gets `cache_control`; everything after is volatile.
+    stable = "\n".join(head + body).rstrip() + "\n"
+    suffix = ("\n".join(volatile).rstrip() + "\n") if volatile else ""
+    markdown = stable + (("\n" + suffix) if suffix else "")
     if config.get("secretScan", True):
-        markdown, _ = redact_secrets(markdown)
+        stable, _ = redact_secrets(stable)
+        if suffix:
+            suffix, _ = redact_secrets(suffix)
+        markdown = stable + (("\n" + suffix) if suffix else "")
     tokens = count_tokens(markdown)
     reduction = (1 - tokens / repo_total) * 100.0 if repo_total else 0.0
     return {
         "strategy": strategy,
         "markdown": markdown,
+        "stable_prefix": stable,
+        "volatile_suffix": suffix,
+        "stable_tokens": count_tokens(stable),
+        "volatile_tokens": count_tokens(suffix) if suffix else 0,
         "tokens": tokens,
         "total_sig_tokens": total_sig,
         "repo_tokens": repo_total,
@@ -5195,6 +5791,21 @@ def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
 def cache_artifact(text: str) -> dict:
     """Provider prompt-cache artifact for the stable signature prefix (PC-1)."""
     return {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
+
+
+def cache_blocks(payload: dict) -> list[dict]:
+    """Provider message blocks with the cache breakpoint in the right place (PC-1).
+
+    Returns Anthropic-shaped content blocks: the stable signature map carries
+    `cache_control`, and the git-volatile tail follows it *uncached*. Sending
+    them in this order means a commit invalidates only the small tail, not the
+    whole map. Blocks are also valid plain-text content for providers with
+    automatic caching (e.g. OpenAI), which need no annotation.
+    """
+    blocks = [cache_artifact(payload["stable_prefix"])]
+    if payload.get("volatile_suffix"):
+        blocks.append({"type": "text", "text": payload["volatile_suffix"]})
+    return blocks
 
 
 def write_adapter(root: Path, adapter: str, content: str,
@@ -5214,16 +5825,34 @@ def write_adapter(root: Path, adapter: str, content: str,
         new = (pre + "\n\n" if pre else "") + block + (("\n" + post) if post else "")
     else:
         new = (existing.rstrip() + "\n\n" if existing.strip() else "") + block
+    # Formats that require frontmatter (Cursor .mdc) get it prepended once,
+    # outside the marker block so regeneration never duplicates or strips it.
+    header = spec.get("header")
+    if header and not new.lstrip().startswith("---"):
+        new = header + "\n" + new
     path.write_text(new, encoding="utf-8")
     return rel
 
 
-def write_cache_sidecar(root: Path, adapter_rel: str, text: str) -> str:
-    """Write the prompt-cache JSON next to an adapter output (PC-1/PC-3)."""
+def write_cache_sidecar(root: Path, adapter_rel: str, payload: "dict | str") -> str:
+    """Write the prompt-cache blocks next to an adapter output (PC-1/PC-3).
+
+    Emits the ordered block list — stable signature map with `cache_control`
+    first, git-volatile tail after — so a consumer can paste it straight into
+    a request and get a prefix that survives commits. A bare string is still
+    accepted and treated as a single stable block.
+    """
     import json
     side = (root / adapter_rel).with_suffix(".cache.json")
     side.parent.mkdir(parents=True, exist_ok=True)
-    side.write_text(json.dumps(cache_artifact(text), indent=2) + "\n", encoding="utf-8")
+    if isinstance(payload, str):
+        doc = {"blocks": [cache_artifact(payload)],
+               "stable_tokens": count_tokens(payload), "volatile_tokens": 0}
+    else:
+        doc = {"blocks": cache_blocks(payload),
+               "stable_tokens": payload["stable_tokens"],
+               "volatile_tokens": payload["volatile_tokens"]}
+    side.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return str(side.relative_to(root).as_posix())
 
 
@@ -7831,35 +8460,131 @@ def hallucination_report_to_markdown(rep: dict) -> str:
 # ==========================================================================
 # IDE integration (FR-IDE): one-command MCP wiring for every major editor
 # ==========================================================================
+def mcp_launch_command() -> dict:
+    """How to launch this MCP server: console script if installed, else python.
+
+    Kept in one place because the setup writers, the doctor and the CI config
+    validator must all agree on it — they previously did not, so a pip-installed
+    ContextIQ wrote a config its own validator rejected.
+    """
+    import shutil
+    if shutil.which("tokengraph"):
+        return {"command": "tokengraph", "args": ["serve"]}
+    return {"command": sys.executable or "python",
+            "args": [os.path.abspath(__file__), "serve"]}
+
+
+def global_mcp_targets() -> dict[str, tuple[Path, dict]]:
+    """Hosts that only read MCP config from a per-user location, not the repo.
+
+    Writing a project-local file for these does nothing — Windsurf and Cline
+    genuinely ignore in-repo MCP config. They are handled separately so
+    `ide-setup` can either write them explicitly (--global) or report the
+    exact path and payload instead of silently producing a dead file.
+    """
+    stdio = mcp_launch_command()
+    home = Path.home()
+    if sys.platform == "darwin":
+        cline_dir = (home / "Library" / "Application Support" / "Code" / "User"
+                     / "globalStorage" / "saoudrizwan.claude-dev" / "settings")
+    elif os.name == "nt":
+        cline_dir = (Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+                     / "Code" / "User" / "globalStorage"
+                     / "saoudrizwan.claude-dev" / "settings")
+    else:
+        cline_dir = (home / ".config" / "Code" / "User" / "globalStorage"
+                     / "saoudrizwan.claude-dev" / "settings")
+    return {
+        "windsurf": (home / ".codeium" / "windsurf" / "mcp_config.json",
+                     {"mcpServers": {"tokengraph": stdio}}),
+        "cline": (cline_dir / "cline_mcp_settings.json",
+                  {"mcpServers": {"tokengraph": {**stdio, "disabled": False}}}),
+    }
+
+
+def _merge_json_file(path: Path, payload: dict) -> None:
+    """Deep-merge `payload` into a JSON file, creating parents as needed."""
+    import json
+    cur: dict = {}
+    if path.exists():
+        try:
+            cur = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            cur = {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_deep_merge(cur, payload), indent=2) + "\n",
+                    encoding="utf-8")
+
+
+def mcp_wiring_status(root: Path) -> list[dict]:
+    """Which project MCP config files exist, and whether they really wire us in.
+
+    Existence is not wiring: a `.claude/settings.json` containing only hooks
+    used to be counted as MCP wiring, which reported a broken setup as healthy.
+    Each entry is checked for a `tokengraph` server under the key that host
+    actually reads.
+    """
+    import json
+    specs = [
+        (".mcp.json", "mcpServers"),
+        (".vscode/mcp.json", "servers"),
+        (".cursor/mcp.json", "mcpServers"),
+        (".zed/settings.json", "context_servers"),
+    ]
+    out: list[dict] = []
+    for rel, key in specs:
+        p = Path(root) / rel
+        declares = False
+        if p.exists():
+            try:
+                declares = "tokengraph" in (
+                    json.loads(p.read_text(encoding="utf-8")).get(key) or {})
+            except Exception:
+                declares = False
+        out.append({"path": rel, "key": key, "exists": p.exists(),
+                    "declares_tokengraph": declares})
+    return out
+
+
 def ide_setup(root: Path, editors: list[str] | None = None,
-              workspace_roots: list[Path] | None = None) -> dict:
+              workspace_roots: list[Path] | None = None,
+              write_global: bool = False) -> dict:
     """Wire ContextIQ's MCP server into every (or selected) MCP-capable editor.
 
     For an MCP-native tool this is the equivalent of shipping editor plugins:
     one command drops a correct server config into each editor's expected
-    location. Non-destructive (merges into existing JSON)."""
-    import json
-    import shutil
+    location. Non-destructive (merges into existing JSON).
+
+    Hosts that only read a per-user config path (Windsurf, Cline) are written
+    only when `write_global` is set, since those files live outside the repo;
+    otherwise their exact path and payload are returned under `global_pending`.
+    """
     root = Path(root).resolve()
     roots = [Path(p).resolve() for p in workspace_roots] if workspace_roots else [root]
-    entry = shutil.which("tokengraph")
-    if entry:
-        stdio = {"command": "tokengraph", "args": ["serve"]}
-    else:
-        stdio = {"command": "python", "args": [os.path.abspath(__file__), "serve"]}
+    stdio = mcp_launch_command()
     stdio_typed = {"type": "stdio", **stdio}
 
-    # editor -> (relative config path, payload to merge)
+    # editor -> (relative config path, payload to merge). Every shape below is
+    # the one the host actually parses:
+    #   .mcp.json / .cursor/mcp.json    -> {"mcpServers": {...}}
+    #   .vscode/mcp.json                -> {"servers": {...}}  (VS Code Copilot)
+    #   .zed/settings.json              -> {"context_servers": {...}} with
+    #                                      "source": "custom", which Zed
+    #                                      requires to accept a user-defined
+    #                                      server (it was missing before).
     targets = {
         "claude":   (".mcp.json", {"mcpServers": {"tokengraph": stdio_typed}}),
         "vscode":   (".vscode/mcp.json", {"servers": {"tokengraph": stdio_typed}}),
-        "cursor":   (".cursor/mcp.json", {"mcpServers": {"tokengraph": stdio}}),
-        "windsurf": (".windsurf/mcp.json", {"mcpServers": {"tokengraph": stdio}}),
+        "cursor":   (".cursor/mcp.json", {"mcpServers": {"tokengraph": stdio_typed}}),
         "zed":      (".zed/settings.json",
-                     {"context_servers": {"tokengraph":
-                      {"command": stdio["command"], "args": stdio["args"]}}}),
+                     {"context_servers": {"tokengraph": {
+                         "source": "custom",
+                         "command": stdio["command"],
+                         "args": stdio["args"],
+                         "env": {}}}}),
+        "continue": (".continue/config.yaml", None),   # YAML, written below
     }
-    chosen = editors or list(targets)
+    chosen = editors or [e for e in targets if e != "continue"]
     written: list[str] = []
     for workspace_root in roots:
         for ed in chosen:
@@ -7867,29 +8592,72 @@ def ide_setup(root: Path, editors: list[str] | None = None,
                 continue
             rel, payload = targets[ed]
             p = workspace_root / rel
-            cur = {}
-            if p.exists():
-                try:
-                    cur = json.loads(p.read_text(encoding="utf-8"))
-                except Exception:
-                    cur = {}
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(_deep_merge(cur, payload), indent=2) + "\n",
-                         encoding="utf-8")
+            if ed == "continue":
+                _write_continue_config(p, stdio)
+            else:
+                _merge_json_file(p, payload)
             written.append(rel if len(roots) == 1 else str(p))
+
+    # Per-user configs (outside the repo).
+    global_written: list[str] = []
+    global_pending: list[dict] = []
+    for name, (gpath, gpayload) in global_mcp_targets().items():
+        if editors and name not in editors:
+            continue
+        if write_global:
+            _merge_json_file(gpath, gpayload)
+            global_written.append(str(gpath))
+        else:
+            global_pending.append({
+                "host": name, "path": str(gpath), "payload": gpayload,
+                "why": f"{name} reads MCP config only from this per-user path; "
+                       f"a file inside the repo is ignored.",
+            })
 
     nvim = ('require("mcphub").setup({ servers = { tokengraph = { command = "%s", '
             'args = { %s } } } })' % (stdio["command"],
             ", ".join(f'"{a}"' for a in stdio["args"])))
     return {
         "written": written,
+        "global_written": global_written,
+        "global_pending": global_pending,
         "editors": chosen,
+        "launch": stdio,
         "neovim_snippet": nvim,
         "jetbrains_note": ("JetBrains AI Assistant: Settings → Tools → MCP → Add → "
                            f"command `{stdio['command']} {' '.join(stdio['args'])}`"),
         "workspace_roots": [str(p) for p in roots],
-        "note": f"wired {len(written)} editor config(s); restart the editor to load",
+        "note": (f"wired {len(written)} project config(s)"
+                 + (f" and {len(global_written)} per-user config(s)"
+                    if global_written else
+                    (f"; {len(global_pending)} host(s) need --global"
+                     if global_pending else ""))
+                 + "; restart the editor to load"),
     }
+
+
+def _write_continue_config(path: Path, stdio: dict) -> None:
+    """Add a tokengraph MCP entry to Continue's YAML config.
+
+    Continue uses YAML, not JSON, and PyYAML is not a dependency, so this
+    appends a correctly-indented block only when one is not already present
+    rather than attempting a full parse-and-rewrite.
+    """
+    marker = "name: tokengraph"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if marker in existing:
+        return
+    args = "".join(f"\n      - {a}" for a in stdio["args"])
+    block = (f"mcpServers:\n"
+             f"  - name: tokengraph\n"
+             f"    command: {stdio['command']}\n"
+             f"    args:{args}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if existing.strip():
+        path.write_text(existing.rstrip() + "\n\n" + block, encoding="utf-8")
+    else:
+        path.write_text("name: Local Assistant\nversion: 1.0.0\n\n" + block,
+                        encoding="utf-8")
 
 
 # ---- installable editor plugins (real artifacts, not just MCP config) --------
@@ -8448,13 +9216,53 @@ def build_mcp_server(root: Path, db: Path):
     root = Path(root).resolve()
     db = Path(db)
 
+    # RP-1: one pooled Retriever per thread, reused across tool calls.
+    # Building a fresh Retriever per call threw away the source cache and the
+    # HNSW index every time — on a large repo that meant rebuilding the ANN
+    # index from scratch for every single query. The pool is thread-local
+    # because a sqlite3 connection must not cross threads, and FastMCP may
+    # dispatch tools concurrently.
+    _pool = threading.local()
+    _pool_lock = threading.Lock()
+    _pool_all: list["Retriever"] = []      # every pooled instance, for shutdown
+
     def _ret() -> "Retriever":
         # Correctness layer: freshen before every retrieval so a query never
         # reads stale line spans (which would mis-slice edited files). The
         # mtime/size fast path keeps this to a stat() per file when nothing
         # changed. A pre-warm hook can keep this a no-op in the common case.
-        index_repo(root, db)
-        return Retriever(root, db)
+        report = index_repo(root, db)
+        r = getattr(_pool, "ret", None)
+        if r is None:
+            r = Retriever(root, db)
+            r.pooled = True          # close() becomes a no-op for pooled use
+            _pool.ret = r
+            with _pool_lock:
+                _pool_all.append(r)
+        elif report.parsed or report.removed or report.reembedded:
+            # The graph moved under us — drop derived caches so the next query
+            # cannot answer from stale source lines or a stale ANN index.
+            r.invalidate()
+        return r
+
+    def _close_pool() -> int:
+        """Release every pooled connection. Call at server shutdown.
+
+        A pooled retriever deliberately survives `close()`, so it holds its
+        sqlite handle open for the process lifetime. Anything that needs the
+        database file released (tests, a temp checkout, Windows, which refuses
+        to delete an open file) must call this.
+        """
+        with _pool_lock:
+            for held in _pool_all:
+                try:
+                    held.close_now()
+                except Exception:
+                    pass
+            n = len(_pool_all)
+            _pool_all.clear()
+        _pool.ret = None
+        return n
 
     mcp = FastMCP(
         name="tokengraph",
@@ -8499,22 +9307,30 @@ def build_mcp_server(root: Path, db: Path):
 
     @mcp.tool
     def find_relevant_context(task: str, budget_tokens: int = 6000, depth: int = 1,
-                              max_body_tokens: int = 1600) -> str:
+                              max_body_tokens: int = 1600,
+                              session: str = "") -> str:
         """Return a token-budgeted context pack of the symbols most relevant to a task.
 
         Use this FIRST instead of opening files. Small seeds get full bodies;
         large seeds are demoted to signatures plus matching indexed chunks.
-        Callers/callees/base-classes are included as signatures. Anything
-        dropped for budget is listed by name so you can request it explicitly.
+        Callers/callees/base-classes are included as signatures, ranked by
+        relevance to the task. Anything dropped for budget is listed by name
+        so you can request it explicitly.
+
+        Pass a stable `session` id (any string identifying this conversation)
+        to enable cross-turn dedup: symbols already sent to that session and
+        unchanged since are referenced by name instead of being resent, which
+        makes repeated retrievals in one conversation substantially cheaper.
         """
         r = _ret()
         try:
             pack = r.find_relevant_context(task, budget_tokens=budget_tokens,
                                            expand_depth=depth,
-                                           max_body_tokens=max_body_tokens)
+                                           max_body_tokens=max_body_tokens,
+                                           session=session)
             files = sorted({p.file for p in pack.pieces})
             record_pack_savings(root, "mcp.context", final_tokens=pack.rendered_tokens,
-                                baseline_tokens=sum(r.store.token_est_for(f) for f in files),
+                                baseline_tokens=r._targeted_baseline(pack),
                                 files=len(files))
             return pack.to_markdown()
         finally:
@@ -8558,15 +9374,88 @@ def build_mcp_server(root: Path, db: Path):
 
     @mcp.tool
     def search_semantic(query: str, limit: int = 12) -> list:
-        """Find symbols by meaning (embedding similarity), not just name match.
+        """Find symbols by embedding similarity, ranked by relevance.
 
-        Use when you don't know the exact identifier — e.g. "retry with backoff"
-        finds a reattempt helper even if the word "retry" never appears. Returns
-        qualified names ranked by relevance.
+        Use when you don't know the exact identifier. NOTE: the strength of
+        this depends on the active embedding backend — call
+        `embedding_status()` to see which one is live. With
+        sentence-transformers installed and warmed you get true meaning-based
+        matching ("retry with backoff" finds a reattempt helper); on the
+        default hashing backend you get robust lexical/structural overlap,
+        which will NOT bridge unrelated vocabulary.
         """
         r = _ret()
         try:
             return [row["qname"] for row in r.semantic_search(query, limit=limit)]
+        finally:
+            r.close()
+
+    @mcp.tool
+    def embedding_status() -> dict:
+        """Which embedding backend is actually in use, and how to improve it.
+
+        Tells you whether `search_semantic` is doing true semantic matching or
+        the deterministic hashing fallback, so you can calibrate how much to
+        trust it.
+        """
+        return embed_backend_info()
+
+    @mcp.tool
+    def session_savings(session: str) -> dict:
+        """What this conversation has already been sent, and what that saved.
+
+        Pair with `find_relevant_context(task, session=...)`: symbols already
+        delivered to `session` and unchanged since are referenced by name
+        rather than resent.
+        """
+        store = Store(db)
+        try:
+            stats = store.session_stats(session)
+            stats["note"] = ("Pass this same session id to find_relevant_context "
+                             "to avoid resending these symbols.")
+            return stats
+        finally:
+            store.close()
+
+    @mcp.tool
+    def reset_session(session: str = "") -> dict:
+        """Forget what was sent to a session (empty string clears all sessions).
+
+        Use when starting a fresh conversation, or after context compaction —
+        once the model no longer holds the earlier text, it must be resent.
+        """
+        store = Store(db)
+        try:
+            return {"cleared_entries": store.clear_session(session),
+                    "session": session or "(all)"}
+        finally:
+            store.close()
+
+    @mcp.tool
+    def prompt_cache_blocks(strategy: str = "full", budget_tokens: int = 8000) -> dict:
+        """Provider-ready message blocks with a correctly placed cache breakpoint.
+
+        Returns the repository signature map split into a large STABLE prefix
+        carrying Anthropic `cache_control: ephemeral`, followed by the small
+        git-volatile tail (recent changes / TODOs) left uncached. Sending them
+        in this order means a new commit invalidates only the tail instead of
+        the whole map. For providers with automatic caching the same blocks
+        work unannotated.
+        """
+        r = _ret()
+        try:
+            cfg = load_config(root)
+            payload = build_context_payload(
+                r, root, strategy=strategy, src_dirs=cfg.get("srcDirs", []),
+                budget=budget_tokens, hot_commits=cfg.get("hotCommits", 20),
+                diff=False, staged=False, config=cfg)
+            return {
+                "blocks": cache_blocks(payload),
+                "stable_tokens": payload["stable_tokens"],
+                "volatile_tokens": payload["volatile_tokens"],
+                "cached_fraction": round(
+                    payload["stable_tokens"] / max(1, payload["tokens"]), 3),
+            }
         finally:
             r.close()
 
@@ -8599,7 +9488,14 @@ def build_mcp_server(root: Path, db: Path):
 
     @mcp.tool
     def estimate_savings(task: str, budget_tokens: int = 6000, depth: int = 1) -> dict:
-        """Tokens in the context pack vs. reading the referenced files whole."""
+        """Pack tokens vs. what grepping and reading around the hits would cost.
+
+        The headline `savings_pct` compares against a *competent* agent
+        baseline (grep, then read a window around each hit, merging overlaps),
+        not against reading whole files. The whole-file comparison is also
+        returned, as `savings_pct_vs_whole_file`, but it flatters the tool on
+        repos with large files and should not be quoted as the saving.
+        """
         r = _ret()
         try:
             return r.measure(task, budget_tokens=budget_tokens, expand_depth=depth)
@@ -9106,6 +10002,8 @@ def build_mcp_server(root: Path, db: Path):
         finally:
             r.close()
 
+    # Explicit shutdown for the connection pool (RP-1).
+    mcp.close_pool = _close_pool
     return mcp
 
 
@@ -9813,7 +10711,8 @@ def cmd_ide_setup(args):
     root = Path(args.path).resolve()
     editors = args.editor or None
     workspace_roots = [Path(p) for p in args.workspace_root] if args.workspace_root else None
-    res = ide_setup(root, editors=editors, workspace_roots=workspace_roots)
+    res = ide_setup(root, editors=editors, workspace_roots=workspace_roots,
+                    write_global=getattr(args, "write_global", False))
     if getattr(args, "plugins", False):
         res["plugins"] = emit_ide_plugins(root)
     if getattr(args, "json", False):
@@ -9822,10 +10721,48 @@ def cmd_ide_setup(args):
         print(res["note"])
         for w in res["written"]:
             print(f"  wired {w}")
+        for w in res["global_written"]:
+            print(f"  wired {w}  (per-user)")
+        for g in res["global_pending"]:
+            print(f"  SKIPPED {g['host']}: {g['why']}")
+            print(f"          write it with: tokengraph ide-setup "
+                  f"--editor {g['host']} --global")
         print(f"  Neovim (mcphub): {res['neovim_snippet']}")
         print(f"  {res['jetbrains_note']}")
         if "plugins" in res:
             print(f"  {res['plugins']['note']}")
+
+
+def cmd_embed_warm(args):
+    """Fetch and verify the semantic embedding model, then invalidate vectors."""
+    res = embed_warm()
+    if res.get("ok"):
+        root = Path(args.path).resolve()
+        db = _db_path(root)
+        if db.exists():
+            store = Store(db)
+            try:
+                dropped = store.drop_stale_vectors()
+                store.set_meta("embed_backend", embed_backend_id())
+                store.commit()
+            finally:
+                store.close()
+            # Rebuild in the new space now, so the next query is not the one
+            # that pays for it.
+            rep = index_repo(root, db)
+            res["vectors_dropped"] = dropped
+            res["vectors_rebuilt"] = rep.reembedded
+    if getattr(args, "json", False):
+        _emit(res, True)
+    elif res.get("ok"):
+        print(f"embeddings ready: {res['model']} ({res['dim']}d)")
+        if "vectors_rebuilt" in res:
+            print(f"  re-embedded {res['vectors_rebuilt']} symbol(s) "
+                  f"(dropped {res['vectors_dropped']} from the old backend)")
+    else:
+        print(f"embed-warm failed: {res['error']}")
+        print(f"  still usable — falling back to: {res['backend']}")
+        sys.exit(1)
 
 
 def cmd_ide_plugin(args):
@@ -10105,6 +11042,12 @@ def cmd_diagnose(args):
 
 
 def cmd_serve(args):
+    """Run the MCP server over stdio (default) or HTTP.
+
+    stdio suits an editor launching the server as a child process. HTTP suits
+    a shared/remote instance — one index serving several clients, or a host
+    that can only reach MCP over the network.
+    """
     root = Path(args.path).resolve()
     db = _db_path(root)
     if not db.exists():
@@ -10115,7 +11058,27 @@ def cmd_serve(args):
         sys.exit("tokengraph: the MCP server needs FastMCP. Install it with:\n"
                  "    pip install fastmcp\n"
                  "(The CLI commands — index/context/skeleton/watch — work without it.)")
-    server.run()   # stdio transport
+
+    transport = (getattr(args, "transport", None) or "stdio").lower()
+    if transport == "stdio":
+        server.run()
+        return
+
+    host = getattr(args, "host", None) or "127.0.0.1"
+    port = int(getattr(args, "port", None) or 8756)
+    # Bind to loopback unless told otherwise: the server exposes repository
+    # source, so it must not become reachable off-box by accident.
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"tokengraph: WARNING — serving repository source on {host}:{port}. "
+              f"This exposes code to anything that can reach that address.",
+              file=sys.stderr)
+    try:
+        server.run(transport=transport, host=host, port=port)
+    except TypeError:
+        # Older FastMCP builds take only the transport name.
+        server.run(transport=transport)
+    except ValueError as ex:
+        sys.exit(f"tokengraph: unsupported transport {transport!r}: {ex}")
 
 
 def _discover_packages(root: Path, each: bool) -> list[Path]:
@@ -10168,7 +11131,7 @@ def cmd_generate(args):
     src_dirs = cfg.get("srcDirs") or ["."]
     hot_commits = (args.hot_commits if args.hot_commits is not None
                    else cfg.get("hotCommits", 10))
-    outputs = args.adapter or cfg.get("outputs") or ["copilot"]
+    outputs = args.adapter or cfg.get("outputs") or list(DEFAULT_ADAPTERS)
     fmt = args.format or cfg.get("format", "md")
 
     index_repo(root, _db_path(root))
@@ -10190,16 +11153,39 @@ def cmd_generate(args):
         warns = warns + payload["warnings"]
 
         written = []
+        # Per-host budgets (HB-1): hosts differ by an order of magnitude in how
+        # much steering text they will carry, so writing one identical blob to
+        # every adapter either wasted a large window or blew a small one.
+        # Payloads are rebuilt only once per *distinct* budget, not per adapter.
+        by_budget: dict[int, list[str]] = {}
         for ad in outputs:
             if ad not in ADAPTERS:
                 warns.append(f"unknown adapter {ad!r} (skipped)")
                 continue
-            custom = cfg.get("output") if ad == "copilot" else None
-            rel = write_adapter(root, ad, payload["markdown"], custom)
-            entry = {"adapter": ad, "path": rel}
-            if fmt == "cache":
-                entry["cache"] = write_cache_sidecar(root, rel, payload["markdown"])
-            written.append(entry)
+            if ADAPTERS[ad].get("deprecated"):
+                warns.append(f"adapter {ad!r} writes a deprecated format; "
+                             f"prefer {ad.replace('-legacy', '')}")
+            by_budget.setdefault(
+                min(budget, adapter_budget(ad, budget)), []).append(ad)
+
+        payloads = {budget: payload}
+        for host_budget, ads in sorted(by_budget.items()):
+            if host_budget not in payloads:
+                payloads[host_budget] = build_context_payload(
+                    r, root, strategy=strategy, src_dirs=src_dirs,
+                    budget=host_budget, hot_commits=hot_commits,
+                    diff=args.diff, staged=args.staged, config=cfg)
+            hp = payloads[host_budget]
+            for ad in ads:
+                custom = cfg.get("output") if ad == "copilot" else None
+                rel = write_adapter(root, ad, hp["markdown"], custom)
+                entry = {"adapter": ad, "path": rel, "budget": host_budget,
+                         "tokens": hp["tokens"]}
+                if fmt == "cache":
+                    # PC-1: the sidecar carries the stable prefix with the cache
+                    # breakpoint, plus the volatile tail after it.
+                    entry["cache"] = write_cache_sidecar(root, rel, hp)
+                written.append(entry)
 
         over = payload["tokens"] > budget
         track_gain(root, {"op": "generate", "final_tokens": payload["tokens"],
@@ -10286,7 +11272,23 @@ def cmd_setup(args):
     stdio = {"type": "stdio", "command": cmd, "args": serve_args}
     _merge_json(".mcp.json", {"mcpServers": {"tokengraph": stdio}})
     _merge_json(".vscode/mcp.json", {"servers": {"tokengraph": stdio}})
-    _merge_json(".claude/settings.json", {"mcpServers": {"tokengraph": stdio}})
+    _merge_json(".cursor/mcp.json", {"mcpServers": {"tokengraph": stdio}})
+    # NOTE: Claude Code reads MCP servers from .mcp.json, NOT from
+    # .claude/settings.json — which has no `mcpServers` key at all. Writing one
+    # there was a silent no-op. What settings.json *is* good for is the
+    # PostToolUse hook that keeps the graph warm after every edit, so that is
+    # what we write instead.
+    _merge_json(".claude/settings.json", {
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "Edit|Write|MultiEdit",
+                "hooks": [{"type": "command",
+                           "command": f"{gen_cmd.rsplit(' ', 1)[0]} index"
+                                      if entry else
+                                      f'python "{script}" index'}],
+            }],
+        },
+    })
 
     hook = root / ".git" / "hooks" / "post-commit"
     if (root / ".git").is_dir():
@@ -10360,19 +11362,87 @@ def load_benchmark_corpus(path: Path) -> list[dict]:
             if case.get("task") and case.get("expected_files")]
 
 
-def run_retrieval_benchmark(r: Retriever, cases: list[dict]) -> dict:
+# QG-1: quality gate thresholds. A retrieval tool whose whole premise is
+# "fewer tokens, same answer" must be able to fail a build when the answer
+# stops being reachable. These are the floors CI enforces.
+#
+# These are calibrated to MEASURED performance on the shipped corpora, with a
+# regression margin — they are detectors, not aspirations. Numbers observed at
+# the product default budget of 6000 tokens across 96 cases in 4 repositories
+# (Python / TypeScript / Go):
+#
+#     recall_at_5 0.958 | symbol_recall 0.719 | answerable 0.51 | waste 0.785
+#
+# The honest reading: ContextIQ nearly always finds the right FILE, but carries
+# every symbol AND fact an answer needs only about half the time at this budget.
+# Raising `answerable_rate` is the main open quality work; do not raise the
+# threshold without first raising the measurement.
+BENCHMARK_THRESHOLDS = {
+    "recall_at_5": 0.90,        # the right file is in the top 5
+    "symbol_recall": 0.65,      # required symbols actually made it into the pack
+    "answerable_rate": 0.45,    # packs carrying EVERY required symbol + fact
+    "irrelevant_token_ratio": 0.85,   # ceiling — budget spent outside target files
+}
+
+
+def score_pack_answerability(pack: "ContextPack", case: dict) -> dict:
+    """Can this pack actually support a correct answer? (QG-1)
+
+    File-level recall is not answer quality: a pack can name the right file and
+    still omit the function the question is about. This checks the two things
+    an answer actually needs —
+
+    * ``expected_symbols`` — every symbol the answer must reason about is
+      present in the pack, as a body or at least a signature.
+    * ``must_contain`` — literal facts (an identifier, a default value, a
+      decorator) that must survive compression into the rendered pack.
+
+    ``answerable`` is the strict conjunction: everything required is there.
+    """
+    rendered = pack.to_markdown()
+    present = {p.qname for p in pack.pieces}
+    # A symbol also counts as covered when a chunk from its file carries its
+    # name, and when the session ledger says the model already holds it.
+    covered_text = rendered
+    reused = set(pack.reused)
+
+    want_symbols = list(case.get("expected_symbols") or [])
+    found_symbols, missing_symbols = [], []
+    for q in want_symbols:
+        leaf = q.rsplit(".", 1)[-1]
+        if q in present or q in reused or leaf in covered_text:
+            found_symbols.append(q)
+        else:
+            missing_symbols.append(q)
+
+    want_facts = list(case.get("must_contain") or [])
+    missing_facts = [f for f in want_facts if f not in covered_text]
+
+    sym_recall = (len(found_symbols) / len(want_symbols)) if want_symbols else 1.0
+    return {
+        "symbol_recall": sym_recall,
+        "missing_symbols": missing_symbols,
+        "missing_facts": missing_facts,
+        "answerable": not missing_symbols and not missing_facts,
+    }
+
+
+def run_retrieval_benchmark(r: Retriever, cases: list[dict],
+                            budget_tokens: int = 4000) -> dict:
     import time
     hits = 0
     reciprocal_rank = 0.0
     irrelevant_tokens = 0
     pack_tokens = 0
+    symbol_recall_sum = 0.0
+    answerable = 0
     latencies_ms: list[float] = []
     rows = []
     for case in cases:
         started = time.perf_counter()
         ranked = [f for f, _ in r.rank_files(
             case["task"], top_k=5, use_recency=False)]
-        pack = r.find_relevant_context(case["task"], budget_tokens=4000)
+        pack = r.find_relevant_context(case["task"], budget_tokens=budget_tokens)
         latencies_ms.append((time.perf_counter() - started) * 1000)
         expected = set(case["expected_files"])
         positions = [ranked.index(f) + 1 for f in expected if f in ranked]
@@ -10385,14 +11455,26 @@ def run_retrieval_benchmark(r: Retriever, cases: list[dict]) -> dict:
                              if piece.file not in expected)
         pack_tokens += row_pack_tokens
         irrelevant_tokens += row_irrelevant
+
+        quality = score_pack_answerability(pack, case)
+        symbol_recall_sum += quality["symbol_recall"]
+        answerable += 1 if quality["answerable"] else 0
+
         rows.append({"task": case["task"], "expected_files": sorted(expected),
-                     "top_files": ranked, "rank": rank})
+                     "top_files": ranked, "rank": rank,
+                     "pack_tokens": pack.rendered_tokens,
+                     "symbol_recall": round(quality["symbol_recall"], 3),
+                     "answerable": quality["answerable"],
+                     "missing_symbols": quality["missing_symbols"],
+                     "missing_facts": quality["missing_facts"]})
     count = len(cases) or 1
     return {
         "queries": len(cases),
         "recall_at_5": round(hits / count, 3),
         "hit_at_5": round(hits / count, 3),
         "mrr": round(reciprocal_rank / count, 3),
+        "symbol_recall": round(symbol_recall_sum / count, 3),
+        "answerable_rate": round(answerable / count, 3),
         "irrelevant_token_ratio": round(
             irrelevant_tokens / pack_tokens, 3) if pack_tokens else 0.0,
         "mean_latency_ms": round(sum(latencies_ms) / count, 2),
@@ -10400,9 +11482,149 @@ def run_retrieval_benchmark(r: Retriever, cases: list[dict]) -> dict:
     }
 
 
+def check_benchmark_thresholds(result: dict,
+                               thresholds: dict | None = None) -> dict:
+    """Compare a benchmark result against the CI floors (QG-1)."""
+    th = dict(BENCHMARK_THRESHOLDS)
+    th.update(thresholds or {})
+    failures = []
+    for metric, limit in th.items():
+        actual = result.get(metric)
+        if actual is None:
+            continue
+        # irrelevant_token_ratio is a ceiling; everything else is a floor.
+        bad = actual > limit if metric == "irrelevant_token_ratio" else actual < limit
+        if bad:
+            failures.append({"metric": metric, "actual": actual,
+                             "threshold": limit,
+                             "direction": "max" if metric == "irrelevant_token_ratio"
+                                          else "min"})
+    return {"ok": not failures, "failures": failures, "thresholds": th}
+
+
+def run_benchmark_suite(corpus_paths: list[Path], budget_tokens: int = 4000,
+                        limit: int = 0) -> dict:
+    """Run every corpus against its own repository and aggregate (QG-1).
+
+    Each corpus declares the repo it targets, so the suite spans several
+    codebases and languages instead of only measuring the tool against
+    itself — a self-only benchmark says nothing about generalisation.
+    """
+    import json
+    suites, all_rows = [], []
+    totals = {"queries": 0, "recall_hits": 0.0, "symbol_recall": 0.0,
+              "answerable": 0.0, "irrelevant": 0.0, "pack": 0.0}
+    for cpath in corpus_paths:
+        cpath = Path(cpath)
+        if not cpath.exists():
+            continue
+        data = json.loads(cpath.read_text(encoding="utf-8"))
+        repo = (cpath.parent / data.get("repo", ".")).resolve()
+        if not repo.exists():
+            continue
+        cases = [c for c in data.get("cases", [])
+                 if c.get("task") and c.get("expected_files")]
+        if limit:
+            cases = cases[:limit]
+        if not cases:
+            continue
+        db = _db_path(repo)
+        index_repo(repo, db)
+        r = Retriever(repo, db)
+        try:
+            res = run_retrieval_benchmark(r, cases, budget_tokens=budget_tokens)
+        finally:
+            r.close()
+        # Label by the repo it exercises — every fixture corpus is named
+        # tasks.json, which made CI output unreadable.
+        res["corpus"] = (cpath.parent.name if cpath.name == "tasks.json"
+                         else cpath.stem)
+        res["repo"] = str(repo)
+        res["languages"] = data.get("languages", [])
+        n = res["queries"]
+        totals["queries"] += n
+        totals["recall_hits"] += res["recall_at_5"] * n
+        totals["symbol_recall"] += res["symbol_recall"] * n
+        totals["answerable"] += res["answerable_rate"] * n
+        totals["irrelevant"] += res["irrelevant_token_ratio"] * n
+        for row in res["rows"]:
+            row["corpus"] = cpath.name
+        all_rows.extend(res["rows"])
+        suites.append(res)
+
+    q = totals["queries"] or 1
+    aggregate = {
+        "queries": totals["queries"],
+        "corpora": len(suites),
+        "recall_at_5": round(totals["recall_hits"] / q, 3),
+        "symbol_recall": round(totals["symbol_recall"] / q, 3),
+        "answerable_rate": round(totals["answerable"] / q, 3),
+        "irrelevant_token_ratio": round(totals["irrelevant"] / q, 3),
+    }
+    return {"aggregate": aggregate, "suites": suites,
+            "failures": [row for row in all_rows if not row["answerable"]]}
+
+
+def discover_corpora(root: Path) -> list[Path]:
+    """Every benchmark corpus in the repo: the self corpus + fixture repos."""
+    out: list[Path] = []
+    self_corpus = root / "benchmarks" / "retrieval_tasks.json"
+    if self_corpus.exists():
+        out.append(self_corpus)
+    repos_dir = root / "benchmarks" / "repos"
+    if repos_dir.is_dir():
+        out.extend(sorted(repos_dir.glob("*/tasks.json")))
+    return out
+
+
 def cmd_benchmark(args):
-    """Corpus-driven retrieval benchmark: Recall@5, MRR, waste, latency."""
+    """Corpus-driven retrieval benchmark across every fixture repo (QG-1).
+
+    With `--all` (the CI mode) this runs every corpus — the self corpus plus
+    each fixture repository — and scores answer quality, not just file recall:
+    whether the pack actually contains the symbols and facts an answer needs.
+    `--check` turns the result into a build gate.
+    """
     root = Path(args.path).resolve()
+    if getattr(args, "all", False) or getattr(args, "check", False):
+        corpora = ([Path(args.corpus)] if args.corpus
+                   else discover_corpora(root))
+        if not corpora:
+            sys.exit("benchmark: no corpora found under benchmarks/")
+        suite = run_benchmark_suite(corpora, budget_tokens=args.budget,
+                                    limit=args.limit if args.limit else 0)
+        gate = check_benchmark_thresholds(suite["aggregate"])
+        suite["gate"] = gate
+        if getattr(args, "json", False):
+            _emit(suite, True)
+        else:
+            agg = suite["aggregate"]
+            print(f"benchmark suite: {agg['queries']} queries across "
+                  f"{agg['corpora']} corpora")
+            for s in suite["suites"]:
+                print(f"  {s['corpus']:<28} n={s['queries']:<3} "
+                      f"recall@5={s['recall_at_5']:<6} "
+                      f"symbols={s['symbol_recall']:<6} "
+                      f"answerable={s['answerable_rate']:<6} "
+                      f"waste={s['irrelevant_token_ratio']}")
+            print(f"  {'AGGREGATE':<28} n={agg['queries']:<3} "
+                  f"recall@5={agg['recall_at_5']:<6} "
+                  f"symbols={agg['symbol_recall']:<6} "
+                  f"answerable={agg['answerable_rate']:<6} "
+                  f"waste={agg['irrelevant_token_ratio']}")
+            if suite["failures"]:
+                print(f"\n  {len(suite['failures'])} unanswerable case(s):")
+                for row in suite["failures"][:10]:
+                    detail = (row["missing_symbols"] or []) + (row["missing_facts"] or [])
+                    print(f"    [{row['corpus']}] {row['task'][:60]}")
+                    print(f"      missing: {', '.join(map(str, detail[:5]))}")
+        if getattr(args, "check", False) and not gate["ok"]:
+            for f in gate["failures"]:
+                print(f"FAIL {f['metric']}: {f['actual']} "
+                      f"({f['direction']} {f['threshold']})", file=sys.stderr)
+            sys.exit(1)
+        return
+
     index_repo(root, _db_path(root))
     r = Retriever(root, _db_path(root))
     try:
@@ -10422,13 +11644,15 @@ def cmd_benchmark(args):
                                           "expected_files": [symbol["file"]]})
             cases = cases[:args.limit]
             source = "generated-symbol-query fallback"
-        out = run_retrieval_benchmark(r, cases)
+        out = run_retrieval_benchmark(r, cases, budget_tokens=args.budget)
         out["corpus"] = source
         if getattr(args, "json", False):
             _emit(out, True)
         else:
             print(f"benchmark: {out['queries']} queries  "
                 f"Recall@5={out['recall_at_5']}  MRR={out['mrr']}  "
+                f"symbols={out['symbol_recall']}  "
+                f"answerable={out['answerable_rate']}  "
                 f"irrelevant={out['irrelevant_token_ratio']}  "
                 f"mean={out['mean_latency_ms']}ms")
     finally:
@@ -10504,9 +11728,24 @@ def cmd_doctor(args):
             "run: tokengraph generate" if not present else
             ("stale >7d — run: tokengraph generate" if stale else ""))
 
-    wired = (root / ".mcp.json").exists() or (root / ".vscode" / "mcp.json").exists() \
-        or (root / ".claude" / "settings.json").exists()
-    add("MCP wiring present", wired, "run: tokengraph setup")
+    # A config file must actually *declare the tokengraph server* to count.
+    # Previously the mere existence of .claude/settings.json (which may hold
+    # only hooks, and cannot hold MCP servers at all) was reported as success.
+    wired_files = mcp_wiring_status(root)
+    wired = any(w["declares_tokengraph"] for w in wired_files)
+    add("MCP wiring present", wired, "run: tokengraph ide-setup")
+    for w in wired_files:
+        if w["exists"] and not w["declares_tokengraph"]:
+            add(f"{w['path']} declares tokengraph", False,
+                f"{w['path']} exists but has no tokengraph server under "
+                f"`{w['key']}` — run: tokengraph ide-setup")
+
+    info = embed_backend_info()
+    add(f"embeddings: {info['kind']}", True, "")
+    if not info["semantic"]:
+        add("semantic embeddings active", False,
+            "search_semantic is using the lexical hash fallback — "
+            "pip install 'contextiq[embeddings]' && tokengraph embed-warm")
 
     ok = all(c["ok"] for c in checks)
     if getattr(args, "json", False):
@@ -10674,7 +11913,20 @@ def build_parser():
 
     sub.add_parser("stats").set_defaults(func=cmd_stats)
     sub.add_parser("langs").set_defaults(func=cmd_langs)
-    sub.add_parser("serve").set_defaults(func=cmd_serve)
+    srv = sub.add_parser("serve", help="run the MCP server (stdio or HTTP)")
+    srv.add_argument("--transport", default="stdio",
+                     choices=["stdio", "http", "streamable-http", "sse"],
+                     help="stdio (default, editor-launched) or an HTTP transport "
+                          "for a shared/remote server")
+    srv.add_argument("--host", default="127.0.0.1",
+                     help="HTTP bind address (default loopback only)")
+    srv.add_argument("--port", type=int, default=8756, help="HTTP port")
+    srv.set_defaults(func=cmd_serve)
+
+    ew = sub.add_parser("embed-warm",
+                        help="download + verify the semantic embedding model, once")
+    ew.add_argument("--json", action="store_true")
+    ew.set_defaults(func=cmd_embed_warm)
 
     dx = sub.add_parser("diagnose-extractors",
                         help="self-test every language extractor (CI gate; exit 1 on failure)")
@@ -10918,8 +12170,13 @@ def build_parser():
     ide = sub.add_parser("ide-setup",
                          help="wire the MCP server into every major editor (VS Code/Cursor/Windsurf/Zed/Claude)")
     ide.add_argument("--editor", action="append",
-                     choices=["claude", "vscode", "cursor", "windsurf", "zed"],
-                     help="limit to specific editor(s); default = all")
+                     choices=["claude", "vscode", "cursor", "zed", "continue",
+                              "windsurf", "cline"],
+                     help="limit to specific editor(s); default = all project-local "
+                          "ones. windsurf/cline are per-user configs and need --global")
+    ide.add_argument("--global", dest="write_global", action="store_true",
+                     help="also write per-user configs outside the repo "
+                          "(Windsurf ~/.codeium, Cline globalStorage)")
     ide.add_argument("--plugins", action="store_true",
                      help="also scaffold installable VS Code / Neovim / JetBrains plugins")
     ide.add_argument("--workspace-root", action="append",
@@ -11009,6 +12266,13 @@ def build_parser():
     bm.add_argument("-n", "--limit", type=int, default=100)
     bm.add_argument("--corpus", default=None,
                     help="JSON corpus with task + expected_files cases")
+    bm.add_argument("--all", action="store_true",
+                    help="run every corpus (self + benchmarks/repos/*/tasks.json) "
+                         "and score answer quality, not just file recall")
+    bm.add_argument("--check", action="store_true",
+                    help="CI gate: implies --all and exits 1 below thresholds")
+    bm.add_argument("--budget", type=int, default=6000,
+                    help="token budget per pack during the benchmark")
     bm.add_argument("--json", action="store_true")
     bm.set_defaults(func=cmd_benchmark)
 

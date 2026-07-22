@@ -36,3 +36,8 @@ ide-plugins/
 # OS
 .DS_Store
 Thumbs.db
+
+# Benchmark fixture repos are source-only; their generated graphs are not.
+benchmarks/repos/*/.tokengraph/
+benchmarks/repos/**/__pycache__/
+benchmark.json

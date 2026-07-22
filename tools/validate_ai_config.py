@@ -57,47 +57,79 @@ def validate_instruction_docs(errors: list[str]) -> None:
     )
 
 
+def _launches_tokengraph(entry: dict) -> bool:
+    """Does this server entry actually start the ContextIQ MCP server?
+
+    Two launch styles are legitimate and `tokengraph setup` picks between them
+    based on whether the package is installed:
+
+      * console script  -> command "tokengraph",   args [..., "serve"]
+      * script fallback -> command <python>,       args [".../tokengraph_all.py", "serve"]
+
+    The previous version hard-required ``command == "python"``, so a
+    pip-installed ContextIQ wrote a config that this validator then rejected.
+    """
+    args = [str(a) for a in entry.get("args", [])]
+    if not args or args[-1] != "serve":
+        return False
+    command = Path(str(entry.get("command", ""))).name.lower()
+    command = command[:-4] if command.endswith(".exe") else command
+    if command.startswith("tokengraph") or command.startswith("contextiq"):
+        return True
+    # Script fallback: any python interpreter, pointed at the module.
+    if command.startswith("python") or command in {"py", "uv", "uvx"}:
+        return any(Path(a).name == "tokengraph_all.py" for a in args)
+    return False
+
+
+# path -> (key the host reads, human name)
+MCP_CONFIGS = {
+    ".vscode/mcp.json": ("servers", "VS Code / Copilot"),
+    ".mcp.json": ("mcpServers", "Claude Code"),
+    ".cursor/mcp.json": ("mcpServers", "Cursor"),
+}
+
+
 def validate_mcp_configs(errors: list[str]) -> None:
-    vscode_cfg = _load_json(ROOT / ".vscode" / "mcp.json")
-    claude_cfg = _load_json(ROOT / ".mcp.json")
+    """Every MCP config present must declare a tokengraph server that launches.
 
-    vs_tg = vscode_cfg.get("servers", {}).get("tokengraph", {})
-    cl_tg = claude_cfg.get("mcpServers", {}).get("tokengraph", {})
-
-    _require(bool(vs_tg), ".vscode/mcp.json is missing servers.tokengraph", errors)
-    _require(bool(cl_tg), ".mcp.json is missing mcpServers.tokengraph", errors)
-
-    def _ends_with_tokengraph_serve(args: list[object]) -> bool:
-        if len(args) < 2:
-            return False
-        script = str(args[-2])
-        return Path(script).name == "tokengraph_all.py" and str(args[-1]) == "serve"
-
-    if vs_tg:
-        _require(vs_tg.get("type") == "stdio", "VS Code tokengraph type must be stdio", errors)
-        _require(vs_tg.get("command") == "python", "VS Code tokengraph command must be python", errors)
+    Configs are validated when they exist rather than being required, so a repo
+    that only wires the hosts it uses still passes — but a config that exists
+    and is broken is always caught.
+    """
+    seen = 0
+    for rel, (key, label) in MCP_CONFIGS.items():
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        seen += 1
+        entry = _load_json(path).get(key, {}).get("tokengraph", {})
+        _require(bool(entry), f"{rel} is missing {key}.tokengraph", errors)
+        if not entry:
+            continue
+        _require(entry.get("type", "stdio") == "stdio",
+                 f"{label}: tokengraph type must be stdio", errors)
         _require(
-            _ends_with_tokengraph_serve(vs_tg.get("args", [])),
-            "VS Code tokengraph args must end with [tokengraph_all.py, serve]",
-            errors,
-        )
-        _require(
-            vs_tg.get("env", {}).get("TOKENGRAPH_ROOT") == "${workspaceFolder}",
-            "VS Code TOKENGRAPH_ROOT must be ${workspaceFolder}",
+            _launches_tokengraph(entry),
+            f"{label}: tokengraph args must invoke the server "
+            f"(got command={entry.get('command')!r} args={entry.get('args')!r})",
             errors,
         )
 
-    if cl_tg:
-        _require(cl_tg.get("type") == "stdio", "Claude tokengraph type must be stdio", errors)
-        _require(cl_tg.get("command") == "python", "Claude tokengraph command must be python", errors)
+    _require(seen > 0,
+             "no MCP config found — run: python tokengraph_all.py ide-setup",
+             errors)
+
+    # .claude/settings.json has NO mcpServers key; Claude Code reads .mcp.json.
+    # An mcpServers block there is silently ignored, so flag it rather than
+    # letting a repo believe it is wired.
+    claude_settings = ROOT / ".claude" / "settings.json"
+    if claude_settings.exists():
+        cfg = _load_json(claude_settings)
         _require(
-            _ends_with_tokengraph_serve(cl_tg.get("args", [])),
-            "Claude tokengraph args must end with [tokengraph_all.py, serve]",
-            errors,
-        )
-        _require(
-            cl_tg.get("env", {}).get("TOKENGRAPH_ROOT") == ".",
-            "Claude TOKENGRAPH_ROOT must be .",
+            "mcpServers" not in cfg,
+            ".claude/settings.json has an 'mcpServers' key, which Claude Code "
+            "ignores — declare MCP servers in .mcp.json instead",
             errors,
         )
 

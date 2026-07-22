@@ -1,46 +1,260 @@
 {
-  "version": 1,
-  "description": "Human-authored ContextIQ repository tasks. Queries intentionally avoid expected symbol names where practical.",
+  "version": 2,
+  "repo": "..",
+  "languages": ["python"],
+  "description": "Human-authored ContextIQ repository tasks. Queries intentionally avoid the expected symbol names where practical, so the corpus measures retrieval rather than string matching. `expected_symbols` and `must_contain` make this an answer-quality corpus: a pack passes only if it actually carries what an answer would need.",
   "cases": [
     {
       "task": "keep caller relationships intact when only the called file changes during an incremental refresh",
-      "expected_files": ["tokengraph_all.py"]
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.index_repo"],
+      "must_contain": ["mtime"]
+    },
+    {
+      "task": "decide how much of each symbol to include so the answer fits a token budget",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.find_relevant_context"],
+      "must_contain": ["budget_tokens"]
+    },
+    {
+      "task": "work out how many tokens a developer would have spent grepping and reading around each hit instead",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever._targeted_baseline"],
+      "must_contain": ["GREP_WINDOW_LINES"]
+    },
+    {
+      "task": "report how much was saved compared with the alternative way of getting the same coverage",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.measure"],
+      "must_contain": ["baseline_tokens"]
+    },
+    {
+      "task": "stop a heavily-referenced utility from crowding out the code the question was about",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever._neighbor_score"],
+      "must_contain": ["hub"]
+    },
+    {
+      "task": "avoid sending the model text it was already given earlier in the same conversation",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Store.sent_map"],
+      "must_contain": ["session"]
+    },
+    {
+      "task": "record which pieces of context have been delivered to a conversation so far",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Store.mark_sent"],
+      "must_contain": ["sent_ledger"]
+    },
+    {
+      "task": "tell whether a snippet has changed since it was last handed over, ignoring reformatting",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all._piece_hash"],
+      "must_contain": ["blake2b"]
+    },
+    {
+      "task": "identify which vector space the stored similarity data belongs to",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.embed_backend_id"],
+      "must_contain": ["hash-v1"]
+    },
+    {
+      "task": "turn a piece of text into a fixed-length numeric signature without any model",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all._hash_embed"],
+      "must_contain": ["trigram"]
+    },
+    {
+      "task": "throw away similarity data that was produced by a different model than the one now in use",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Store.drop_stale_vectors"],
+      "must_contain": ["backend"]
+    },
+    {
+      "task": "find which indexed definitions still need a similarity signature computed",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Store.symbols_missing_vectors"],
+      "must_contain": ["LEFT JOIN"]
+    },
+    {
+      "task": "fetch the similarity model ahead of time so a query never stalls on a download",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.embed_warm"],
+      "must_contain": ["sentence_transformers"]
+    },
+    {
+      "task": "arrange the outgoing message so the provider can reuse most of it between requests",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.cache_blocks"],
+      "must_contain": ["ephemeral"]
+    },
+    {
+      "task": "split the generated project overview into the part that rarely changes and the part that changes every commit",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.build_context_payload"],
+      "must_contain": ["stable_prefix"]
+    },
+    {
+      "task": "combine two differently-ordered result lists into one ranking",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever._fuse"],
+      "must_contain": ["rank"]
+    },
+    {
+      "task": "rank definitions by closeness in meaning rather than exact spelling",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.semantic_search"],
+      "must_contain": ["cosine"]
+    },
+    {
+      "task": "drop a snippet that repeats something already shown further up",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all._dedupe_pieces"],
+      "must_contain": ["threshold"]
+    },
+    {
+      "task": "count how many other definitions touch each one, in a single database round trip",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Store.degrees"],
+      "must_contain": ["edges"]
+    },
+    {
+      "task": "shrink a pasted crash dump or build log before it is charged for",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.squeeze_text"],
+      "must_contain": ["kind"]
+    },
+    {
+      "task": "make sure credentials never leave the machine inside returned context",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.redact_secrets"],
+      "must_contain": ["redact"]
+    },
+    {
+      "task": "work out the size of a chunk of text the way a specific vendor's model would",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.count_tokens_for_model"],
+      "must_contain": ["model_family"]
+    },
+    {
+      "task": "price a request before it is actually sent anywhere",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.estimate_cost"],
+      "must_contain": ["expected_output_tokens"]
     },
     {
       "task": "connect an AI client to the local code graph over the model context protocol",
-      "expected_files": ["tokengraph_all.py"]
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.ide_setup"],
+      "must_contain": ["mcpServers"]
     },
     {
-      "task": "show cumulative prompt token savings and cost estimates as interactive charts",
-      "expected_files": ["tokengraph_all.py"]
+      "task": "check whether an editor's configuration file genuinely points at this server or merely exists",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.mcp_wiring_status"],
+      "must_contain": ["declares_tokengraph"]
+    },
+    {
+      "task": "decide whether to invoke the installed program or fall back to running the script directly",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.mcp_launch_command"],
+      "must_contain": ["serve"]
+    },
+    {
+      "task": "update a steering document without destroying the notes a human wrote in it",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.write_adapter"],
+      "must_contain": ["CLAUDE_BEGIN"]
+    },
+    {
+      "task": "judge whether the retrieved material is enough to answer correctly",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.score_pack_answerability"],
+      "must_contain": ["answerable"]
+    },
+    {
+      "task": "fail the build when retrieval quality drops below an agreed floor",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.check_benchmark_thresholds"],
+      "must_contain": ["threshold"]
+    },
+    {
+      "task": "score the tool against several different codebases and roll the numbers up",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.run_benchmark_suite"],
+      "must_contain": ["aggregate"]
+    },
+    {
+      "task": "list everything that would be affected if a particular definition changed",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.get_impact"],
+      "must_contain": ["qname"]
+    },
+    {
+      "task": "show every declaration in a file without any of the implementations",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.file_skeleton"],
+      "must_contain": ["signature"]
+    },
+    {
+      "task": "assemble context for exactly what an in-progress change touches",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.get_diff_context"],
+      "must_contain": ["staged"]
+    },
+    {
+      "task": "produce a reproducible artifact that an auditor could re-derive byte for byte",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.build_evidence_pack"],
+      "must_contain": ["hash"]
+    },
+    {
+      "task": "infer the house style of a codebase so generated files match it",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.analyze_conventions"],
+      "must_contain": ["conventions"]
+    },
+    {
+      "task": "drop derived in-memory state after the underlying files moved",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.Retriever.invalidate"],
+      "must_contain": ["_src_cache"]
+    },
+    {
+      "task": "condense a long back-and-forth into a short brief that carries the decisions forward",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.summarize_conversation"],
+      "must_contain": ["max_tokens"]
+    },
+    {
+      "task": "remove near-identical passages from a set of snippets before they are sent",
+      "expected_files": ["tokengraph_all.py"],
+      "expected_symbols": ["tokengraph_all.dedupe_blocks"],
+      "must_contain": ["threshold"]
     },
     {
       "task": "verify that repository AI configuration files point to valid local resources",
-      "expected_files": ["tools/validate_ai_config.py"]
-    },
-    {
-      "task": "test editor configuration generation for several development environments",
-      "expected_files": ["tests/test_contextiq_all.py"]
+      "expected_files": ["tools/validate_ai_config.py"],
+      "expected_symbols": [],
+      "must_contain": ["validate"]
     },
     {
       "task": "declare optional packages for parsing languages, serving MCP, and accurate token counts",
-      "expected_files": ["pyproject.toml"]
+      "expected_files": ["pyproject.toml"],
+      "expected_symbols": [],
+      "must_contain": ["tiktoken"]
     },
     {
       "task": "explain practical techniques for reducing context consumed by coding assistants",
-      "expected_files": ["docs/TokenEfficiency.md"]
-    },
-    {
-      "task": "compare this graph retriever with the predecessor across capabilities and maturity",
-      "expected_files": ["docs/Comparison.md"]
+      "expected_files": ["docs/TokenEfficiency.md"],
+      "expected_symbols": [],
+      "must_contain": []
     },
     {
       "task": "instruct GitHub Copilot to use graph retrieval before opening complete files",
-      "expected_files": [".github/copilot-instructions.md"]
-    },
-    {
-      "task": "install and configure the local graph tool for a new repository",
-      "expected_files": ["README.md"]
+      "expected_files": [".github/copilot-instructions.md"],
+      "expected_symbols": [],
+      "must_contain": []
     }
   ]
 }

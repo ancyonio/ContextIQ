@@ -1,0 +1,158 @@
+{
+  "version": 2,
+  "repo": ".",
+  "languages": ["python"],
+  "description": "pyshop fixture: a Python e-commerce order service (HTTP handlers, order state machine, retrying payment client, repository layer, pricing rules, fulfilment worker). Tasks are phrased the way a developer would describe the problem, deliberately avoiding the identifier names so the corpus measures semantic retrieval rather than substring matching.",
+  "cases": [
+    {
+      "task": "stop sending traffic to the card processor once it has failed several times in a row, and let a single request through later to see if it recovered",
+      "expected_files": ["app/payments/gateway.py"],
+      "expected_symbols": [
+        "app.payments.gateway.CircuitBreaker",
+        "app.payments.gateway.CircuitBreaker.allow",
+        "app.payments.gateway.CircuitBreaker.record_failure"
+      ],
+      "must_contain": ["half_open"]
+    },
+    {
+      "task": "spread out repeated attempts so a whole fleet of workers does not hit the provider again at the exact same moment after an outage",
+      "expected_files": ["app/payments/gateway.py"],
+      "expected_symbols": ["app.payments.gateway.compute_backoff"],
+      "must_contain": ["max_delay", "jitter"]
+    },
+    {
+      "task": "make sure a checkout that gets submitted twice from a flaky mobile client cannot bill the shopper twice",
+      "expected_files": ["app/payments/gateway.py", "app/storage/repository.py"],
+      "expected_symbols": [
+        "app.payments.gateway.idempotency_key_for",
+        "app.storage.repository.OrderRepository.find_by_idempotency_key"
+      ],
+      "must_contain": ["idem_", "idempotency_key"]
+    },
+    {
+      "task": "work out which upstream responses are worth another attempt and which ones mean the card was refused and we should give up straight away",
+      "expected_files": ["app/payments/gateway.py"],
+      "expected_symbols": [
+        "app.payments.gateway.PaymentGateway.charge",
+        "app.payments.gateway.PaymentDeclined"
+      ],
+      "must_contain": ["RETRYABLE_STATUS"]
+    },
+    {
+      "task": "stop an order that was already refunded from sliding back into the shipping flow",
+      "expected_files": ["app/orders/state_machine.py"],
+      "expected_symbols": [
+        "app.orders.state_machine.OrderStateMachine.can_transition",
+        "app.orders.state_machine.OrderStateMachine.transition"
+      ],
+      "must_contain": ["ALLOWED_TRANSITIONS"]
+    },
+    {
+      "task": "the queue delivers the same message twice and the second delivery should be a harmless no-op instead of an error",
+      "expected_files": ["app/orders/state_machine.py"],
+      "expected_symbols": ["app.orders.state_machine.OrderStateMachine.transition"],
+      "must_contain": ["idempotent replay"]
+    },
+    {
+      "task": "drop the carriage charge once the basket is large enough, and charge a flat rate otherwise",
+      "expected_files": ["app/pricing/rules.py"],
+      "expected_symbols": [
+        "app.pricing.rules.PricingEngine.shipping_for",
+        "app.pricing.rules.PricingEngine.price"
+      ],
+      "must_contain": ["FREE_SHIPPING_THRESHOLD"]
+    },
+    {
+      "task": "take a little off the basket automatically for shoppers who come back often or sit in a premium band",
+      "expected_files": ["app/pricing/rules.py", "app/models.py"],
+      "expected_symbols": [
+        "app.pricing.rules.LoyaltyRule.applies",
+        "app.pricing.rules.LoyaltyRule.discount",
+        "app.models.Customer.is_loyal"
+      ],
+      "must_contain": ["is_loyal"]
+    },
+    {
+      "task": "reject a coupon the shop has never heard of before we bother pricing the whole basket",
+      "expected_files": ["app/pricing/rules.py"],
+      "expected_symbols": [
+        "app.pricing.rules.validate_discount_code",
+        "app.pricing.rules.PromoCodeRule.applies"
+      ],
+      "must_contain": ["PROMO_CODES"]
+    },
+    {
+      "task": "let several background processes pull work off the same queue table without blocking each other on the same rows",
+      "expected_files": ["app/storage/repository.py"],
+      "expected_symbols": [
+        "app.storage.repository.OrderRepository.claim_batch",
+        "app.storage.repository.OrderRepository.release"
+      ],
+      "must_contain": ["SKIP LOCKED"]
+    },
+    {
+      "task": "keep the username and password out of the connection string we print at startup",
+      "expected_files": ["app/config.py"],
+      "expected_symbols": [
+        "app.config._mask_credentials",
+        "app.config.Settings.redacted"
+      ],
+      "must_contain": ["***@"]
+    },
+    {
+      "task": "refuse to boot with a clear message when a mandatory environment variable has not been set",
+      "expected_files": ["app/config.py", "app/main.py"],
+      "expected_symbols": [
+        "app.config.load_settings",
+        "app.config.ConfigError",
+        "app.main.main"
+      ],
+      "must_contain": ["DATABASE_URL"]
+    },
+    {
+      "task": "adding two amounts in different currencies should blow up loudly instead of quietly coercing one of them",
+      "expected_files": ["app/models.py"],
+      "expected_symbols": [
+        "app.models.Money.add",
+        "app.models.Money._assert_same_currency"
+      ],
+      "must_contain": ["currency mismatch"]
+    },
+    {
+      "task": "let the long-running loop finish the batch it is holding before the container is torn down",
+      "expected_files": ["app/workers/fulfillment.py"],
+      "expected_symbols": [
+        "app.workers.fulfillment.FulfillmentWorker.install_signal_handlers",
+        "app.workers.fulfillment.FulfillmentWorker.stop"
+      ],
+      "must_contain": ["SIGTERM"]
+    },
+    {
+      "task": "when the polling loop keeps blowing up cycle after cycle, make it wait a while instead of spinning hot",
+      "expected_files": ["app/workers/fulfillment.py"],
+      "expected_symbols": ["app.workers.fulfillment.FulfillmentWorker.run_forever"],
+      "must_contain": ["ERROR_BACKOFF_SECONDS"]
+    },
+    {
+      "task": "hand a paid basket to the courier and record the parcel number against it",
+      "expected_files": ["app/workers/fulfillment.py"],
+      "expected_symbols": [
+        "app.workers.fulfillment.FulfillmentWorker.process_order",
+        "app.workers.fulfillment.ConsoleShipper.dispatch"
+      ],
+      "must_contain": ["TRK"]
+    },
+    {
+      "task": "tell the API client the bank said no, with a specific status code rather than a generic server error",
+      "expected_files": ["app/api/handlers.py"],
+      "expected_symbols": ["app.api.handlers.OrderHandlers.pay_order"],
+      "must_contain": ["payment_declined"]
+    },
+    {
+      "task": "put an upper bound on how many distinct products one basket may contain and complain about a bad quantity before anything is saved",
+      "expected_files": ["app/api/handlers.py"],
+      "expected_symbols": ["app.api.handlers.parse_order_request"],
+      "must_contain": ["MAX_LINES_PER_ORDER"]
+    }
+  ]
+}

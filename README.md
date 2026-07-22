@@ -1,4 +1,7 @@
+# <p align="center"> <img src="images/ContextIQ_Inline.png" align ="center" width="400" alt="ContextIQ"> </p>
+
 # ContextIQ
+
 
 A local, single-file **AST code graph** that gives AI coding agents token-efficient context. Instead of letting the agent read whole files (and re-read them every session), ContextIQ indexes your repo into a local SQLite graph of symbols + call/inheritance edges, then serves a **token-budgeted "context pack"** of only the symbols relevant to a task.
 
@@ -82,7 +85,7 @@ python tokengraph_all.py skeleton path/to/file.py      # signatures only, no bod
 python tokengraph_all.py summary path/to/file.py       # compact module summary
 python tokengraph_all.py callers my.module.func        # who calls it
 python tokengraph_all.py callees my.module.func        # what it calls
-python tokengraph_all.py measure "add retry logic"     # token savings vs whole files
+python tokengraph_all.py measure "add retry logic"     # savings vs a grep+targeted-read baseline
 python tokengraph_all.py report --tasks-file tasks.txt -o report.md --csv report.csv  # aggregate with/without report
 python tokengraph_all.py report --tasks-file tasks.txt --csv runs.csv --append        # same, accumulated across runs
 python tokengraph_all.py gain                           # realized savings from the ledger (tokens + $)
@@ -144,10 +147,14 @@ python tokengraph_all.py memory                          # read notes + checkpoi
 python tokengraph_all.py checkpoint "phase-1" --note "indexing done"
 
 # Multi-assistant export + distribution + editor integration
-python tokengraph_all.py generate --adapter claude --adapter cursor  # write CLAUDE.md / .cursorrules / copilot / windsurf / AGENTS.md
+python tokengraph_all.py generate --adapter claude --adapter cursor  # CLAUDE.md / .cursor/rules/*.mdc / copilot / AGENTS.md (per-host budgets)
 python tokengraph_all.py generate --monorepo --adapter copilot       # per-package context for every nested manifest-detected package
 python tokengraph_all.py generate --each --adapter claude            # per immediate sub-directory (workspace of repos)
-python tokengraph_all.py ide-setup                       # one-command MCP wiring for VS Code / Cursor / Windsurf / Zed / Claude Code
+python tokengraph_all.py ide-setup                       # MCP wiring: VS Code / Cursor / Zed / Claude Code (project-local)
+python tokengraph_all.py ide-setup --global              # also Windsurf + Cline, which only read per-user config paths
+python tokengraph_all.py serve --transport http --port 8756  # shared/remote server instead of stdio
+python tokengraph_all.py embed-warm                      # fetch the semantic model once (otherwise: hashing fallback)
+python tokengraph_all.py benchmark --check               # CI gate: answer-quality across 4 repos, exit 1 on regression
 python tokengraph_all.py ide-setup --workspace-root repo-a --workspace-root repo-b  # multi-root wiring
 python tokengraph_all.py ide-plugin                      # scaffold installable plugins: VS Code .vsix / Neovim Lua / JetBrains
 python tokengraph_all.py freeze --build                  # build a standalone binary now (PyInstaller)
@@ -184,14 +191,28 @@ deps** — the default backend is a deterministic hashing embedding (token +
 char-trigram). It captures lexical/structural overlap robustly but is not a true
 neural model.
 
-For real neural semantic search, opt into a local model:
+For real neural semantic search:
 
 ```bash
-pip install sentence-transformers
-export TOKENGRAPH_EMBEDDINGS=st               # Windows: $env:TOKENGRAPH_EMBEDDINGS="st"
-export TOKENGRAPH_EMBED_MODEL=all-MiniLM-L6-v2   # optional, this is the default
-python tokengraph_all.py index                # rebuild vectors with the model
+pip install 'contextiq[embeddings]'
+python tokengraph_all.py embed-warm     # one-time download + verify, then re-embeds
 ```
+
+`embed-warm` is a separate step on purpose: a query must never stall for minutes
+on a model download, so nothing is fetched implicitly. Once the model is cached
+locally it is picked up automatically — no env var required.
+
+Which backend is live is never a guess:
+
+```bash
+python tokengraph_all.py doctor         # reports the active backend
+```
+
+or call the `embedding_status()` MCP tool. Vectors record the backend that
+produced them, so switching backends invalidates the old ones and triggers a
+re-embed instead of silently comparing incompatible vector spaces. Set
+`TOKENGRAPH_EMBEDDINGS=off` to pin the deterministic hash backend (what CI uses,
+for reproducible scores).
 
 Vectors live in the `vectors` table (float32 blobs) and are compared by cosine in
 Python — fine for repo-scale symbol counts.
@@ -317,11 +338,55 @@ python tokengraph_all.py hallucination -o HALLUCINATION.md      # reproducible m
 ## Editor integration & distribution
 
 ```bash
-python tokengraph_all.py ide-setup     # one-command MCP wiring: VS Code / Cursor / Windsurf / Zed / Claude Code (+ Neovim & JetBrains snippets)
+python tokengraph_all.py ide-setup           # project-local MCP wiring: Claude Code / VS Code Copilot / Cursor / Zed
+python tokengraph_all.py ide-setup --global  # also Windsurf + Cline (per-user config paths, outside the repo)
 python tokengraph_all.py ide-plugin    # scaffold installable plugins: packageable VS Code .vsix, lazy.nvim Lua, Gradle JetBrains
 python tokengraph_all.py freeze --build # build a standalone binary now (PyInstaller)
 python tokengraph_all.py dist          # CI release workflow + Dockerfile + Homebrew tap + install.sh + PUBLISHING.md
 ```
+
+### What gets written where
+
+Every path below is the one the host actually reads — verified, not assumed.
+Steering files are marker-scoped, so hand-written text around the generated
+block survives regeneration, and each host gets a budget sized to its window
+rather than one identical blob.
+
+| Host | MCP config | Steering file |
+|---|---|---|
+| Claude Code | `.mcp.json` | `CLAUDE.md` |
+| VS Code / Copilot | `.vscode/mcp.json` (`servers` key) | `.github/copilot-instructions.md` |
+| Cursor | `.cursor/mcp.json` | `.cursor/rules/contextiq.mdc` |
+| Zed | `.zed/settings.json` (`context_servers`, `source: custom`) | `.rules` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` — **`--global`** | `.windsurf/rules/contextiq.md` |
+| Cline | VS Code globalStorage — **`--global`** | `.clinerules/contextiq.md` |
+| Continue | `.continue/config.yaml` | `.continue/rules/contextiq.md` |
+| Codex / Aider / Jules | (AGENTS.md standard) | `AGENTS.md`, `CONVENTIONS.md` |
+| Gemini CLI | — | `GEMINI.md` |
+| Roo Code | — | `.roo/rules/contextiq.md` |
+| JetBrains / Neovim | printed snippet (manual) | — |
+
+Two notes worth knowing:
+
+- **Windsurf and Cline only read a per-user config path.** A `.windsurf/mcp.json`
+  inside the repo is a file nothing ever loads, so `ide-setup` refuses to write
+  one and reports the real path instead. Pass `--global` to write it.
+- **Claude Code reads MCP servers from `.mcp.json`, not `.claude/settings.json`.**
+  An `mcpServers` block in `settings.json` is silently ignored; `doctor` and
+  `tools/validate_ai_config.py` both flag it rather than reporting success.
+
+`doctor` verifies that a config *declares the tokengraph server*, not merely that
+the file exists.
+
+### Remote / shared server
+
+```bash
+python tokengraph_all.py serve                                   # stdio (default; editor launches it)
+python tokengraph_all.py serve --transport http --port 8756      # one index, several clients
+```
+
+HTTP binds to loopback unless you override `--host`, and warns loudly if you do —
+the server exposes repository source.
 
 `ide-setup` merges non-destructively into each editor's MCP config and can repeat
 `--workspace-root` for multi-root workspaces. `ide-plugin` emits packageable plugin
@@ -392,7 +457,7 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 | `squeeze(text, kind="auto")` | Shrink a pasted stacktrace / CI log / JSON blob before it costs tokens — drops vendor frames & build noise, keeps the diagnostics |
 | `learn(file, good, weight=1.0)` | Reinforce / penalise a file's local ranking weight |
 | `read_memory(limit=20)` / `write_memory(text, kind)` / `create_checkpoint(label, note)` | Cross-session decision log + git-snapshot checkpoints, stored **locally** |
-| `estimate_savings(task)` | Tokens in the pack vs. reading the referenced files whole (single what-if) |
+| `estimate_savings(task)` | Pack tokens vs. a **grep + targeted-read** baseline (what a competent agent would actually spend). Also reports the whole-file comparison separately |
 | `savings_report(tasks)` | Aggregate with/without savings across many tasks |
 | `savings_ledger(since="", model="claude-sonnet", top=0)` | **Realized** savings from the persistent ledger: totals, reduction %, per-op breakdown, dollar projection, and daily/weekly/monthly trends |
 | `estimate_call_cost(prompt, model="claude-sonnet", expected_output_tokens=500, compare=False)` | Price an API call **before** sending it — model-aware input+output USD; `compare=True` ranks GPT/Claude/Gemini/Llama cheapest-first |
@@ -534,24 +599,52 @@ concurrency, language extractors, and the grounded-creation pipeline.
 
 ---
 
-## Benchmark & savings
+## Benchmark & answer quality
 
-Self-benchmark on **this repository** (5 files, 419 symbols, 881 edges):
+The claim is "fewer tokens, **same answer quality**". The second half is the one
+worth distrusting, so it is measured and enforced in CI rather than asserted.
 
 ```bash
-python tokengraph_all.py benchmark         # corpus Recall@5, MRR, irrelevant-token ratio, latency
-python tokengraph_all.py measure "task"    # token savings vs reading files whole (single task)
-python tokengraph_all.py gain --all        # cumulative realized savings over time (tokens + $)
+python tokengraph_all.py benchmark --all     # 96 cases across 4 repos, answer-quality scored
+python tokengraph_all.py benchmark --check   # CI gate: exit 1 when quality regresses
+python tokengraph_all.py measure "task"      # savings vs a grep+targeted-read baseline
+python tokengraph_all.py gain --all          # cumulative realized savings (tokens + $)
 ```
 
-| Metric | Value | How |
-|---|--:|---|
-| Retrieval quality | Repository-dependent | `benchmark` uses `benchmarks/retrieval_tasks.json` human-authored tasks |
-| Token savings (example task) | **95.9%** | pack ≈2,449 tok vs ≈59,678 tok reading the 3 referenced files whole |
+### What is actually measured
 
-> These are this repo's own numbers; hit@5 is high because the project is a single
-> dense module. Run the same two commands inside your repo for representative figures —
-> savings scale with codebase size (the larger the repo, the more you avoid re-reading).
+The corpus spans **four repositories and three languages** — this repo plus three
+fixture services under `benchmarks/repos/` (Python, TypeScript, Go) — because a
+benchmark that only runs against its own source proves nothing about
+generalisation. Tasks are phrased in natural language that avoids the target
+symbol names, so the corpus measures retrieval rather than string matching.
+
+Each case declares the symbols and literal facts an answer would need. A pack is
+`answerable` only if **every** one of them survived compression:
+
+| Metric | Measured | Floor (CI) | Meaning |
+|---|--:|--:|---|
+| `recall_at_5` | **0.958** | 0.90 | the right file is in the top 5 |
+| `symbol_recall` | **0.72** | 0.65 | required symbols made it into the pack |
+| `answerable_rate` | **0.51** | 0.45 | pack carried *every* required symbol **and** fact |
+| `irrelevant_token_ratio` | 0.79 | ≤0.85 | budget spent outside the target files |
+
+Measured at the default 6,000-token budget on the deterministic hash backend.
+
+**Read this honestly:** ContextIQ nearly always finds the right *file*, but at a
+6k budget it carries everything an answer needs only about half the time. Raising
+`answerable_rate` is the main open quality work. Give it a larger budget, or call
+`get_symbol` for anything the pack lists as dropped.
+
+### Savings
+
+`measure` compares against a **grep + read-around-the-hits** baseline — what a
+competent agent actually does — not against reading whole files. The whole-file
+number is still reported, as `savings_pct_vs_whole_file`, but it flatters the
+tool badly on repos with large files and should not be quoted as the saving.
+Savings can legitimately come out **negative** on small files, where the pack
+costs more than simply reading them; a metric that cannot show a loss is not a
+measurement.
 
 For the hallucination-guard's effect, run `python tokengraph_all.py grounding` (fabrications caught vs. real refs flagged) or `python tokengraph_all.py hallucination -o HALLUCINATION.md` (a reproducible, multi-repo reduction report).
 

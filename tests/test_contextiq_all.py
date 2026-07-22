@@ -447,24 +447,39 @@ class MCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             "def status():\n    return 'before'\n")
             tg.index_repo(root, db)
             server = tg.build_mcp_server(root, db)
+            try:
+                async with Client(server) as client:
+                    tools = await client.list_tools()
+                    names = {tool.name for tool in tools}
+                    self.assertIn("find_relevant_context", names)
+                    self.assertIn("get_symbol", names)
+                    # tools added alongside the token-efficiency work
+                    self.assertIn("embedding_status", names)
+                    self.assertIn("session_savings", names)
+                    self.assertIn("prompt_cache_blocks", names)
 
-            async with Client(server) as client:
-                tools = await client.list_tools()
-                names = {tool.name for tool in tools}
-                self.assertIn("find_relevant_context", names)
-                self.assertIn("get_symbol", names)
+                    before = await client.call_tool(
+                        "get_symbol", {"qname": "service.status"})
+                    self.assertFalse(before.is_error)
+                    self.assertIn("'before'", before.data)
 
-                before = await client.call_tool(
-                    "get_symbol", {"qname": "service.status"})
-                self.assertFalse(before.is_error)
-                self.assertIn("'before'", before.data)
+                    source.write_text(
+                        "def status():\n    return 'after-edit'\n", encoding="utf-8")
+                    after = await client.call_tool(
+                        "get_symbol", {"qname": "service.status"})
+                    self.assertFalse(after.is_error)
+                    self.assertIn("'after-edit'", after.data)
 
-                source.write_text(
-                    "def status():\n    return 'after-edit'\n", encoding="utf-8")
-                after = await client.call_tool(
-                    "get_symbol", {"qname": "service.status"})
-                self.assertFalse(after.is_error)
-                self.assertIn("'after-edit'", after.data)
+                    # RP-1: the retriever is pooled across calls, so a repeated
+                    # query must still see the edit above rather than a cached
+                    # pre-edit source line.
+                    repeat = await client.call_tool(
+                        "get_symbol", {"qname": "service.status"})
+                    self.assertIn("'after-edit'", repeat.data)
+            finally:
+                # The pool deliberately keeps sqlite handles open; release them
+                # or the temp directory cannot be removed (Windows).
+                server.close_pool()
 
 
 class IntentRoutingUnitTests(unittest.TestCase):
@@ -1581,9 +1596,14 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
     def test_ide_setup_writes_editor_configs(self):
         import json
         res = tg.ide_setup(self.root)
+        # Windsurf is deliberately NOT here: it reads MCP config only from
+        # ~/.codeium/windsurf/mcp_config.json, so a project-local
+        # .windsurf/mcp.json is a file nothing ever reads. It is reported
+        # under global_pending instead and written only with --global.
         self.assertEqual(set(res["written"]),
                          {".mcp.json", ".vscode/mcp.json", ".cursor/mcp.json",
-                          ".windsurf/mcp.json", ".zed/settings.json"})
+                          ".zed/settings.json"})
+        self.assertIn("windsurf", {g["host"] for g in res["global_pending"]})
         # each config is valid JSON wiring the tokengraph server
         vsc = json.loads((self.root / ".vscode" / "mcp.json").read_text("utf-8"))
         self.assertIn("tokengraph", vsc["servers"])
@@ -2118,6 +2138,540 @@ class UsageReportTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             tg.cmd_gain(args)
         self.assertTrue(tg.usage_report_path(self.root).exists())
+
+
+class _RepoCase(unittest.TestCase):
+    """Base: a throwaway indexed repo per test."""
+
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+
+    def _index(self):
+        tg.index_repo(self.root, self.db)
+        r = tg.Retriever(self.root, self.db)
+        self.addCleanup(r.close_now)
+        return r
+
+
+class NeighborRankingTests(_RepoCase):
+    """NB-1: hub symbols must not flood the pack with irrelevant signatures."""
+
+    def _hub_repo(self, callers: int = 120):
+        _write(self.root, "hub.py", "def shared(x):\n    return x\n")
+        # Many unrelated callers of one hub symbol, plus the actual target.
+        for i in range(callers):
+            _write(self.root, f"caller_{i}.py",
+                   f"from hub import shared\n\n"
+                   f"def unrelated_{i}(v):\n"
+                   f"    return shared(v)\n")
+        _write(self.root, "target.py",
+               "from hub import shared\n\n"
+               "def parse_yaml_frontmatter(text):\n"
+               "    '''Split YAML frontmatter from a markdown document.'''\n"
+               "    return shared(text)\n")
+
+    # depth=2 is where the flood actually happens: the seed reaches the hub in
+    # one hop, and the hub's whole caller list in the second.
+    def test_fanout_is_bounded(self):
+        self._hub_repo()
+        r = self._index()
+        pack = r.find_relevant_context("parse yaml frontmatter from markdown",
+                                       budget_tokens=6000, expand_depth=2)
+        neighbor_pieces = [p for p in pack.pieces
+                           if p.reason in ("caller", "callee", "base")]
+        self.assertLessEqual(len(neighbor_pieces), tg.MAX_NEIGHBOR_SIGS)
+        # The expansion saw far more candidates than it emitted.
+        self.assertGreater(pack.neighbors_considered, tg.MAX_NEIGHBOR_SIGS)
+        self.assertGreater(pack.neighbors_pruned, 0)
+
+    def test_candidate_collection_is_capped(self):
+        self._hub_repo(callers=300)
+        r = self._index()
+        pack = r.find_relevant_context("parse yaml frontmatter from markdown",
+                                       budget_tokens=6000, expand_depth=2)
+        self.assertLessEqual(pack.neighbors_considered,
+                             tg.MAX_NEIGHBOR_CANDIDATES)
+
+    def test_target_survives_hub_flood(self):
+        """The asked-for symbol must not be evicted by a hub's caller list."""
+        self._hub_repo()
+        r = self._index()
+        pack = r.find_relevant_context("parse yaml frontmatter from markdown",
+                                       budget_tokens=4000, expand_depth=2)
+        qnames = {p.qname for p in pack.pieces}
+        self.assertIn("target.parse_yaml_frontmatter", qnames)
+
+    def test_relevant_neighbors_outrank_noise(self):
+        """Emitted neighbours should skew to the task, not to discovery order."""
+        self._hub_repo()
+        r = self._index()
+        pack = r.find_relevant_context("parse yaml frontmatter from markdown",
+                                       budget_tokens=6000, expand_depth=2)
+        noise = [p for p in pack.pieces
+                 if p.reason == "caller" and p.qname.startswith("caller_")]
+        # Without ranking every one of the 120 unrelated callers would be a
+        # candidate for emission; the cap alone bounds this to MAX_NEIGHBOR_SIGS.
+        self.assertLessEqual(len(noise), tg.MAX_NEIGHBOR_SIGS)
+
+    def test_scoring_prefers_task_overlap(self):
+        rows = []
+
+        class _Row(dict):
+            def __getitem__(self, k):
+                return self.get(k)
+
+        relevant = _Row(id=1, qname="mod.parse_yaml", name="parse_yaml",
+                        signature="def parse_yaml(text)", docstring="parse yaml")
+        noise = _Row(id=2, qname="mod.unrelated_42", name="unrelated_42",
+                     signature="def unrelated_42(v)", docstring="")
+        terms = set(tg._tokenize("parse yaml frontmatter"))
+        s_rel = tg.Retriever._neighbor_score(relevant, "caller", 0, terms, 2)
+        s_noise = tg.Retriever._neighbor_score(noise, "caller", 0, terms, 2)
+        self.assertGreater(s_rel, s_noise)
+        rows.append((s_rel, s_noise))
+
+    def test_hub_penalty_lowers_score(self):
+        class _Row(dict):
+            def __getitem__(self, k):
+                return self.get(k)
+
+        row = _Row(id=1, qname="m.f", name="f", signature="def f()", docstring="")
+        terms = set(tg._tokenize("anything"))
+        low_degree = tg.Retriever._neighbor_score(row, "callee", 0, terms, 1)
+        high_degree = tg.Retriever._neighbor_score(row, "callee", 0, terms, 500)
+        self.assertGreater(low_degree, high_degree)
+
+
+class SessionDedupTests(_RepoCase):
+    """SD-1: a second retrieval must not re-bill unchanged content."""
+
+    def _repo(self):
+        _write(self.root, "svc.py",
+               "def charge_card(token, amount):\n"
+               "    '''Charge a card through the payment provider.'''\n"
+               "    validated = validate(token)\n"
+               "    return submit(validated, amount)\n\n"
+               "def validate(token):\n"
+               "    return token.strip()\n\n"
+               "def submit(t, amount):\n"
+               "    return {'t': t, 'amount': amount}\n")
+
+    def test_second_call_is_cheaper_and_lists_reuse(self):
+        self._repo()
+        r = self._index()
+        first = r.find_relevant_context("charge a card", budget_tokens=3000,
+                                        session="conv-1")
+        second = r.find_relevant_context("charge a card", budget_tokens=3000,
+                                         session="conv-1")
+        self.assertLess(second.rendered_tokens, first.rendered_tokens)
+        self.assertTrue(second.reused)
+        self.assertGreater(second.tokens_reused, 0)
+        self.assertIn("Already sent earlier this session", second.to_markdown())
+
+    def test_sessions_are_isolated(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("charge a card", budget_tokens=3000, session="a")
+        other = r.find_relevant_context("charge a card", budget_tokens=3000,
+                                        session="b")
+        self.assertEqual(other.reused, [])
+
+    def test_no_session_id_means_no_dedup(self):
+        self._repo()
+        r = self._index()
+        a = r.find_relevant_context("charge a card", budget_tokens=3000)
+        b = r.find_relevant_context("charge a card", budget_tokens=3000)
+        self.assertEqual(a.rendered_tokens, b.rendered_tokens)
+        self.assertEqual(b.reused, [])
+
+    def test_edited_symbol_is_resent(self):
+        """Content hash, not just name — an edit must invalidate the reuse."""
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("charge a card", budget_tokens=3000, session="s")
+        _write(self.root, "svc.py",
+               "def charge_card(token, amount):\n"
+               "    '''Charge a card through the payment provider.'''\n"
+               "    validated = validate(token)\n"
+               "    audit_log(validated)\n"
+               "    return submit(validated, amount)\n\n"
+               "def validate(token):\n"
+               "    return token.strip()\n\n"
+               "def audit_log(v):\n    return v\n\n"
+               "def submit(t, amount):\n"
+               "    return {'t': t, 'amount': amount}\n")
+        tg.index_repo(self.root, self.db)
+        r.invalidate()
+        again = r.find_relevant_context("charge a card", budget_tokens=3000,
+                                        session="s")
+        self.assertIn("audit_log", again.to_markdown())
+        self.assertNotIn("svc.charge_card", again.reused)
+
+    def test_reset_session_clears_ledger(self):
+        self._repo()
+        r = self._index()
+        r.find_relevant_context("charge a card", budget_tokens=3000, session="s")
+        self.assertGreater(r.store.session_stats("s")["symbols_sent"], 0)
+        r.store.clear_session("s")
+        self.assertEqual(r.store.session_stats("s")["symbols_sent"], 0)
+
+
+class HonestBaselineTests(_RepoCase):
+    """MS-1: the headline saving must use a realistic agent baseline."""
+
+    def _big_repo(self):
+        # One large file: the case where whole-file baselines flatter most.
+        body = "\n".join(
+            f"def fn_{i}(x):\n"
+            f"    '''Function number {i}.'''\n"
+            f"    total = 0\n"
+            f"    for j in range(x):\n"
+            f"        total += j * {i}\n"
+            f"    return total\n"
+            for i in range(200))
+        _write(self.root, "big.py", body)
+
+    def test_targeted_baseline_is_far_below_whole_file(self):
+        self._big_repo()
+        r = self._index()
+        m = r.measure("function number 7 accumulate total")
+        self.assertEqual(m["baseline_kind"], "grep+targeted-read")
+        self.assertLess(m["baseline_tokens"], m["baseline_whole_file_tokens"])
+        # Both numbers are reported; neither is hidden.
+        self.assertIn("savings_pct_vs_whole_file", m)
+
+    def test_savings_can_be_negative(self):
+        """A metric that cannot show a loss is not a measurement."""
+        _write(self.root, "tiny.py", "def a():\n    return 1\n")
+        r = self._index()
+        m = r.measure("a")
+        # On a two-line file the pack overhead exceeds just reading it, and the
+        # tool must be willing to say so.
+        self.assertLess(m["savings_pct"], 100.0)
+        self.assertIsInstance(m["tokens_saved"], int)
+
+    def test_windows_merge_rather_than_double_count(self):
+        self._big_repo()
+        r = self._index()
+        pack = r.find_relevant_context("function number 7", budget_tokens=4000)
+        baseline = r._targeted_baseline(pack)
+        whole = sum(r.store.token_est_for(f)
+                    for f in {p.file for p in pack.pieces})
+        self.assertGreater(baseline, 0)
+        self.assertLessEqual(baseline, whole * 2)
+
+
+class EmbeddingBackendTests(_RepoCase):
+    """EM-1/EM-2: backend identity, invalidation and honest reporting."""
+
+    def test_backend_id_is_stable_and_descriptive(self):
+        bid = tg.embed_backend_id()
+        self.assertTrue(bid)
+        self.assertEqual(bid, tg.embed_backend_id())
+
+    def test_info_reports_kind_and_status(self):
+        info = tg.embed_backend_info()
+        self.assertIn(info["kind"], ("hashing", "sentence-transformers"))
+        self.assertIsInstance(info["semantic"], bool)
+        self.assertTrue(info["status"])
+        if not info["semantic"]:
+            self.assertIn("does NOT match by meaning", info["note"])
+
+    def test_vectors_carry_backend_and_stale_ones_are_dropped(self):
+        _write(self.root, "a.py", "def alpha():\n    return 1\n")
+        r = self._index()
+        self.assertTrue(r.store.has_vectors())
+        r.store.conn.execute("UPDATE vectors SET backend='some-other-backend'")
+        r.store.commit()
+        # Vectors from another space are invisible, not silently compared.
+        self.assertFalse(r.store.has_vectors())
+        self.assertGreater(len(r.store.symbols_missing_vectors()), 0)
+        removed = r.store.drop_stale_vectors()
+        self.assertGreater(removed, 0)
+
+    def test_reindex_backfills_missing_vectors(self):
+        _write(self.root, "a.py", "def alpha():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        store = tg.Store(self.db)
+        store.conn.execute("UPDATE vectors SET backend='stale'")
+        store.commit()
+        store.set_meta("embed_backend", "stale")
+        store.close()
+        report = tg.index_repo(self.root, self.db)
+        self.assertGreater(report.reembedded, 0)
+        store = tg.Store(self.db)
+        try:
+            self.assertTrue(store.has_vectors())
+        finally:
+            store.close()
+
+    def test_semantic_search_falls_back_instead_of_returning_nothing(self):
+        _write(self.root, "a.py", "def alpha_beta():\n    return 1\n")
+        r = self._index()
+        r.store.conn.execute("DELETE FROM vectors")
+        r.store.commit()
+        hits = r.semantic_search("alpha_beta", limit=5)
+        self.assertTrue(hits, "must degrade to lexical, not return empty")
+
+
+class SchemaMigrationTests(_RepoCase):
+    def test_user_version_is_stamped(self):
+        _write(self.root, "a.py", "def a():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        store = tg.Store(self.db)
+        try:
+            v = store.conn.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(v, tg.SCHEMA_VERSION)
+        finally:
+            store.close()
+
+    def test_newer_schema_is_rebuilt_not_misread(self):
+        _write(self.root, "a.py", "def a():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        store = tg.Store(self.db)
+        store.conn.execute(f"PRAGMA user_version={tg.SCHEMA_VERSION + 5}")
+        store.commit()
+        store.close()
+        store = tg.Store(self.db)       # must not raise
+        try:
+            v = store.conn.execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(v, tg.SCHEMA_VERSION)
+        finally:
+            store.close()
+
+    def test_meta_roundtrip(self):
+        store = tg.Store(self.db)
+        try:
+            self.assertEqual(store.get_meta("nope", "dflt"), "dflt")
+            store.set_meta("k", "v")
+            self.assertEqual(store.get_meta("k"), "v")
+        finally:
+            store.close()
+
+
+class TargetedDeleteTests(_RepoCase):
+    """A notify-style targeted refresh must reconcile the paths it is given."""
+
+    def test_targeted_reindex_forgets_deleted_path(self):
+        _write(self.root, "a.py", "def a():\n    return 1\n")
+        _write(self.root, "b.py", "def b():\n    return 2\n")
+        tg.index_repo(self.root, self.db)
+        (self.root / "b.py").unlink()
+        report = tg.index_repo(self.root, self.db, paths=["b.py"])
+        self.assertEqual(report.removed, 1)
+        store = tg.Store(self.db)
+        try:
+            self.assertNotIn("b.py", store.all_indexed_files())
+            self.assertIn("a.py", store.all_indexed_files())
+        finally:
+            store.close()
+
+
+class PromptCacheOrderingTests(_RepoCase):
+    """PC-1: volatile git state must sit AFTER the cache breakpoint."""
+
+    def _repo_with_git_noise(self):
+        _write(self.root, "m.py",
+               "def alpha():\n    return 1\n\n# TODO: revisit this\n")
+
+    def test_payload_splits_stable_from_volatile(self):
+        self._repo_with_git_noise()
+        r = self._index()
+        payload = tg.build_context_payload(
+            r, self.root, strategy="full", src_dirs=["."], budget=4000,
+            hot_commits=5, diff=False, staged=False, config={})
+        self.assertIn("stable_prefix", payload)
+        self.assertNotIn("## TODO / FIXME", payload["stable_prefix"])
+        self.assertIn("## TODO / FIXME", payload["volatile_suffix"])
+        # The whole document is still the concatenation, in order.
+        self.assertTrue(payload["markdown"].startswith(
+            payload["stable_prefix"].rstrip()[:80]))
+
+    def test_cache_blocks_annotate_only_the_stable_block(self):
+        self._repo_with_git_noise()
+        r = self._index()
+        payload = tg.build_context_payload(
+            r, self.root, strategy="full", src_dirs=["."], budget=4000,
+            hot_commits=5, diff=False, staged=False, config={})
+        blocks = tg.cache_blocks(payload)
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertGreaterEqual(len(blocks), 2)
+        self.assertNotIn("cache_control", blocks[1])
+        self.assertIn("TODO", blocks[1]["text"])
+
+
+class RetrieverPoolingTests(_RepoCase):
+    """RP-1: pooled retrievers survive close() and drop stale caches."""
+
+    def test_pooled_close_is_a_noop(self):
+        _write(self.root, "a.py", "def a():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        r = tg.Retriever(self.root, self.db)
+        r.pooled = True
+        r.close()
+        self.assertTrue(r.file_skeleton("a.py"))   # connection still usable
+        r.close_now()
+
+    def test_invalidate_clears_source_cache(self):
+        _write(self.root, "a.py", "def a():\n    return 1\n")
+        r = self._index()
+        r._lines("a.py")
+        self.assertIn("a.py", r._src_cache)
+        r.invalidate()
+        self.assertEqual(r._src_cache, {})
+        self.assertIsNone(r._ann_index)
+
+
+class IdeWiringTests(_RepoCase):
+    """Table 2: config shapes each host actually parses."""
+
+    def test_ide_setup_writes_correct_shapes(self):
+        res = tg.ide_setup(self.root)
+        cfg = json.loads((self.root / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertIn("tokengraph", cfg["mcpServers"])
+        vs = json.loads((self.root / ".vscode" / "mcp.json").read_text(encoding="utf-8"))
+        self.assertIn("tokengraph", vs["servers"])       # VS Code uses `servers`
+        cur = json.loads((self.root / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
+        self.assertEqual(cur["mcpServers"]["tokengraph"]["type"], "stdio")
+        zed = json.loads((self.root / ".zed" / "settings.json").read_text(encoding="utf-8"))
+        # Zed needs `source: custom` to accept a user-defined server.
+        self.assertEqual(zed["context_servers"]["tokengraph"]["source"], "custom")
+        self.assertIn("written", res)
+
+    def test_global_only_hosts_are_reported_not_silently_written(self):
+        res = tg.ide_setup(self.root)
+        hosts = {g["host"] for g in res["global_pending"]}
+        self.assertIn("windsurf", hosts)
+        self.assertIn("cline", hosts)
+        # Nothing dead was written into the repo for them.
+        self.assertFalse((self.root / ".windsurf" / "mcp.json").exists())
+
+    def test_wiring_status_requires_actual_declaration(self):
+        (self.root / ".mcp.json").write_text("{}", encoding="utf-8")
+        status = {w["path"]: w for w in tg.mcp_wiring_status(self.root)}
+        self.assertTrue(status[".mcp.json"]["exists"])
+        self.assertFalse(status[".mcp.json"]["declares_tokengraph"])
+
+    def test_cursor_adapter_writes_mdc_with_frontmatter(self):
+        rel = tg.write_adapter(self.root, "cursor", "# generated body")
+        text = (self.root / rel).read_text(encoding="utf-8")
+        self.assertTrue(rel.endswith(".mdc"))
+        self.assertTrue(text.startswith("---"))
+        self.assertIn("alwaysApply: true", text)
+        # Regenerating must not duplicate the frontmatter.
+        tg.write_adapter(self.root, "cursor", "# second body")
+        text2 = (self.root / rel).read_text(encoding="utf-8")
+        self.assertEqual(text2.count("alwaysApply"), 1)
+        self.assertIn("second body", text2)
+
+    def test_adapters_preserve_handwritten_content(self):
+        target = self.root / "CLAUDE.md"
+        target.write_text("# My own notes\n", encoding="utf-8")
+        tg.write_adapter(self.root, "claude", "generated")
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("My own notes", text)
+        self.assertIn("generated", text)
+
+    def test_modern_adapter_paths(self):
+        self.assertEqual(tg.ADAPTERS["cursor"]["path"], ".cursor/rules/contextiq.mdc")
+        self.assertEqual(tg.ADAPTERS["windsurf"]["path"],
+                         ".windsurf/rules/contextiq.md")
+        self.assertEqual(tg.ADAPTERS["gemini"]["path"], "GEMINI.md")
+        for name in ("cline", "roo", "continue", "aider", "codex", "zed"):
+            self.assertIn(name, tg.ADAPTERS)
+        # Legacy formats are still reachable but flagged.
+        self.assertTrue(tg.ADAPTERS["cursor-legacy"]["deprecated"])
+
+    def test_per_host_budgets_differ(self):
+        self.assertNotEqual(tg.adapter_budget("claude", 8000),
+                            tg.adapter_budget("copilot", 8000))
+
+    def test_launch_command_is_consistent(self):
+        cmd = tg.mcp_launch_command()
+        self.assertEqual(cmd["args"][-1], "serve")
+        self.assertTrue(cmd["command"])
+
+
+class QualityGateTests(_RepoCase):
+    """QG-1: answer quality, not just file recall."""
+
+    def _repo(self):
+        _write(self.root, "auth.py",
+               "DEFAULT_TTL = 3600\n\n"
+               "def issue_token(user, ttl=DEFAULT_TTL):\n"
+               "    '''Mint a signed session token.'''\n"
+               "    return {'user': user, 'ttl': ttl}\n")
+
+    def test_answerable_requires_symbols_and_facts(self):
+        self._repo()
+        r = self._index()
+        pack = r.find_relevant_context("mint a signed session token",
+                                       budget_tokens=3000)
+        good = tg.score_pack_answerability(pack, {
+            "expected_symbols": ["auth.issue_token"],
+            "must_contain": ["DEFAULT_TTL"]})
+        self.assertTrue(good["answerable"])
+        self.assertEqual(good["symbol_recall"], 1.0)
+
+        bad = tg.score_pack_answerability(pack, {
+            "expected_symbols": ["auth.issue_token", "auth.nonexistent_helper"],
+            "must_contain": ["A_FACT_NOT_PRESENT_ANYWHERE"]})
+        self.assertFalse(bad["answerable"])
+        self.assertIn("auth.nonexistent_helper", bad["missing_symbols"])
+        self.assertIn("A_FACT_NOT_PRESENT_ANYWHERE", bad["missing_facts"])
+        self.assertLess(bad["symbol_recall"], 1.0)
+
+    def test_benchmark_reports_quality_metrics(self):
+        self._repo()
+        r = self._index()
+        out = tg.run_retrieval_benchmark(r, [{
+            "task": "mint a signed session token",
+            "expected_files": ["auth.py"],
+            "expected_symbols": ["auth.issue_token"],
+            "must_contain": ["DEFAULT_TTL"]}])
+        for key in ("symbol_recall", "answerable_rate", "recall_at_5", "mrr"):
+            self.assertIn(key, out)
+        self.assertEqual(out["answerable_rate"], 1.0)
+
+    def test_threshold_gate_flags_regressions(self):
+        ok = tg.check_benchmark_thresholds(
+            {"recall_at_5": 1.0, "symbol_recall": 1.0, "answerable_rate": 1.0,
+             "irrelevant_token_ratio": 0.1})
+        self.assertTrue(ok["ok"])
+        bad = tg.check_benchmark_thresholds(
+            {"recall_at_5": 0.1, "symbol_recall": 0.1, "answerable_rate": 0.0,
+             "irrelevant_token_ratio": 0.99})
+        self.assertFalse(bad["ok"])
+        self.assertEqual(len(bad["failures"]), 4)
+        # irrelevant_token_ratio is a ceiling, the rest are floors.
+        directions = {f["metric"]: f["direction"] for f in bad["failures"]}
+        self.assertEqual(directions["irrelevant_token_ratio"], "max")
+        self.assertEqual(directions["recall_at_5"], "min")
+
+    def test_fixture_corpora_are_discovered(self):
+        repo_root = Path(tg.__file__).resolve().parent
+        corpora = tg.discover_corpora(repo_root)
+        self.assertTrue(corpora, "no benchmark corpora found")
+        for c in corpora:
+            data = json.loads(c.read_text(encoding="utf-8"))
+            self.assertTrue(data.get("cases"), f"{c} has no cases")
+            for case in data["cases"]:
+                self.assertTrue(case.get("task"))
+                self.assertTrue(case.get("expected_files"))
+
+    def test_corpus_is_large_enough_and_multi_repo(self):
+        """The old corpus was 10 self-referential cases; that proved nothing."""
+        repo_root = Path(tg.__file__).resolve().parent
+        corpora = tg.discover_corpora(repo_root)
+        total = sum(len(json.loads(c.read_text(encoding="utf-8"))["cases"])
+                    for c in corpora)
+        self.assertGreaterEqual(total, 50,
+                                f"quality corpus too small ({total} cases)")
+        self.assertGreaterEqual(len(corpora), 3,
+                                "quality gate must span multiple repositories")
 
 
 if __name__ == "__main__":
