@@ -43,9 +43,9 @@ docker run --rm -v "$PWD:/repo" -w /repo contextiq context "the task"
 
 The `[all]` extra pulls `tree-sitter-language-pack` (deep parsing for all 25+ languages),
 `fastmcp` (MCP `serve`), `tiktoken` (accurate token counts), and `sentence-transformers`.
-Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`, `[ann]`, and
-`[dashboard]`. With zero extras the
-single file still runs the full CLI (regex parsing + heuristic token counts).
+Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`, and `[ann]`.
+With zero extras the single file still runs the full CLI (regex parsing +
+heuristic token counts).
 
 Set `TOKENGRAPH_OFFLINE=1` to disable remote configuration loading and optional
 neural-model loading. The deterministic hash embedding remains available. For large
@@ -561,7 +561,7 @@ For the hallucination-guard's effect, run `python tokengraph_all.py grounding` (
 
 Use these repo assets to keep GHCP and Claude Code focused and avoid large token consumption:
 
-- [TokenEfficiency.md](TokenEfficiency.md) — full guide with context strategy, anti-patterns, checklists, and measurable savings workflows.
+- [docs/TokenEfficiency.md](docs/TokenEfficiency.md) — full guide with context strategy, anti-patterns, checklists, and measurable savings workflows.
 - [.prompts/bug-fix.md](.prompts/bug-fix.md) — minimal-context bug fixing template.
 - [.prompts/code-review.md](.prompts/code-review.md) — risk-first review template.
 - [.prompts/test-generation.md](.prompts/test-generation.md) — targeted test creation template.
@@ -594,4 +594,3 @@ Suggested daily flow:
 | `.context/usage.ndjson` | Per-run metric log (timestamp + reduction %) read by `health` / `status` |
 
 Generated on demand (not committed): `ide-plugins/` (`ide-plugin`), distribution kit + `PUBLISHING.md` (`dist`), and per-assistant context files (`generate`).
-=======

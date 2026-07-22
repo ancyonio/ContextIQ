@@ -9,7 +9,7 @@
             "shell": "bash",
             "async": true,
             "statusMessage": "Refreshing code graph",
-            "command": "python \"d:/05. TECHNICAL/ContextIQ/tokengraph_all.py\" --path \"${CLAUDE_PROJECT_DIR:-.}\" index >/dev/null 2>&1 || true"
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/tokengraph_all.py\" --path \"${CLAUDE_PROJECT_DIR:-.}\" index >/dev/null 2>&1 || true"
           }
         ]
       }
