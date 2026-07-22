@@ -9976,6 +9976,39 @@ def report_to_csv(rep: dict) -> str:
     return buf.getvalue()
 
 
+def append_report_csv(path: Path, csv_text: str) -> int:
+    """Append a report's data rows to a cumulative CSV, header written once.
+
+    `report --csv` overwrites, which is right for a snapshot but loses history
+    when you re-run a task list over time. Appending keeps one growing sheet:
+    the header goes in when the file is created, later runs contribute rows
+    only. Returns how many data rows were added.
+    """
+    path = Path(path)
+    lines = [ln for ln in csv_text.splitlines() if ln.strip()]
+    if not lines:
+        return 0
+    header, rows = lines[0], lines[1:]
+    existing = path.exists() and path.stat().st_size > 0
+    body = "\n".join(rows if existing else lines)
+    with path.open("a", encoding="utf-8", newline="") as fh:
+        fh.write(body + "\n")
+    return len(rows)
+
+
+def append_report_markdown(path: Path, md: str, tasks: int,
+                           stamp: str | None = None) -> None:
+    """Append one timestamped run section to a cumulative markdown log."""
+    import datetime as _dt
+    path = Path(path)
+    stamp = stamp or _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    head = "" if (path.exists() and path.stat().st_size) else \
+        "# ContextIQ savings report (running log)\n\n"
+    plural = "task" if tasks == 1 else "tasks"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{head}## Run {stamp} ({tasks} {plural})\n\n{md.rstrip()}\n\n")
+
+
 def _collect_tasks(args) -> list[str]:
     tasks = list(args.tasks or [])
     if args.tasks_file:
@@ -9998,15 +10031,24 @@ def cmd_report(args):
     try:
         rep = r.report(tasks, budget_tokens=args.budget, expand_depth=args.depth)
         md = report_to_markdown(rep)
+        append = getattr(args, "append", False)
         if args.out:
-            Path(args.out).write_text(md, encoding="utf-8")
-            print(f"wrote {args.out} ({rep['aggregate']['tasks']} task(s), "
-                  f"{rep['aggregate']['savings_pct_overall']}% fewer overall)")
+            if append:
+                append_report_markdown(Path(args.out), md, len(tasks))
+                print(f"appended a run section to {args.out}")
+            else:
+                Path(args.out).write_text(md, encoding="utf-8")
+                print(f"wrote {args.out} ({rep['aggregate']['tasks']} task(s), "
+                      f"{rep['aggregate']['savings_pct_overall']}% fewer overall)")
         else:
             print(md)
         if args.csv:
-            Path(args.csv).write_text(report_to_csv(rep), encoding="utf-8")
-            print(f"wrote {args.csv}")
+            if append:
+                n = append_report_csv(Path(args.csv), report_to_csv(rep))
+                print(f"appended {n} row(s) to {args.csv}")
+            else:
+                Path(args.csv).write_text(report_to_csv(rep), encoding="utf-8")
+                print(f"wrote {args.csv}")
     finally:
         r.close()
 
@@ -10625,6 +10667,9 @@ def build_parser():
     rp.add_argument("-d", "--depth", type=int, default=1)
     rp.add_argument("-o", "--out", default=None, help="write the markdown report to a file")
     rp.add_argument("--csv", default=None, help="also write a per-task CSV to this path")
+    rp.add_argument("--append", action="store_true",
+                    help="accumulate instead of overwriting: append rows to --csv "
+                         "(header written once) and a timestamped run section to -o")
     rp.set_defaults(func=cmd_report)
 
     sub.add_parser("stats").set_defaults(func=cmd_stats)

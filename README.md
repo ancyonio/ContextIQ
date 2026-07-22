@@ -84,6 +84,7 @@ python tokengraph_all.py callers my.module.func        # who calls it
 python tokengraph_all.py callees my.module.func        # what it calls
 python tokengraph_all.py measure "add retry logic"     # token savings vs whole files
 python tokengraph_all.py report --tasks-file tasks.txt -o report.md --csv report.csv  # aggregate with/without report
+python tokengraph_all.py report --tasks-file tasks.txt --csv runs.csv --append        # same, accumulated across runs
 python tokengraph_all.py gain                           # realized savings from the ledger (tokens + $)
 python tokengraph_all.py gain --since 30d --all         # window + daily/weekly/monthly trends
 python tokengraph_all.py gain --report                  # per-workspace dashboard -> .tokengraph/token-usage.html

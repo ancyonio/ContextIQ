@@ -505,6 +505,10 @@ representative set of tasks, use `report`:
 
 ```bash
 python tokengraph_all.py report --tasks-file tasks.txt -o report.md --csv report.csv
+
+# --append accumulates instead of overwriting: the CSV header is written once
+# and each run adds its rows, while -o becomes a timestamped running log.
+python tokengraph_all.py report --tasks-file tasks.txt -o runs.md --csv runs.csv --append
 ```
 
 - `tasks.txt` is one task per line (`#` comments allowed); you can also pass

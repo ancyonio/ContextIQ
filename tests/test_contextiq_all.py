@@ -294,6 +294,38 @@ class IndexerTests(unittest.TestCase):
         finally:
             ret.close()
 
+    def test_report_append_accumulates_across_runs(self):
+        """`report --append` keeps one growing sheet instead of overwriting.
+
+        Replaces report_append.ps1 (Windows-only) with something that works on
+        every platform: header once, rows appended, markdown as a run log.
+        """
+        csv_path = self.root / "runs.csv"
+        md_path = self.root / "runs.md"
+        first = "task,tokens_saved\nalpha,10\n"
+        second = "task,tokens_saved\nbeta,20\n"
+
+        self.assertEqual(tg.append_report_csv(csv_path, first), 1)
+        self.assertEqual(tg.append_report_csv(csv_path, second), 1)
+        lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(lines, ["task,tokens_saved", "alpha,10", "beta,20"])
+
+        tg.append_report_markdown(md_path, "body one", 1, stamp="2026-01-01 00:00:00")
+        tg.append_report_markdown(md_path, "body two", 3, stamp="2026-01-02 00:00:00")
+        log = md_path.read_text(encoding="utf-8")
+        self.assertEqual(log.count("# ContextIQ savings report (running log)"), 1)
+        self.assertIn("## Run 2026-01-01 00:00:00 (1 task)", log)
+        self.assertIn("## Run 2026-01-02 00:00:00 (3 tasks)", log)
+        self.assertLess(log.index("body one"), log.index("body two"))
+
+    def test_report_append_writes_header_into_an_empty_file(self):
+        """A pre-created but empty file must still get the header."""
+        csv_path = self.root / "empty.csv"
+        csv_path.write_text("", encoding="utf-8")
+        tg.append_report_csv(csv_path, "task,tokens_saved\nalpha,10\n")
+        self.assertEqual(csv_path.read_text(encoding="utf-8").strip().splitlines(),
+                         ["task,tokens_saved", "alpha,10"])
+
     def test_import_aware_resolution(self):
         _write(self.root, "lib.py", "def shared():\n    return 1\n")
         _write(self.root, "other.py", "def shared():\n    return 2\n")
