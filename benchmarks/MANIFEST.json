@@ -1,0 +1,286 @@
+{
+  "file_count": 56,
+  "dataset_hash": "0443130df021f6f2d1a36a65f07de28a260d9dc264d044996ef2319e31eedbb3",
+  "files": [
+    {
+      "path": "benchmarks/repos/gosvc/cmd/gosvc/main.go",
+      "sha256": "6a412250af6672bdff29a0683fdcc31da6b61ff01e617839cb093e2a72c3e455",
+      "bytes": 5424
+    },
+    {
+      "path": "benchmarks/repos/gosvc/go.mod",
+      "sha256": "931187e8000fafe1bde918656a64ce2b721e130d4c31d116edbab4d02c9797a2",
+      "bytes": 22
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/breaker/breaker.go",
+      "sha256": "177fb536541f787f936350e59d6c98d503a8973309618d4db4e5a7f208af6fa5",
+      "bytes": 5721
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/config/config.go",
+      "sha256": "dc15b05b4cf7ce08ec07b8193e2db89774210a089497bed0f8e45a14aad2e49f",
+      "bytes": 6437
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/consumer/consumer.go",
+      "sha256": "01c6adc7ae06963b8508d202b34770655f3ccc87bb9e920c74a205433c0f8b01",
+      "bytes": 7514
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/logging/logger.go",
+      "sha256": "7cd6fd46413ce729cbd6ab24187b99ee9ed4647c28df62703661bdca3e3b1a24",
+      "bytes": 4355
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/pool/pool.go",
+      "sha256": "0549406b23643690fcdfd4e80f8a992f80c14269d57bc917aa62f67f4c9ffbe7",
+      "bytes": 5587
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/server/handlers.go",
+      "sha256": "3ce46f09dbb03863101d79888aa2c67a1aec933d095f075096c58eeec08bf29a",
+      "bytes": 6540
+    },
+    {
+      "path": "benchmarks/repos/gosvc/internal/store/store.go",
+      "sha256": "7ef855c99363158413bc2444edcb798ec59d512f77d4f49124405f97a36ec42d",
+      "bytes": 6104
+    },
+    {
+      "path": "benchmarks/repos/gosvc/judge.json",
+      "sha256": "abb050e9c1c42c6abb8e7c631e2e40e2d74b9dad86c9f4244f5377f3a60133ba",
+      "bytes": 19654
+    },
+    {
+      "path": "benchmarks/repos/gosvc/tasks.json",
+      "sha256": "086593cc738708bbd1eff92972adf053dfb79c5f6dd54f72f61d280c08beb9d6",
+      "bytes": 6547
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/api/handlers.py",
+      "sha256": "85d9634a27fda8c6d7bc7c0ad2b0c1c97b6fb1946d736a7820e8a802e5bc11d2",
+      "bytes": 10083
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/config.py",
+      "sha256": "fec7502b691261fc69550cbc40334ffd533ee2eb06be0b9a53ddcaba1131210f",
+      "bytes": 4902
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/main.py",
+      "sha256": "2915f2d0dc4dd80883d56086347e0a3597bc5f55aa89813d628a85a1aa8b6c13",
+      "bytes": 3593
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/models.py",
+      "sha256": "43fb7d51ca56770999cc391b43a9171f18fb647912fb0ff899093c373c8b5ca5",
+      "bytes": 4604
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/orders/state_machine.py",
+      "sha256": "f815d7259ec191239b7d4607977758dac4ba98df7c9ee8cbe64dd9e510f217c7",
+      "bytes": 5340
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/payments/gateway.py",
+      "sha256": "8c0d583c0dbe7a2eac8a619838a571e083ee46aae630121fcfb8d9d130c74e62",
+      "bytes": 8946
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/pricing/rules.py",
+      "sha256": "46c80ce2ab2d447e5ff8c1bb9ff26c12f70e3714d5303567b072bcbd5d528e85",
+      "bytes": 5694
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/storage/repository.py",
+      "sha256": "5e3eb79ac26818fe72bebf5649036a4aa10aa0037c882e3a86ce8a8f75c7828f",
+      "bytes": 7608
+    },
+    {
+      "path": "benchmarks/repos/pyshop/app/workers/fulfillment.py",
+      "sha256": "7dbaa607ae1d3f3dd3d099418b4f20a6a42cba33fe330cb766733d78cc755006",
+      "bytes": 7211
+    },
+    {
+      "path": "benchmarks/repos/pyshop/judge.json",
+      "sha256": "30719de0dbb8b12aa7ed4641cbee402dbef3870313aad39431a58a84c499a450",
+      "bytes": 17973
+    },
+    {
+      "path": "benchmarks/repos/pyshop/tasks.json",
+      "sha256": "2717335a2c6845db68caa27cbc0805afbd6765abadc95770ec8b989852033acc",
+      "bytes": 6950
+    },
+    {
+      "path": "benchmarks/repos/tsapi/judge.json",
+      "sha256": "34873ce716c16a0deaaecd0e4d12aa4218ec17e09d68709c06c77f26df9de43f",
+      "bytes": 19005
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/auth.ts",
+      "sha256": "c0779b986542e819bc8973dcfab7b974635722094824345ea6d74ea9f07fdd91",
+      "bytes": 6165
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/config.ts",
+      "sha256": "116e87a4606b974e5f9957d5b40d5c2d0639c6d4f28a7229c58d3c738b910ff9",
+      "bytes": 4768
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/db.ts",
+      "sha256": "3a747783fe4a84a0d08fdcd567980a96696a288cfa1123075bf45b239410f0cd",
+      "bytes": 6174
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/notifications.ts",
+      "sha256": "e20c2c3ea9787304c96fe3ebe76225f0f5a4d32ce65901eb3ef49afeb90b167e",
+      "bytes": 7399
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/rateLimiter.ts",
+      "sha256": "f6515e0f1d3444148b686a08e50fa6c7998d844d6751cdaa947b2333fb581d1d",
+      "bytes": 5200
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/router.ts",
+      "sha256": "b04ba7a64ae3efc00f484a6fb224cec48b194088ea6a61783c4facbccfd93d43",
+      "bytes": 6254
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/routes.ts",
+      "sha256": "f19b60833339b2b236114c3fbedb2f0cd8e67519a4d148e78d8e37e8c18c358c",
+      "bytes": 5740
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/server.ts",
+      "sha256": "5c610a3a41c7e5c5f86d05b08219ad12dc281eb937b95f3f0511588ca287d313",
+      "bytes": 4404
+    },
+    {
+      "path": "benchmarks/repos/tsapi/src/validation.ts",
+      "sha256": "9a3706654b24cf48cad5d01d730b46f4c5013961128fe256d19184bcd0e0c1ac",
+      "bytes": 6864
+    },
+    {
+      "path": "benchmarks/repos/tsapi/tasks.json",
+      "sha256": "a2891011618cd5c410212ef6e565a0093cca2f1928d09290f4dc8bc03249b8f7",
+      "bytes": 6286
+    },
+    {
+      "path": "benchmarks/retrieval_tasks.json",
+      "sha256": "7b10759c4b0773593c44af27a8c47003aaef0f43cbd514bcca2f9662c6e07229",
+      "bytes": 11025
+    },
+    {
+      "path": "benchmarks/testmap/calc.py",
+      "sha256": "680df8de3e5c095d92660cec6dbc7bc25af0ccd1151d6666441cca6f1d19a725",
+      "bytes": 34
+    },
+    {
+      "path": "benchmarks/testmap/helpers.py",
+      "sha256": "74fdc1870876ca7c53c4ee504c1e6a0aa091c3c094b08e40b262c5c332ac4eaf",
+      "bytes": 55
+    },
+    {
+      "path": "benchmarks/testmap/java/Money.java",
+      "sha256": "e38cf5e0e1931afed558cc270a9102b078b9a0b7440f9e017caa99c5c5cb798c",
+      "bytes": 66
+    },
+    {
+      "path": "benchmarks/testmap/java/MoneyTest.java",
+      "sha256": "ee4b48c2ecf29f36166432546b437eb9f8486318cde91f86bbb96386685b72d2",
+      "bytes": 52
+    },
+    {
+      "path": "benchmarks/testmap/orders.py",
+      "sha256": "1806f649b0ebf2bbd6304ab18ad1a64891b2676b2062d329952f9087c5750dfb",
+      "bytes": 62
+    },
+    {
+      "path": "benchmarks/testmap/orders_test.py",
+      "sha256": "b2b401773528eb6596c389cdb134cd14bd48726105a76a4234a3060e84abe17c",
+      "bytes": 86
+    },
+    {
+      "path": "benchmarks/testmap/pairs.json",
+      "sha256": "c88ee53e9e69cadc5524ac561aa8d59d40e80f4a0d75c2bb8008d6750211937b",
+      "bytes": 1204
+    },
+    {
+      "path": "benchmarks/testmap/pkg/cache/cache.go",
+      "sha256": "dd9874eb093772e2c1f784ea00364639ead75e25d3abf31d4af99ddbfd827f12",
+      "bytes": 111
+    },
+    {
+      "path": "benchmarks/testmap/pkg/cache/cache_test.go",
+      "sha256": "ce48c194807c0715ff03e6fe3cbf0acea4e69b473f29fba549a2661a8ce9d255",
+      "bytes": 82
+    },
+    {
+      "path": "benchmarks/testmap/pkg/queue/queue.go",
+      "sha256": "e1722df496d9bc2845b2ae0738678a4917784a52d5c2dc962b3f806a1ff14fd8",
+      "bytes": 115
+    },
+    {
+      "path": "benchmarks/testmap/pkg/queue/queue_test.go",
+      "sha256": "d8c3d88c5d4670d7ca4a73f0bc20ce86dc6df28f7fe3481187ac4ce31ca9d243",
+      "bytes": 95
+    },
+    {
+      "path": "benchmarks/testmap/pricing.py",
+      "sha256": "b03199ecf4ed86716df3de03ad424d3aa0b3b368beac61f135c0fda0388faa10",
+      "bytes": 57
+    },
+    {
+      "path": "benchmarks/testmap/src/__tests__/user.spec.ts",
+      "sha256": "496e761bff8efd2d413a2fa9e7a31dae941d02d8d5d0085406d4b8a58de5023b",
+      "bytes": 95
+    },
+    {
+      "path": "benchmarks/testmap/src/auth.test.ts",
+      "sha256": "f36b6a1346a7f65c5cd51a9c279979772e2c058701e305d64be77b90de482d10",
+      "bytes": 91
+    },
+    {
+      "path": "benchmarks/testmap/src/auth.ts",
+      "sha256": "bdaf13eb66e5c7fb46fc726366ddc1c8c2f438e49e1b0cf85f08f2f450b6d557",
+      "bytes": 72
+    },
+    {
+      "path": "benchmarks/testmap/src/parse.spec.ts",
+      "sha256": "0b43325197f42bfd53540f5175369be8b380dc5dc55bd3a12b30a5eb8ed1f4dc",
+      "bytes": 96
+    },
+    {
+      "path": "benchmarks/testmap/src/parse.ts",
+      "sha256": "e3abc98c63b2cd6d1e5bffd711f9d60bb637bf9cb79d60b27398d5d56055ea32",
+      "bytes": 74
+    },
+    {
+      "path": "benchmarks/testmap/src/user.ts",
+      "sha256": "38dcc9c31d877fac21ab3dae4773b12abd55c656aeffe46de25bf6a6c54d866f",
+      "bytes": 59
+    },
+    {
+      "path": "benchmarks/testmap/strutil.py",
+      "sha256": "4c0f9bae2c854483e3e275784b2049c00ca4e1ea102360bf92809b1d55cb772b",
+      "bytes": 65
+    },
+    {
+      "path": "benchmarks/testmap/tests/test_calc.py",
+      "sha256": "e0c3228b133f9a02054325f2548619c6eb6a83defd615327328715e56b54b5f6",
+      "bytes": 68
+    },
+    {
+      "path": "benchmarks/testmap/tests/test_pricing_rules.py",
+      "sha256": "5794c7bb70d40eaad9a4bed957a3ef43794827bb533a8c0bd5b2b246586254f7",
+      "bytes": 91
+    },
+    {
+      "path": "benchmarks/testmap/tests/test_strutil.py",
+      "sha256": "b6efd7c76fb2c0a5189f5c1368a5b4b672705d06add90c0cb5ec2474d5e4f192",
+      "bytes": 85
+    }
+  ]
+}

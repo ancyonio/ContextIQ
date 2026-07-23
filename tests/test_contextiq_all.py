@@ -3397,6 +3397,335 @@ class JetBrainsNvimTests(_RepoCase):
         self.assertIn("return M", text)
 
 
+class NamedToolTests(unittest.TestCase):
+    """Dedicated named tools: get_method_impact + get_architecture_overview."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+        _write(self.root, "mod.py", SAMPLE)
+        tg.index_repo(self.root, self.db)
+        self.ret = tg.Retriever(self.root, self.db)
+
+    def tearDown(self):
+        self.ret.close()
+        self._tmp.cleanup()
+
+    def test_method_impact_reports_callers(self):
+        # helper() is called by Greeter.greet() -> it must appear as a caller.
+        imp = self.ret.get_method_impact("mod.helper")
+        self.assertTrue(imp["found"])
+        self.assertEqual(imp["kind"], "function")
+        callers = [c["symbol"] for c in imp["callers"]]
+        self.assertIn("mod.Greeter.greet", callers)
+        # every caller carries a concrete call site
+        self.assertTrue(all("file" in c and "line" in c for c in imp["callers"]))
+        self.assertIn("blast_radius", imp)
+        self.assertIn("blast_radius_reliable", imp)
+
+    def test_method_impact_reports_callees(self):
+        imp = self.ret.get_method_impact("mod.Greeter.greet")
+        callees = [c["symbol"] for c in imp["callees"]]
+        self.assertIn("mod.helper", callees)
+
+    def test_method_impact_missing_symbol_suggests(self):
+        imp = self.ret.get_method_impact("mod.helpr")   # typo
+        self.assertFalse(imp["found"])
+        self.assertIn("did_you_mean", imp)
+
+    def test_architecture_overview_composes_everything(self):
+        a = self.ret.get_architecture_overview()
+        self.assertGreaterEqual(a["totals"]["files"], 1)
+        self.assertGreaterEqual(a["totals"]["symbols"], 3)
+        self.assertIn("modules", a)
+        self.assertTrue(any(m["module"] == "." for m in a["modules"]))
+        self.assertTrue(any(L["language"] == "python" for L in a["languages"]))
+        for key in ("hubs", "cycles", "routes_total", "routes"):
+            self.assertIn(key, a)
+
+
+class TestDiscoveryTests(unittest.TestCase):
+    """get_test_map + the F1-benchmarked impl<->test mapping."""
+
+    def test_is_test_path_conventions(self):
+        for p in ("tests/test_calc.py", "orders_test.py", "src/auth.test.ts",
+                  "src/parse.spec.ts", "java/MoneyTest.java",
+                  "pkg/cache/cache_test.go", "src/__tests__/user.spec.ts"):
+            self.assertTrue(tg.is_test_path(p), p)
+        for p in ("calc.py", "src/auth.ts", "pkg/cache/cache.go",
+                  "java/Money.java"):
+            self.assertFalse(tg.is_test_path(p), p)
+
+    def test_build_test_map_cross_language(self):
+        files = ["calc.py", "tests/test_calc.py", "orders.py", "orders_test.py",
+                 "pkg/cache/cache.go", "pkg/cache/cache_test.go",
+                 "src/auth.ts", "src/auth.test.ts", "src/user.ts",
+                 "src/__tests__/user.spec.ts", "java/Money.java",
+                 "java/MoneyTest.java", "helpers.py"]
+        m = tg.build_test_map(files)
+        self.assertEqual(m["impl_to_tests"]["calc.py"], ["tests/test_calc.py"])
+        self.assertEqual(m["impl_to_tests"]["orders.py"], ["orders_test.py"])
+        self.assertEqual(m["impl_to_tests"]["pkg/cache/cache.go"],
+                         ["pkg/cache/cache_test.go"])
+        self.assertEqual(m["impl_to_tests"]["src/user.ts"],
+                         ["src/__tests__/user.spec.ts"])
+        self.assertEqual(m["impl_to_tests"]["java/Money.java"],
+                         ["java/MoneyTest.java"])
+        self.assertIn("helpers.py", m["untested_impls"])   # not force-paired
+
+    def test_f1_on_labeled_corpus(self):
+        corpus = Path(tg.__file__).resolve().parent / "benchmarks" / "testmap"
+        if not (corpus / "pairs.json").exists():
+            self.skipTest("labeled test-discovery corpus not present")
+        gold = json.loads((corpus / "pairs.json").read_text(
+            encoding="utf-8"))["pairs"]
+        files = [p.relative_to(corpus).as_posix()
+                 for p in sorted(corpus.rglob("*"))
+                 if p.is_file() and p.name != "pairs.json"]
+        res = tg.test_discovery_f1(files, gold)
+        # Naming heuristic: perfect precision, one honest miss (name-divergent pair)
+        self.assertEqual(res["precision"], 1.0)
+        self.assertGreaterEqual(res["f1"], 0.90)
+        self.assertGreaterEqual(res["hit_at_1"], 0.85)
+
+    def test_get_test_map_symbol_recovers_via_call_graph(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            db = root / ".tokengraph" / "graph.db"
+            _write(root, "pricing.py",
+                   "def discount(price, pct):\n    return price * (1 - pct)\n")
+            # test name diverges from impl stem -> naming can't link it,
+            # but the import+call creates a real edge the map should use.
+            _write(root, "tests/test_pricing_rules.py",
+                   "from pricing import discount\n\n"
+                   "def test_discount():\n    assert discount(100, 0.1) == 90\n")
+            tg.index_repo(root, db)
+            r = tg.Retriever(root, db)
+            try:
+                tm = r.get_test_map("pricing.discount")
+                self.assertEqual(tm["tests_by_name"], [])
+                self.assertIn("tests/test_pricing_rules.py",
+                              tm["tests_by_call_graph"])
+            finally:
+                r.close()
+
+
+class BenchmarkPublicationTests(unittest.TestCase):
+    """Publish-ready benchmark artifacts (reproducible dataset + metadata)."""
+
+    def _corpus(self, root: Path):
+        _write(root, "benchmarks/testmap/calc.py", "def add(a,b):\n    return a+b\n")
+        _write(root, "benchmarks/testmap/tests/test_calc.py",
+               "from calc import add\n\ndef test_add():\n    assert add(1,2)==3\n")
+        _write(root, "benchmarks/testmap/pairs.json",
+               json.dumps({"pairs": [{"impl": "calc.py",
+                                      "test": "tests/test_calc.py"}]}))
+
+    def test_dataset_manifest_is_deterministic_and_excludes_generated(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            self._corpus(root)
+            _write(root, "benchmarks/REPORT.md", "# generated, must be excluded\n")
+            m1 = tg.dataset_manifest(root)
+            m2 = tg.dataset_manifest(root)
+            self.assertEqual(m1["dataset_hash"], m2["dataset_hash"])   # reproducible
+            paths = {f["path"] for f in m1["files"]}
+            self.assertNotIn("benchmarks/REPORT.md", paths)            # output excluded
+            self.assertIn("benchmarks/testmap/calc.py", paths)        # input included
+
+    def test_build_publication_includes_test_discovery_f1(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            self._corpus(root)
+            pub = tg.build_benchmark_publication(root)
+            self.assertIsNotNone(pub["test_discovery"])
+            self.assertEqual(pub["test_discovery"]["f1"], 1.0)        # clean pair
+            self.assertIn("dataset_hash", pub["dataset"])
+
+    def test_report_and_metadata_render(self):
+        pub = {"retrieval": {"recall_at_5": 0.97, "queries": 96, "corpora": 4},
+               "test_discovery": {"f1": 0.9474, "precision": 1.0, "recall": 0.9,
+                                  "hit_at_1": 0.9, "gold_pairs": 10,
+                                  "true_positives": 9, "false_positives": 0,
+                                  "false_negatives": 1},
+               "dataset": {"dataset_hash": "abc123", "file_count": 21},
+               "environment": {"extractor_version": "3:x", "python": "3.12"}}
+        md = tg.render_benchmark_report_md(pub, generated_at="2026-07-23")
+        self.assertIn("F1", md)
+        self.assertIn("0.9474", md)
+        self.assertIn("abc123", md)
+        z = tg.zenodo_metadata(pub, version="1.0.0", creator="Tester")
+        self.assertEqual(z["upload_type"], "dataset")
+        self.assertEqual(z["creators"][0]["name"], "Tester")
+        self.assertIn("dataset_hash=abc123", z["notes"])
+        self.assertIn("cff-version", tg.citation_cff())
+
+
+class IdeCompletenessTests(unittest.TestCase):
+    """One-command IDE completeness: MCP wiring + steering rules + verify."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _write(self.root, "mod.py", SAMPLE)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_write_ide_rules_emits_editor_rule_files(self):
+        written = tg.write_ide_rules(self.root, editors=["cursor", "vscode",
+                                                         "windsurf"])
+        self.assertIn(".cursor/rules/contextiq.mdc", written)
+        self.assertIn(".github/copilot-instructions.md", written)
+        self.assertIn(".windsurf/rules/contextiq.md", written)
+        for rel in written:
+            self.assertTrue((self.root / rel).exists())
+
+    def test_verify_reports_not_ready_before_setup(self):
+        rows = {r["editor"]: r for r in
+                tg.verify_ide_wiring(self.root, editors=["cursor", "vscode"])}
+        self.assertFalse(rows["cursor"]["ready"])
+        self.assertFalse(rows["vscode"]["ready"])
+
+    def test_verify_reports_ready_after_mcp_and_rules(self):
+        tg.ide_setup(self.root, editors=["cursor", "vscode"])
+        tg.write_ide_rules(self.root, editors=["cursor", "vscode"])
+        rows = {r["editor"]: r for r in
+                tg.verify_ide_wiring(self.root, editors=["cursor", "vscode"])}
+        self.assertTrue(rows["cursor"]["ready"], rows["cursor"])
+        self.assertTrue(rows["vscode"]["ready"], rows["vscode"])
+        self.assertEqual(rows["cursor"]["mcp_scope"], "project")
+
+    def test_verify_windsurf_mcp_is_per_user_scope(self):
+        # Windsurf reads MCP only from a per-user path; verify must say so
+        # rather than pretend a project file wires it.
+        tg.write_ide_rules(self.root, editors=["windsurf"])
+        row = tg.verify_ide_wiring(self.root, editors=["windsurf"])[0]
+        self.assertTrue(row["rules_present"])          # rules ARE project-local
+        self.assertTrue(row["mcp_scope"].startswith("per-user"))
+
+
+class DocCommentTests(unittest.TestCase):
+    """Cross-language doc-comment extraction feeds signature + embedding text."""
+
+    def test_strip_comment_markers_across_styles(self):
+        cases = {
+            "// godoc line": "godoc line",
+            "/// rustdoc line": "rustdoc line",
+            "//! rust inner": "rust inner",
+            " * javadoc star line": "javadoc star line",
+            "# python/ruby/bash": "python/ruby/bash",
+            "-- haskell/lua/sql": "haskell/lua/sql",
+            "/// <summary>C# xml doc</summary>": "C# xml doc",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(tg._strip_comment_markers(raw), want, raw)
+
+    def test_clean_doc_comment_summarises_block(self):
+        # A JSDoc block: fences stripped, first paragraph kept, @param dropped.
+        raw = ("/**\n"
+               " * Compute the retry backoff in milliseconds.\n"
+               " *\n"
+               " * @param n the attempt number\n"
+               " * @returns the delay\n"
+               " */")
+        self.assertEqual(tg._clean_doc_comment(raw),
+                         "Compute the retry backoff in milliseconds.")
+
+    def test_clean_doc_comment_is_bounded(self):
+        raw = "// " + "word " * 200
+        self.assertLessEqual(len(tg._clean_doc_comment(raw)),
+                             tg.DOC_COMMENT_MAX_CHARS + 1)  # +1 for the ellipsis
+
+    def test_generic_leading_doc_scans_upward(self):
+        lines = ["# not adjacent", "", "-- describes the thing below",
+                 "-- second line", "def thing():"]
+        self.assertEqual(tg._generic_leading_doc(lines, 5),
+                         "describes the thing below second line")
+        # a blank line breaks contiguity, so the far comment is not attached
+        self.assertNotIn("not adjacent", tg._generic_leading_doc(lines, 5))
+
+    def _js_profile(self):
+        return tg.build_profiles().get(".js")
+
+    def test_treesitter_doc_comment_is_captured(self):
+        prof = self._js_profile()
+        if prof is None:
+            self.skipTest("no JavaScript tree-sitter grammar installed")
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            p = _write(root, "a.js",
+                       "/**\n * Compute exponential backoff delay.\n"
+                       " * @param n attempt\n */\n"
+                       "function f1(n){ return n; }\n")
+            res = tg.parse_treesitter(root, p, prof)
+            docs = {s.name: s.docstring for s in res.symbols}
+            self.assertEqual(docs.get("f1"), "Compute exponential backoff delay.")
+
+    def test_doc_comment_feeds_semantic_retrieval(self):
+        """A query matching only the doc comment (not the identifier) still hits."""
+        prof = self._js_profile()
+        if prof is None:
+            self.skipTest("no JavaScript tree-sitter grammar installed")
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            db = root / ".tokengraph" / "graph.db"
+            # identifier is opaque ('f1'); the meaning lives in the doc comment.
+            _write(root, "a.js",
+                   "/** Compute exponential backoff delay for a retry. */\n"
+                   "function f1(n){ return n; }\n")
+            tg.index_repo(root, db)
+            store = tg.Store(db)
+            try:
+                row = store.symbol_by_qname("a.f1")
+                self.assertIsNotNone(row)
+                self.assertIn("backoff", row["docstring"])
+            finally:
+                store.close()
+            ret = tg.Retriever(root, db)
+            try:
+                hits = ret.semantic_search("exponential backoff retry", limit=5)
+                self.assertTrue(any("f1" in h["qname"] for h in hits),
+                                [h["qname"] for h in hits])
+            finally:
+                ret.close()
+
+
+class RepomixInteropTests(unittest.TestCase):
+    """Export the signature map as a Repomix pack; import a Repomix dump."""
+
+    def _payload(self):
+        return {"markdown": "# sig map\n### a.py\n```py\ndef f(): ...\n```\n",
+                "tokens": 1234, "repo_tokens": 50000,
+                "reduction_pct": 97.5, "files": 7}
+
+    def test_render_repomix_envelope(self):
+        doc = tg.render_repomix(self._payload())
+        for needle in ("<repomix>", "<file_summary>", "<files>",
+                       "CONTEXTIQ_SIGNATURE_MAP.md", "</repomix>"):
+            self.assertIn(needle, doc)
+
+    def test_parse_repomix_xml(self):
+        xml = ('<repomix><files>'
+               '<file path="src/a.go">package a</file>'
+               '<file path="src/b.go">package b</file>'
+               '</files></repomix>')
+        self.assertEqual([p for p, _ in tg.parse_repomix(xml)],
+                         ["src/a.go", "src/b.go"])
+
+    def test_parse_repomix_markdown(self):
+        md = "## File: lib/x.py\n```python\ndef x():\n    return 1\n```\n"
+        blocks = tg.parse_repomix(md)
+        self.assertTrue(blocks and blocks[0][0] == "lib/x.py")
+
+    def test_export_roundtrips_through_import(self):
+        doc = tg.render_repomix(self._payload())
+        blocks = tg.parse_repomix(doc)
+        self.assertEqual([p for p, _ in blocks], ["CONTEXTIQ_SIGNATURE_MAP.md"])
+        self.assertIn("def f()", blocks[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
 

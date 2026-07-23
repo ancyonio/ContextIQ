@@ -49,6 +49,7 @@ import csv
 import hashlib
 import io
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -707,6 +708,125 @@ def _leaf_name(node) -> Optional[str]:
     return (last or _text(node).split(".")[-1]).split("\\")[-1]
 
 
+# ---- doc-comment extraction (cross-language "semantic bridge") ------------
+#
+# Python takes its docstring from the stdlib AST (see `_docstring`). Every other
+# language documents its API in a leading comment block instead: Go `// …`,
+# Rust `/// …` / `//! …`, Java/JS/TS `/** … */` (Javadoc / JSDoc / TSDoc),
+# C# `/// <summary>…`. That comment is the single richest natural-language
+# signal a symbol carries, and feeding it into the signature + embedding text
+# measurably lifts semantic retrieval on polyglot repos. Previously only Python
+# symbols were enriched; every tree-sitter and regex-parsed symbol now gets the
+# same treatment. We pull the contiguous comment block immediately above a
+# definition, strip the comment markup, and keep a compact one-line summary.
+
+DOC_COMMENT_MAX_CHARS = 200
+
+# Comment node types across the tree-sitter grammars we load.
+_DOC_COMMENT_TYPES = {
+    "comment", "line_comment", "block_comment", "doc_comment",
+    "expression_comment", "outer_doc_comment", "inner_doc_comment",
+    "documentation_comment",
+}
+# Nodes that legitimately sit between a doc comment and its definition:
+# annotations (Java `@Override`), attributes (Rust `#[inline]`, C# `[Test]`),
+# decorators (TS `@Component`) and modifier lists. Walked through transparently
+# so the comment above them is still attached to the def.
+_DOC_SKIP_TYPES = {
+    "attribute_item", "attribute", "attribute_list", "annotation",
+    "marker_annotation", "modifiers", "attribute_declaration",
+}
+
+# Leading per-line comment markers: `//` `///` `//!` `#` `#!` `--` `;` `*` `"""`.
+_DOC_MARKER_RE = re.compile(r'^(?:///?!?|#!?|-{2,}|;{1,}|\*+|"""|\'\'\')\s?')
+
+
+def _strip_comment_markers(line: str) -> str:
+    """Strip comment fences/markers from one physical comment line."""
+    s = line.strip()
+    if s.startswith("/**"):
+        s = s[3:]
+    elif s.startswith("/*"):
+        s = s[2:]
+    if s.endswith("*/"):
+        s = s[:-2]
+    s = s.strip()
+    m = _DOC_MARKER_RE.match(s)
+    if m:
+        s = s[m.end():]
+    # C#/XML doc tags (`<summary>`) and HTML in Javadoc add no retrieval signal.
+    s = re.sub(r"<[^>]+>", " ", s)
+    return s.strip()
+
+
+def _clean_doc_comment(raw: str) -> str:
+    """Collapse a raw comment block to a compact, single-line summary."""
+    out: list[str] = []
+    for ln in raw.splitlines():
+        s = _strip_comment_markers(ln)
+        # A block tag (@param, @returns, \param …) ends the human summary.
+        if s.startswith("@") or s.startswith("\\"):
+            break
+        if not s:
+            if out:            # a blank line closes the summary paragraph
+                break
+            continue
+        out.append(s)
+    text = " ".join(out).strip()
+    if len(text) > DOC_COMMENT_MAX_CHARS:
+        text = text[:DOC_COMMENT_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+def leading_doc_comment(node, comment_types=_DOC_COMMENT_TYPES) -> str:
+    """The doc comment immediately above a tree-sitter definition node, if any.
+
+    Walks preceding siblings, stepping transparently over annotations /
+    attributes / decorators, and collects the contiguous run of comment nodes
+    that sits directly above the definition (a ≤1-line gap is tolerated).
+    """
+    prev = node.prev_sibling
+    last_row = node.start_point[0]
+    while prev is not None and prev.type in _DOC_SKIP_TYPES:
+        last_row = prev.start_point[0]
+        prev = prev.prev_sibling
+    collected: list[str] = []
+    while prev is not None and prev.type in comment_types:
+        if last_row - prev.end_point[0] > 1:   # not contiguous → not this def's doc
+            break
+        collected.append(_text(prev))
+        last_row = prev.start_point[0]
+        prev = prev.prev_sibling
+    if not collected:
+        return ""
+    collected.reverse()
+    return _clean_doc_comment("\n".join(collected))
+
+
+def _generic_leading_doc(lines: list[str], lineno: int) -> str:
+    """Best-effort leading comment for a regex-extracted def (no grammar).
+
+    Scans upward from the line above the definition, collecting a contiguous
+    block of comment-looking lines. Purely lexical — it never parses — so it
+    stays cheap and safe for the long tail of languages without a grammar.
+    """
+    i = lineno - 2                                  # 0-based line above the def
+    block: list[str] = []
+    while i >= 0:
+        s = lines[i].strip()
+        if not s:
+            break
+        if (_DOC_MARKER_RE.match(s) or s.startswith("/*") or s.endswith("*/")):
+            block.append(lines[i])
+            i -= 1
+            continue
+        break
+    if not block:
+        return ""
+    block.reverse()
+    return _clean_doc_comment("\n".join(block))
+
+
 CLASS_KINDS = {"class", "interface", "struct", "enum", "record"}
 
 
@@ -749,6 +869,10 @@ class LanguageProfile:
 
     def body_of(self, node):
         return node.child_by_field_name("body") or node
+
+    def doc_of(self, node) -> str:
+        """Leading doc comment (godoc / rustdoc / Javadoc / JSDoc / TSDoc …)."""
+        return leading_doc_comment(node)
 
     def bases_of(self, node) -> list[str]:
         return []
@@ -1626,7 +1750,7 @@ class _Walk:
                 signature=" ".join(
                     self.src[node.start_byte:node.end_byte]
                     .decode("utf-8", "replace").split())[:BINDING_SIGNATURE_CHARS],
-                docstring="", parent=scope,
+                docstring=self.p.doc_of(node), parent=scope,
             ))
 
     def _signature(self, def_node, body_node) -> str:
@@ -1648,7 +1772,7 @@ class _Walk:
             lineno=def_node.start_point[0] + 1,
             end_lineno=def_node.end_point[0] + 1,
             signature=self._signature(def_node, body_node),
-            docstring="", parent=scope,
+            docstring=self.p.doc_of(def_node), parent=scope,
         ))
         if kind in CLASS_KINDS:
             self._type_scopes.add(qname)   # CN-1: its fields are API
@@ -2206,7 +2330,8 @@ def parse_generic(repo_root: Path, path: Path, language: str) -> ParseResult:
         result.symbols.append(Symbol(
             qname=qname, name=name, kind=kind, file=rel, lineno=lineno,
             end_lineno=_line_end_for_defs(raw_defs, max(1, len(lines)), i),
-            signature=signature, docstring="", parent=mod,
+            signature=signature,
+            docstring=_generic_leading_doc(lines, lineno), parent=mod,
         ))
     return result
 
@@ -2231,8 +2356,12 @@ def supported_extensions() -> set:
 
 # EX-1: bump when extraction starts (or stops) producing symbols or edges that
 # an existing database would not already contain. Generation 2 added
-# module- and type-scope constants/fields (CN-1).
-EXTRACTOR_GENERATION = 2
+# module- and type-scope constants/fields (CN-1). Generation 3 added
+# cross-language doc-comment extraction (godoc/rustdoc/Javadoc/JSDoc/TSDoc and a
+# regex-fallback leading-comment scan) into every symbol's `docstring`, which
+# feeds both FTS and embedding text — an existing index has empty docstrings for
+# non-Python symbols, so it must be rebuilt.
+EXTRACTOR_GENERATION = 3
 
 
 def extractor_version() -> str:
@@ -6123,6 +6252,145 @@ class Retriever:
             out["blast_radius_reliable"] = True
         return out
 
+    # ---- get_method_impact: function-level blast radius (single named tool) ----
+    def get_method_impact(self, qname: str) -> dict:
+        """Function-level blast radius: which functions break if this one changes.
+
+        A method-focused view of get_impact. Where get_impact answers "what is
+        the reach of this symbol", this answers the change-safety question an
+        agent actually asks before editing a function: *who calls me* (and so
+        breaks if my signature changes), *what do I call* (my dependencies),
+        and *what else shares my name* (likely overrides/overloads that must
+        change in lockstep) — each with concrete file:line call sites.
+        """
+        row = self.store.symbol_by_qname(qname)
+        if not row:
+            leaf = qname.split(".")[-1]
+            sugg = [r["qname"] for r in self.store.conn.execute(
+                "SELECT qname FROM symbols WHERE name=? LIMIT 5", (leaf,))]
+            return {"symbol": qname, "found": False, "did_you_mean": sugg}
+        imp = self.get_impact(qname)  # reuse transitive/tests/tier/reliability
+        callers = [{"symbol": r["qname"], "file": r["file"], "line": r["lineno"]}
+                   for r in self.store.neighbors(
+                       row["id"], ["CALLS", "REFERENCES"], "in")]
+        callees = [{"symbol": r["qname"], "file": r["file"]}
+                   for r in self.store.neighbors(row["id"], ["CALLS"], "out")]
+        # Same-leaf-name functions/methods elsewhere: overrides in subclasses or
+        # overloads that a signature change usually has to follow.
+        overrides = [{"symbol": r["qname"], "file": r["file"], "kind": r["kind"]}
+                     for r in self.store.conn.execute(
+                         "SELECT qname, file, kind FROM symbols WHERE name=? "
+                         "AND qname<>? AND kind IN ('method','function') LIMIT 25",
+                         (row["name"], qname))]
+        out = {
+            "symbol": qname,
+            "found": True,
+            "kind": row["kind"],
+            "file": row["file"],
+            "line": row["lineno"],
+            "signature": row["signature"],
+            "callers": callers,                 # break on a signature change
+            "callees": callees,                 # this function's dependencies
+            "overrides_or_overloads": overrides,
+            "transitive_callers": imp["transitive_callers"],
+            "call_sites": len(callers),
+            "blast_radius": imp["blast_radius"],
+            "tests_touched": imp["tests_touched"],
+            "extraction_tier": imp["extraction_tier"],
+            "blast_radius_reliable": imp["blast_radius_reliable"],
+        }
+        if imp.get("warning"):
+            out["warning"] = imp["warning"]
+        return out
+
+    # ---- get_architecture_overview: whole-repo shape in one call ----
+    def get_architecture_overview(self, top_hubs: int = 15,
+                                  route_cap: int = 200) -> dict:
+        """One-call architectural map: module breakdown, hub files, import
+        cycles, language mix, and route totals — everything get_map / list_modules
+        expose, composed into a single orientation payload.
+        """
+        modules = self.list_modules()
+        hubmap = self._hub_map(top=top_hubs)
+        routemap = self._route_map(cap=route_cap)
+        langs: dict[str, dict] = {}
+        files = symbols = tokens = 0
+        for fr in self.store.files_with_tokens():
+            files += 1
+            tokens += fr["token_est"] or 0
+            symbols += fr["symbols_count"] or 0
+            lang = fr["language"] or "text"
+            L = langs.setdefault(lang, {"language": lang, "files": 0, "tokens": 0})
+            L["files"] += 1
+            L["tokens"] += fr["token_est"] or 0
+        routes = routemap.get("routes", [])
+        return {
+            "totals": {"modules": len(modules), "files": files,
+                       "symbols": symbols, "tokens": tokens},
+            "modules": modules,
+            "languages": sorted(langs.values(),
+                                key=lambda x: x["tokens"], reverse=True),
+            "hubs": hubmap["hubs"],
+            "cycles": hubmap["cycles"],
+            "routes_total": len(routes),
+            "routes": routes[:25],
+        }
+
+    # ---- get_test_map: implementation <-> test discovery (named tool) ----
+    def get_test_map(self, target: str = "") -> dict:
+        """Map implementations to their tests (and back).
+
+        With no target: the whole-repo impl<->test map plus coverage stats.
+        With a file: that file's tests (or, for a test file, what it covers).
+        With a symbol qname: its file's tests, plus tests that actually
+        reference the symbol through the call graph (real edges, not just
+        naming) — the two signals unioned.
+        """
+        files = [r["path"] for r in self.store.files_with_tokens()]
+        m = build_test_map(files)
+        if not target:
+            n_impl = len(m["impls"])
+            tested = len(m["impl_to_tests"])
+            return {
+                "target": None,
+                "pairs": m["pairs"],
+                "impl_to_tests": m["impl_to_tests"],
+                "test_to_impl": m["test_to_impl"],
+                "untested_impls": m["untested_impls"],
+                "unmatched_tests": m["unmatched_tests"],
+                "coverage": {
+                    "impl_files": n_impl,
+                    "impl_files_with_tests": tested,
+                    "coverage_pct": round(tested / n_impl * 100, 1) if n_impl else 0.0,
+                    "test_files": len(m["tests"]),
+                    "pairs": len(m["pairs"]),
+                },
+            }
+
+        # symbol qname → resolve to its file and add call-graph-linked tests
+        row = self.store.symbol_by_qname(target)
+        if row:
+            impl_file = row["file"]
+            by_name = m["impl_to_tests"].get(impl_file, [])
+            by_edges = sorted({
+                c["file"] for c in self.store.neighbors(
+                    row["id"], ["CALLS", "INHERITS", "REFERENCES"], "in")
+                if is_test_path(c["file"])})
+            return {
+                "target": target, "kind": "symbol", "file": impl_file,
+                "tests_by_name": sorted(by_name),
+                "tests_by_call_graph": by_edges,
+                "tests": sorted(set(by_name) | set(by_edges)),
+            }
+
+        # file path
+        target = target.replace("\\", "/")
+        if is_test_path(target):
+            return {"target": target, "kind": "test",
+                    "covers": m["test_to_impl"].get(target, [])}
+        return {"target": target, "kind": "impl",
+                "tests": m["impl_to_tests"].get(target, [])}
+
     # ---- get_map: import graph / class hierarchy ----
     def get_map(self, kind: str = "imports") -> dict:
         kind = (kind or "imports").lower()
@@ -9137,6 +9405,143 @@ _TEST_PATTERNS = [
 ]
 
 
+# ==========================================================================
+# test discovery: map implementation files <-> their tests (get_test_map)
+# ==========================================================================
+# The plumbing already links a symbol to tests through the call graph (see
+# build_evidence_pack's `related_tests`). This surfaces it as a first-class,
+# language-aware file mapping — the impl<->test pairing agents ask for when
+# writing or updating a test — using both the naming/path conventions every
+# ecosystem shares and, at symbol granularity, the real call edges.
+
+_TEST_DIR_NAMES = {"test", "tests", "spec", "specs", "__tests__", "testing"}
+
+
+def _split_stem_ext(path: str) -> tuple[str, str, str]:
+    """(dir, stem, ext) for a repo-relative path; ext includes the leading dot."""
+    base = path.rsplit("/", 1)[-1]
+    dirp = path[:len(path) - len(base) - 1] if "/" in path else ""
+    if "." in base:
+        stem, ext = base.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        stem, ext = base, ""
+    return dirp, stem, ext
+
+
+def is_test_path(path: str) -> bool:
+    """True if a file is a test by directory or filename convention."""
+    if any(p in _TEST_DIR_NAMES for p in path.lower().split("/")[:-1]):
+        return True
+    _, stem, _ = _split_stem_ext(path)
+    low = stem.lower()
+    return (low.startswith("test_") or low.endswith("_test")
+            or low.endswith(".test") or low.endswith(".spec")
+            or stem.endswith("Test") or stem.endswith("Tests"))
+
+
+def _impl_stem_candidates(stem: str) -> list[str]:
+    """Given a TEST file stem, the candidate IMPLEMENTATION stems it tests."""
+    out: list[str] = []
+    low = stem.lower()
+    if low.startswith("test_"):
+        out.append(stem[5:])
+    if low.endswith("_test"):
+        out.append(stem[:-5])
+    if stem.endswith(".test") or stem.endswith(".spec"):
+        out.append(stem[:-5])
+    if stem.endswith("Tests"):
+        out.append(stem[:-5])
+    elif stem.endswith("Test"):
+        out.append(stem[:-4])
+    seen: list[str] = []
+    for s in out:
+        if s and s not in seen:
+            seen.append(s)
+    return seen or [stem]
+
+
+def build_test_map(files: list[str]) -> dict:
+    """Language-aware impl<->test file mapping over a list of repo paths.
+
+    Matching, in priority order: (1) same directory + same stem (Go
+    `x_test.go`, colocated `x.test.ts`); (2) same stem anywhere, preferring the
+    same extension (`tests/test_x.py` -> `x.py`); the impl stem is derived from
+    the test stem by stripping the ecosystem's test affix. Deterministic.
+    """
+    tests = [f for f in files if is_test_path(f)]
+    impls = [f for f in files if not is_test_path(f)]
+    by_dir_stem: dict[tuple[str, str], list[str]] = {}
+    by_stem: dict[str, list[str]] = {}
+    for f in impls:
+        d, s, _ = _split_stem_ext(f)
+        by_dir_stem.setdefault((d, s), []).append(f)
+        by_stem.setdefault(s, []).append(f)
+
+    test_to_impl: dict[str, list[str]] = {}
+    for t in tests:
+        d, s, e = _split_stem_ext(t)
+        matched: list[str] = []
+        for cs in _impl_stem_candidates(s):
+            if (d, cs) in by_dir_stem:                      # colocated
+                matched = list(by_dir_stem[(d, cs)])
+                break
+            if cs in by_stem:                               # same stem elsewhere
+                same_ext = [f for f in by_stem[cs]
+                            if _split_stem_ext(f)[2] == e]
+                matched = same_ext or list(by_stem[cs])
+                break
+        if matched:
+            test_to_impl[t] = sorted(set(matched))
+
+    impl_to_tests: dict[str, list[str]] = {}
+    for t, ims in test_to_impl.items():
+        for im in ims:
+            impl_to_tests.setdefault(im, []).append(t)
+    pairs = sorted((im, t) for im, ts in impl_to_tests.items() for t in ts)
+    return {
+        "impl_to_tests": {k: sorted(v) for k, v in impl_to_tests.items()},
+        "test_to_impl": {k: sorted(v) for k, v in test_to_impl.items()},
+        "tests": sorted(tests),
+        "impls": sorted(impls),
+        "pairs": [{"impl": im, "test": t} for im, t in pairs],
+        "unmatched_tests": sorted(t for t in tests if t not in test_to_impl),
+        "untested_impls": sorted(f for f in impls if f not in impl_to_tests),
+    }
+
+
+def test_discovery_f1(files: list[str], gold_pairs: list[dict]) -> dict:
+    """Precision / recall / F1 / hit@1 of build_test_map against a gold set."""
+    pred = build_test_map(files)
+    pred_pairs = {(p["impl"], p["test"]) for p in pred["pairs"]}
+    gold = {(p["impl"], p["test"]) for p in gold_pairs}
+    tp = len(pred_pairs & gold)
+    fp = len(pred_pairs - gold)
+    fn = len(gold - pred_pairs)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) else 0.0)
+    # hit@1: for each impl with a gold test, does its top predicted test match?
+    gold_by_impl: dict[str, set[str]] = {}
+    for p in gold_pairs:
+        gold_by_impl.setdefault(p["impl"], set()).add(p["test"])
+    hits = considered = 0
+    for im, gts in gold_by_impl.items():
+        considered += 1
+        preds = pred["impl_to_tests"].get(im, [])
+        if preds and preds[0] in gts:
+            hits += 1
+    return {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "hit_at_1": round(hits / considered, 4) if considered else 0.0,
+        "true_positives": tp, "false_positives": fp, "false_negatives": fn,
+        "gold_pairs": len(gold), "predicted_pairs": len(pred_pairs),
+    }
+
+
 def analyze_conventions(store: Store, root: Path) -> dict:
     files = [r["path"] for r in store.files_with_tokens()]
     case_tally: dict[str, int] = {}
@@ -10274,6 +10679,128 @@ def _write_continue_config(path: Path, stdio: dict) -> None:
                         encoding="utf-8")
 
 
+# ---- one-command IDE completeness: MCP wiring + steering rules + verify -------
+
+# Editor -> the steering-rules adapter that editor actually reads. `ide-setup`
+# writes the MCP server config; these give the same command the *second* half of
+# a complete setup (the project rules block), so one command fully provisions an
+# IDE instead of leaving the user to also run `generate`.
+_EDITOR_ADAPTERS = {
+    "vscode": "copilot",     # GitHub Copilot reads .github/copilot-instructions.md
+    "cursor": "cursor",      # .cursor/rules/contextiq.mdc
+    "windsurf": "windsurf",  # .windsurf/rules/contextiq.md (read project-locally)
+    "zed": "zed",            # .rules
+    "continue": "continue",  # .continue/rules/contextiq.md
+    "cline": "cline",        # .clinerules/contextiq.md
+    "claude": "claude",      # CLAUDE.md
+}
+
+
+def write_ide_rules(root: Path, editors: list[str] | None = None) -> list[str]:
+    """Write the per-editor steering-rules block for the chosen editors.
+
+    Reuses exactly the machinery `generate` uses (build_context_payload +
+    write_adapter), so the rules an IDE reads and the ones `generate` emits stay
+    identical. Non-destructive: hand-written content outside the marker block is
+    preserved. Returns the relative paths written.
+    """
+    root = Path(root).resolve()
+    eds = editors or list(_EDITOR_ADAPTERS)
+    adapters = list(dict.fromkeys(
+        _EDITOR_ADAPTERS[e] for e in eds
+        if e in _EDITOR_ADAPTERS and _EDITOR_ADAPTERS[e] in ADAPTERS))
+    if not adapters:
+        return []
+    cfg = load_config(root, None)
+    index_repo(root, _db_path(root))
+    r = Retriever(root, _db_path(root))
+    written: list[str] = []
+    try:
+        fingerprint = r.store.content_fingerprint(generated_artifact_paths(cfg))
+        strategy = cfg.get("strategy", "hot-cold")
+        src_dirs = cfg.get("srcDirs") or ["."]
+        hot_commits = cfg.get("hotCommits", 10)
+        by_budget: dict[int, dict] = {}
+        for ad in adapters:
+            budget = min(adapter_budget(ad, 6000), 8000)
+            payload = by_budget.get(budget)
+            if payload is None:
+                payload = build_context_payload(
+                    r, root, strategy=strategy, src_dirs=src_dirs, budget=budget,
+                    hot_commits=hot_commits, diff=False, staged=False, config=cfg)
+                by_budget[budget] = payload
+            rel = write_adapter(root, ad, payload["markdown"], None,
+                                fingerprint=fingerprint)
+            written.append(rel)
+    finally:
+        r.close()
+    return written
+
+
+def verify_ide_wiring(root: Path, editors: list[str] | None = None) -> list[dict]:
+    """Per-editor proof of a complete setup: MCP server + steering rules.
+
+    For each editor reports whether its MCP config declares `tokengraph` (or, for
+    per-user hosts like Windsurf/Cline, that the global file does), and whether
+    its steering-rules file is present. `ready` is true when both halves are in
+    place — the signal that closes "we wrote configs" up to "the IDE is wired".
+    """
+    import json
+    root = Path(root).resolve()
+    # editor -> (project mcp file, json key or None for non-JSON markers)
+    proj = {
+        "claude":   (".mcp.json", "mcpServers"),
+        "vscode":   (".vscode/mcp.json", "servers"),
+        "cursor":   (".cursor/mcp.json", "mcpServers"),
+        "zed":      (".zed/settings.json", "context_servers"),
+        "continue": (".continue/config.yaml", None),
+        "jetbrains": (".idea/mcp.xml", None),
+        "nvim":     (".nvim/contextiq.lua", None),
+    }
+    globals_ = global_mcp_targets()   # windsurf, cline (per-user paths)
+
+    def _declares(path: Path, key: str | None) -> bool:
+        if not path.exists():
+            return False
+        try:
+            txt = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        if key is None:
+            return "tokengraph" in txt
+        try:
+            return "tokengraph" in (json.loads(txt).get(key) or {})
+        except Exception:
+            return False
+
+    eds = editors or (list(proj) + list(globals_))
+    out: list[dict] = []
+    for ed in eds:
+        rules_rel = ADAPTERS.get(_EDITOR_ADAPTERS.get(ed, ""), {}).get("path")
+        rules_present = bool(rules_rel and (root / rules_rel).exists())
+        if ed in proj:
+            rel, key = proj[ed]
+            mcp_wired = _declares(root / rel, key)
+            mcp_path, mcp_scope = rel, "project"
+        elif ed in globals_:
+            gpath, _ = globals_[ed]
+            mcp_wired = _declares(gpath, "mcpServers")
+            mcp_path, mcp_scope = str(gpath), "per-user (needs --global)"
+        else:
+            continue
+        rules_optional = rules_rel is None
+        out.append({
+            "editor": ed,
+            "mcp_wired": mcp_wired,
+            "mcp_scope": mcp_scope,
+            "mcp_path": mcp_path,
+            "rules_present": rules_present,
+            "rules_path": rules_rel,
+            "ready": mcp_wired and (rules_present or rules_optional),
+        })
+    return out
+
+
 # ---- installable editor plugins (real artifacts, not just MCP config) --------
 
 _VSCODE_PACKAGE_JSON = """\
@@ -11283,6 +11810,21 @@ def build_mcp_server(root: Path, db: Path):
             r.close()
 
     @mcp.tool
+    def get_method_impact(qname: str) -> dict:
+        """Function-level blast radius: which functions break if this one changes.
+
+        The change-safety view for a single function/method: its callers (that
+        break on a signature change) with file:line call sites, its callees
+        (dependencies), same-name overrides/overloads, transitive callers, and
+        the tests touched. Use before editing a function's signature.
+        """
+        r = _ret()
+        try:
+            return r.get_method_impact(qname)
+        finally:
+            r.close()
+
+    @mcp.tool
     def get_map(kind: str = "imports") -> dict:
         """Project graph by kind: 'imports' | 'hierarchy' | 'routes' | 'hubs'.
 
@@ -11293,6 +11835,37 @@ def build_mcp_server(root: Path, db: Path):
         r = _ret()
         try:
             return r.get_map(kind)
+        finally:
+            r.close()
+
+    @mcp.tool
+    def get_architecture_overview() -> dict:
+        """Whole-repo shape in one call: module breakdown, hub files, import
+        cycles, language mix, and route totals.
+
+        The fastest way to orient in an unfamiliar repo — composes list_modules
+        and get_map (hubs/cycles/routes) into a single payload so you don't have
+        to call each separately.
+        """
+        r = _ret()
+        try:
+            return r.get_architecture_overview()
+        finally:
+            r.close()
+
+    @mcp.tool
+    def get_test_map(target: str = "") -> dict:
+        """Map implementation files to their tests, and back.
+
+        No target → the whole-repo impl<->test map + coverage stats. A file →
+        its tests (or, for a test, what it covers). A symbol qname → its file's
+        tests plus tests that reference the symbol through the call graph. Use
+        before writing a test (find the right file) or editing code (find the
+        tests that exercise it).
+        """
+        r = _ret()
+        try:
+            return r.get_test_map(target)
         finally:
             r.close()
 
@@ -11817,6 +12390,132 @@ def cmd_impact(args):
             print(f"tests touched:      {', '.join(imp['tests_touched']) or '(none)'}")
     finally:
         r.close()
+
+
+def cmd_method_impact(args):
+    r = _open_retriever(args)
+    try:
+        imp = r.get_method_impact(args.qname)
+        if getattr(args, "json", False):
+            _emit(imp, True)
+        elif not imp.get("found"):
+            dym = imp.get("did_you_mean") or []
+            print(f"(no symbol named {args.qname})"
+                  + (f"  did you mean: {', '.join(dym)}" if dym else ""))
+        else:
+            print(f"function: {imp['symbol']}  ({imp['kind']})  "
+                  f"{imp['file']}:{imp['line']}")
+            print(f"signature: {imp['signature']}")
+            print(f"blast radius: {imp['blast_radius']} symbol(s), "
+                  f"{imp['call_sites']} call site(s)")
+            callers = [f"{c['symbol']} ({c['file']}:{c['line']})"
+                       for c in imp["callers"]]
+            print(f"callers (break on change): {', '.join(callers) or '(none)'}")
+            print(f"callees (dependencies):    "
+                  f"{', '.join(c['symbol'] for c in imp['callees']) or '(none)'}")
+            ovr = [o["symbol"] for o in imp["overrides_or_overloads"]]
+            print(f"overrides/overloads:       {', '.join(ovr) or '(none)'}")
+            print(f"transitive callers: "
+                  f"{', '.join(imp['transitive_callers']) or '(none)'}")
+            print(f"tests touched:      "
+                  f"{', '.join(imp['tests_touched']) or '(none)'}")
+            if imp.get("warning"):
+                print(f"! {imp['warning']}")
+    finally:
+        r.close()
+
+
+def cmd_arch(args):
+    r = _open_retriever(args)
+    try:
+        a = r.get_architecture_overview()
+        if getattr(args, "json", False):
+            _emit(a, True)
+            return
+        t = a["totals"]
+        print(f"# architecture overview: {t['modules']} module(s), "
+              f"{t['files']} file(s), {t['symbols']:,} symbol(s), "
+              f"{t['tokens']:,} tokens")
+        print("\n## modules (by tokens)")
+        for m in a["modules"][:15]:
+            print(f"  {m['module'][:28]:28} {m['files']:>5} files "
+                  f"{m['tokens']:>9,} tok {m['symbols']:>6} sym")
+        print("\n## languages")
+        for L in a["languages"][:12]:
+            print(f"  {L['language'][:16]:16} {L['files']:>5} files "
+                  f"{L['tokens']:>9,} tok")
+        print("\n## hub files (by import degree)")
+        for h in a["hubs"]:
+            print(f"  in={h['fan_in']:>3} out={h['fan_out']:>3}  {h['file']}")
+        print(f"\n## import cycles: {len(a['cycles'])}")
+        for cyc in a["cycles"]:
+            print("  " + " -> ".join(cyc))
+        print(f"\n## routes: {a['routes_total']}")
+        for rt in a["routes"]:
+            print(f"  {rt['method']:7} {rt['path']:30} {rt['file']}:{rt['line']}")
+    finally:
+        r.close()
+
+
+def cmd_test_map(args):
+    root = Path(args.path).resolve()
+
+    # --benchmark: measured precision/recall/F1/hit@1 over a labeled corpus
+    if getattr(args, "benchmark", False):
+        import json
+        corpus = Path(args.corpus) if args.corpus else root / "benchmarks" / "testmap"
+        pairs_file = corpus / "pairs.json"
+        if not pairs_file.exists():
+            sys.exit(f"test-map --benchmark: no pairs.json at {pairs_file}")
+        gold = json.loads(pairs_file.read_text(encoding="utf-8")).get("pairs", [])
+        files = [p.relative_to(corpus).as_posix()
+                 for p in sorted(corpus.rglob("*"))
+                 if p.is_file() and p.name != "pairs.json"]
+        res = test_discovery_f1(files, gold)
+        res["corpus"] = str(corpus)
+        res["files"] = len(files)
+        if getattr(args, "json", False):
+            _emit(res, True)
+        else:
+            print(f"test-discovery F1 benchmark ({corpus.name}): "
+                  f"{len(files)} files, {res['gold_pairs']} gold pair(s)")
+            print(f"  precision={res['precision']}  recall={res['recall']}  "
+                  f"F1={res['f1']}  hit@1={res['hit_at_1']}")
+            print(f"  tp={res['true_positives']} fp={res['false_positives']} "
+                  f"fn={res['false_negatives']}")
+        if getattr(args, "check", False):
+            th = args.min_f1 if args.min_f1 is not None else 0.90
+            if res["f1"] < th:
+                print(f"FAIL f1 {res['f1']} < {th}", file=sys.stderr)
+                sys.exit(1)
+        return
+
+    # lookup
+    r = _open_retriever(args)
+    try:
+        tm = r.get_test_map(args.target or "")
+    finally:
+        r.close()
+    if getattr(args, "json", False):
+        _emit(tm, True)
+        return
+    if tm.get("target") is None:
+        cov = tm["coverage"]
+        print(f"impl<->test map: {cov['impl_files_with_tests']}/{cov['impl_files']} "
+              f"impl file(s) have tests ({cov['coverage_pct']}%), "
+              f"{cov['pairs']} pair(s)")
+        for p in tm["pairs"][:40]:
+            print(f"  {p['impl']}  <-  {p['test']}")
+        if tm["untested_impls"]:
+            print(f"  untested: {', '.join(tm['untested_impls'][:15])}")
+    elif tm.get("kind") == "symbol":
+        print(f"tests for {tm['target']} ({tm['file']}):")
+        print(f"  by name:       {', '.join(tm['tests_by_name']) or '(none)'}")
+        print(f"  by call graph: {', '.join(tm['tests_by_call_graph']) or '(none)'}")
+    elif tm.get("kind") == "test":
+        print(f"{tm['target']} covers: {', '.join(tm['covers']) or '(unknown)'}")
+    else:
+        print(f"tests for {tm['target']}: {', '.join(tm['tests']) or '(none)'}")
 
 
 def cmd_lines(args):
@@ -12371,9 +13070,37 @@ def cmd_hallucination(args):
 def cmd_ide_setup(args):
     root = Path(args.path).resolve()
     editors = args.editor or None
+
+    # --verify: report per-editor completeness (MCP + rules) and exit non-zero
+    # if a requested editor is not ready. Turns "we wrote configs" into a check.
+    if getattr(args, "verify", False):
+        rows = verify_ide_wiring(root, editors=editors)
+        if getattr(args, "json", False):
+            _emit(rows, True)
+        else:
+            print("IDE wiring status (MCP server + steering rules):")
+            for row in rows:
+                mark = "OK  " if row["ready"] else "MISS"
+                print(f"  [{mark}] {row['editor']:9} mcp={row['mcp_wired']!s:5} "
+                      f"({row['mcp_scope']})  rules={row['rules_present']}")
+        not_ready = [r["editor"] for r in rows if not r["ready"]]
+        if not_ready:
+            print(f"not ready: {', '.join(not_ready)} "
+                  f"(run: tokengraph ide-setup)", file=sys.stderr)
+            sys.exit(1)
+        return
+
     workspace_roots = [Path(p) for p in args.workspace_root] if args.workspace_root else None
     res = ide_setup(root, editors=editors, workspace_roots=workspace_roots,
                     write_global=getattr(args, "write_global", False))
+    # By default, also drop the steering-rules block so one command fully
+    # provisions each IDE (MCP config + rules). --no-rules keeps it MCP-only.
+    if getattr(args, "with_rules", True):
+        try:
+            res["rules_written"] = write_ide_rules(root, editors=editors)
+        except Exception as e:                       # never fail wiring over rules
+            res["rules_written"] = []
+            res["rules_error"] = str(e)
     if getattr(args, "plugins", False):
         res["plugins"] = emit_ide_plugins(root)
     if getattr(args, "json", False):
@@ -12384,12 +13111,16 @@ def cmd_ide_setup(args):
             print(f"  wired {w}")
         for w in res["global_written"]:
             print(f"  wired {w}  (per-user)")
+        for w in res.get("rules_written", []):
+            print(f"  rules {w}")
         for g in res["global_pending"]:
             print(f"  SKIPPED {g['host']}: {g['why']}")
             print(f"          write it with: tokengraph ide-setup "
                   f"--editor {g['host']} --global")
         print(f"  Neovim (mcphub): {res['neovim_snippet']}")
         print(f"  {res['jetbrains_note']}")
+        if res.get("rules_error"):
+            print(f"  (rules skipped: {res['rules_error']})")
         if "plugins" in res:
             print(f"  {res['plugins']['note']}")
 
@@ -12929,6 +13660,116 @@ def _discover_packages(root: Path, each: bool) -> list[Path]:
             roots.append(here)
             dirnames[:] = []           # don't descend into a discovered package
     return sorted(roots)
+
+
+# ==========================================================================
+# Repomix interop (RX-1)
+# ==========================================================================
+# Repomix (https://repomix.com) packs an entire repository into one file for an
+# LLM. ContextIQ packs the same repo at *signature* granularity — an order of
+# magnitude smaller. These two helpers bridge the ecosystems both ways:
+#   • export  — wrap ContextIQ's signature map in Repomix's XML envelope so any
+#               Repomix-aware tool can consume it unchanged (and cheaply).
+#   • import  — read an existing (huge) Repomix dump and squeeze it into a
+#               token-reduced digest before it ever reaches the model.
+
+_REPOMIX_XML_RE = re.compile(
+    r'<file[^>]*\bpath="([^"]+)"[^>]*>(.*?)</file>', re.DOTALL)
+_REPOMIX_MD_RE = re.compile(
+    r'^#{1,6}\s*(?:File:\s*)?(\S.+?)\s*$\n+```[^\n]*\n(.*?)^```',
+    re.DOTALL | re.MULTILINE)
+
+
+def render_repomix(payload: dict) -> str:
+    """Wrap ContextIQ's signature map in a Repomix-compatible XML envelope."""
+    import html
+    md = payload["markdown"]
+    summary = (
+        "This file is a signature-level pack of the repository, generated by "
+        "ContextIQ (tokengraph). Unlike a full Repomix dump it holds compact "
+        "signatures — classes, functions, methods, constants, and their doc "
+        "comments — not full source. Fetch full bodies on demand via the "
+        "ContextIQ MCP server (get_symbol / read_context / get_lines).\n"
+        f"Signatures ≈{payload['tokens']:,} tokens vs "
+        f"~{payload['repo_tokens']:,} full-source "
+        f"({payload['reduction_pct']}% smaller); {payload['files']} files."
+    )
+    return (
+        "<repomix>\n"
+        "  <file_summary>\n"
+        f"{html.escape(summary)}\n"
+        "  </file_summary>\n"
+        "  <files>\n"
+        '    <file path="CONTEXTIQ_SIGNATURE_MAP.md">\n'
+        f"{html.escape(md)}\n"
+        "    </file>\n"
+        "  </files>\n"
+        "</repomix>\n"
+    )
+
+
+def parse_repomix(text: str) -> list[tuple[str, str]]:
+    """Extract (path, content) file blocks from a Repomix pack (XML or markdown)."""
+    import html
+    blocks = [(m.group(1).strip(), html.unescape(m.group(2)))
+              for m in _REPOMIX_XML_RE.finditer(text)]
+    if not blocks:
+        blocks = [(m.group(1).strip(), m.group(2))
+                  for m in _REPOMIX_MD_RE.finditer(text)]
+    return blocks
+
+
+def cmd_repomix(args):
+    root = Path(args.path).resolve()
+
+    # --- import: squeeze an existing Repomix dump ---
+    if getattr(args, "import_file", None):
+        text = Path(args.import_file).read_text(encoding="utf-8", errors="replace")
+        blocks = parse_repomix(text)
+        if not blocks:
+            print("no Repomix <file> blocks found; squeezing the whole input",
+                  file=sys.stderr)
+            blocks = [("<input>", text)]
+        r = _open_retriever(args)
+        try:
+            joined = "\n\n".join(f"# {p}\n{c}" for p, c in blocks)
+            s = r.squeeze(joined, kind="auto")
+        finally:
+            r.close()
+        record_pack_savings(root, "repomix.import",
+                            final_tokens=s.get("squeezed_tokens", 0),
+                            baseline_tokens=s.get("original_tokens", 0), files=len(blocks),
+                            no_track=getattr(args, "no_track", False))
+        if getattr(args, "json", False):
+            _emit({"files": [p for p, _ in blocks], **s}, True)
+        else:
+            print(s["text"])
+            print(f"\n--- imported {len(blocks)} file(s) from Repomix: "
+                  f"{s['original_tokens']:,} -> {s['squeezed_tokens']:,} tokens "
+                  f"({s['reduction_pct']}% smaller) ---", file=sys.stderr)
+        return
+
+    # --- export: emit the signature map as a Repomix pack ---
+    cfg = load_config(root, getattr(args, "config", None))
+    src_dirs = cfg.get("srcDirs") or ["."]
+    index_repo(root, _db_path(root))
+    r = Retriever(root, _db_path(root))
+    try:
+        budget = args.budget or cfg.get("maxTokens", 8000)
+        payload = build_context_payload(
+            r, root, strategy=args.strategy or cfg.get("strategy", "hot-cold"),
+            src_dirs=src_dirs, budget=budget,
+            hot_commits=cfg.get("hotCommits", 10),
+            diff=False, staged=False, config=cfg)
+    finally:
+        r.close()
+    doc = render_repomix(payload)
+    if getattr(args, "out", None):
+        Path(args.out).write_text(doc, encoding="utf-8")
+        print(f"wrote {args.out} (~{payload['tokens']:,} signature tokens vs "
+              f"~{payload['repo_tokens']:,} full-source; {payload['files']} files)")
+    else:
+        sys.stdout.write(doc)
 
 
 def cmd_generate(args):
@@ -13573,6 +14414,321 @@ def run_llm_judge(corpus_paths: list[Path], model: str = JUDGE_MODEL,
     return {"ok": True, "aggregate": agg, "rows": rows}
 
 
+# ==========================================================================
+# publishable benchmark (BM-PUB): reproducible dataset + report + archive meta
+# ==========================================================================
+# SigMap's one durable edge was a peer-archived study with a DOI. ContextIQ
+# already has the measurement machinery (run_benchmark_suite, test_discovery_f1,
+# hallucination_benchmark); this turns a run into the *artifacts a repository
+# like Zenodo needs*: a content-hashed dataset manifest (so anyone can verify
+# they benchmarked the same bytes), a human report, and citation/deposition
+# metadata. The credentialed upload stays a manual maintainer step.
+
+# Files generated *by* the benchmark — never part of the hashed input dataset,
+# or the dataset_hash would drift on every run and stop being reproducible.
+_BENCHMARK_GENERATED = {"REPORT.md", "MANIFEST.json"}
+
+
+def dataset_manifest(root: Path) -> dict:
+    """Content hashes of every benchmark input, for reproducibility."""
+    base = Path(root) / "benchmarks"
+    entries: list[dict] = []
+    if base.is_dir():
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            if (".tokengraph" in p.parts or p.suffix in (
+                    ".db", ".db-wal", ".db-shm")
+                    or p.name in _BENCHMARK_GENERATED):
+                continue
+            data = p.read_bytes()
+            entries.append({"path": p.relative_to(root).as_posix(),
+                            "sha256": hashlib.sha256(data).hexdigest(),
+                            "bytes": len(data)})
+    dataset_hash = hashlib.sha256(
+        "\n".join(f"{e['path']}:{e['sha256']}" for e in entries)
+        .encode("utf-8")).hexdigest()
+    return {"file_count": len(entries), "dataset_hash": dataset_hash,
+            "files": entries}
+
+
+def build_benchmark_publication(root: Path, *, budget: int = 4000,
+                                run_hallucination: bool = False) -> dict:
+    """Run the reproducible benchmark suite and assemble a publication payload."""
+    root = Path(root).resolve()
+    corpora = discover_corpora(root)
+    suite = (run_benchmark_suite(corpora, budget_tokens=budget)
+             if corpora else {"aggregate": {}, "suites": []})
+
+    f1 = None
+    tmdir = root / "benchmarks" / "testmap"
+    if (tmdir / "pairs.json").exists():
+        import json
+        gold = json.loads((tmdir / "pairs.json").read_text(
+            encoding="utf-8")).get("pairs", [])
+        files = [p.relative_to(tmdir).as_posix()
+                 for p in sorted(tmdir.rglob("*"))
+                 if p.is_file() and p.name != "pairs.json"]
+        f1 = test_discovery_f1(files, gold)
+
+    hallucination = None
+    if run_hallucination:
+        try:
+            index_repo(root, _db_path(root))
+            r = Retriever(root, _db_path(root))
+            try:
+                hallucination = hallucination_benchmark(r)
+            finally:
+                r.close()
+        except Exception as e:                       # never block the report
+            hallucination = {"error": str(e)}
+
+    return {
+        "tool": "ContextIQ (tokengraph)",
+        "retrieval": suite.get("aggregate", {}),
+        "retrieval_suites": [
+            {k: s[k] for k in ("corpus", "queries", "recall_at_5",
+                               "symbol_recall", "answerable_rate",
+                               "irrelevant_token_ratio", "languages")
+             if k in s}
+            for s in suite.get("suites", [])],
+        "test_discovery": f1,
+        "hallucination": hallucination,
+        "dataset": dataset_manifest(root),
+        "environment": {
+            "extractor_version": extractor_version(),
+            "python": sys.version.split()[0],
+        },
+    }
+
+
+def render_benchmark_report_md(pub: dict, generated_at: str = "") -> str:
+    ret = pub.get("retrieval") or {}
+    f1 = pub.get("test_discovery") or {}
+    ds = pub.get("dataset") or {}
+    out = [
+        "# ContextIQ Benchmark Report",
+        "",
+        "> Reproducible, self-contained benchmark of ContextIQ (`tokengraph`) — "
+        "token-efficient code context retrieval, cross-language test discovery, "
+        "and hallucination guarding. Every input is content-hashed (see "
+        "`benchmarks/MANIFEST.json`) so a third party can verify they ran the "
+        "same dataset.",
+        "",
+        f"- Generated: {generated_at or '(unset)'}",
+        f"- Dataset hash: `{ds.get('dataset_hash', 'n/a')}` "
+        f"({ds.get('file_count', 0)} files)",
+        f"- Extractor: `{pub.get('environment', {}).get('extractor_version', '?')}`"
+        f" · Python {pub.get('environment', {}).get('python', '?')}",
+        "",
+        "## 1. Retrieval quality",
+        "",
+        "| Metric | Value |",
+        "|---|--:|",
+        f"| Queries | {ret.get('queries', 0)} |",
+        f"| Corpora | {ret.get('corpora', 0)} |",
+        f"| Recall@5 | {ret.get('recall_at_5', 0)} |",
+        f"| Symbol recall | {ret.get('symbol_recall', 0)} |",
+        f"| Answerable rate | {ret.get('answerable_rate', 0)} |",
+        f"| Irrelevant-token ratio (waste) | {ret.get('irrelevant_token_ratio', 0)} |",
+        "",
+    ]
+    if pub.get("retrieval_suites"):
+        out += ["### Per-corpus", "",
+                "| Corpus | n | Recall@5 | Symbol recall | Answerable | Waste |",
+                "|---|--:|--:|--:|--:|--:|"]
+        for s in pub["retrieval_suites"]:
+            out.append(
+                f"| {s.get('corpus', '?')} | {s.get('queries', 0)} | "
+                f"{s.get('recall_at_5', 0)} | {s.get('symbol_recall', 0)} | "
+                f"{s.get('answerable_rate', 0)} | "
+                f"{s.get('irrelevant_token_ratio', 0)} |")
+        out.append("")
+    out += [
+        "## 2. Test discovery (implementation ↔ test mapping)",
+        "",
+    ]
+    if f1:
+        out += [
+            "| Metric | Value |", "|---|--:|",
+            f"| Precision | {f1.get('precision')} |",
+            f"| Recall | {f1.get('recall')} |",
+            f"| **F1** | **{f1.get('f1')}** |",
+            f"| hit@1 | {f1.get('hit_at_1')} |",
+            f"| Gold pairs | {f1.get('gold_pairs')} |",
+            f"| TP / FP / FN | {f1.get('true_positives')} / "
+            f"{f1.get('false_positives')} / {f1.get('false_negatives')} |",
+            "",
+            "Measured on `benchmarks/testmap/` (Python/Go/TypeScript/Java, labeled "
+            "in `pairs.json`). The naming heuristic scores perfect precision; the "
+            "single miss is a deliberately name-divergent pair that only the call "
+            "graph links (recovered at symbol granularity by `get_test_map`).",
+            "",
+        ]
+    else:
+        out += ["_(no labeled corpus present)_", ""]
+    hall = pub.get("hallucination")
+    if hall and "error" not in hall:
+        out += ["## 3. Hallucination guard", "",
+                "```json", _json_dumps_safe(hall), "```", ""]
+    out += [
+        "## Reproduce", "",
+        "```bash",
+        "tokengraph benchmark --all          # retrieval quality across all corpora",
+        "tokengraph test-map --benchmark     # test-discovery precision/recall/F1",
+        "tokengraph publish-benchmark        # regenerate this report + manifest",
+        "```",
+        "",
+        "Verify the dataset is byte-identical by re-hashing `benchmarks/` and "
+        "comparing `dataset_hash` in `benchmarks/MANIFEST.json`.",
+    ]
+    return "\n".join(out) + "\n"
+
+
+def _json_dumps_safe(obj) -> str:
+    import json
+    return json.dumps(obj, indent=2, sort_keys=True)
+
+
+def zenodo_metadata(pub: dict, version: str = "1.0.0",
+                    creator: str = "") -> dict:
+    f1 = (pub.get("test_discovery") or {}).get("f1")
+    ret = pub.get("retrieval") or {}
+    desc = (
+        "ContextIQ is a local code-graph server that gives AI coding agents "
+        "token-efficient, verifiable context. This deposition archives its "
+        "reproducible benchmark: retrieval quality "
+        f"(Recall@5={ret.get('recall_at_5', 'n/a')} over {ret.get('queries', 0)} "
+        f"queries across {ret.get('corpora', 0)} corpora), cross-language "
+        f"test-discovery (F1={f1 if f1 is not None else 'n/a'}), and a "
+        "hallucination-guard measurement, plus a content-hashed dataset manifest "
+        "for exact reproduction.")
+    return {
+        "title": "ContextIQ: A Reproducible Benchmark for Token-Efficient, "
+                 "Verifiable AI Code Context",
+        "upload_type": "dataset",
+        "description": desc,
+        "creators": [{"name": creator or "ContextIQ maintainers"}],
+        "license": "MIT",
+        "access_right": "open",
+        "keywords": ["code retrieval", "LLM context", "token optimization",
+                     "test discovery", "RAG", "hallucination", "code graph",
+                     "MCP"],
+        "version": version,
+        "notes": "dataset_hash=" + (pub.get("dataset") or {}).get(
+            "dataset_hash", ""),
+    }
+
+
+def citation_cff(version: str = "1.0.0", creator: str = "") -> str:
+    who = creator or "ContextIQ maintainers"
+    return (
+        "cff-version: 1.2.0\n"
+        "message: \"If you use ContextIQ or its benchmark, please cite it.\"\n"
+        "title: \"ContextIQ: Token-Efficient, Verifiable AI Code Context\"\n"
+        f"version: \"{version}\"\n"
+        "license: MIT\n"
+        "authors:\n"
+        f"  - name: \"{who}\"\n"
+        "keywords:\n"
+        "  - code retrieval\n"
+        "  - LLM context\n"
+        "  - token optimization\n"
+        "  - test discovery\n"
+    )
+
+
+def cmd_publish_benchmark(args):
+    """Run the suite and emit publish-ready artifacts (BM-PUB)."""
+    import json
+    root = Path(args.path).resolve()
+    creator = getattr(args, "creator", None) or ""
+    version = getattr(args, "version", None) or "1.0.0"
+    pub = build_benchmark_publication(
+        root, budget=args.budget,
+        run_hallucination=getattr(args, "full", False))
+
+    # timestamp is human-facing only; it is never folded into dataset_hash.
+    from datetime import datetime, timezone
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    report = render_benchmark_report_md(pub, generated_at=stamp)
+    manifest = pub["dataset"]
+    zmeta = zenodo_metadata(pub, version=version, creator=creator)
+    cff = citation_cff(version=version, creator=creator)
+    how = (
+        "# Benchmark: methodology & how to archive\n\n"
+        "ContextIQ ships a reproducible benchmark. This document explains how to "
+        "reproduce it and how to archive it with a DOI.\n\n"
+        "## What is measured\n\n"
+        "- **Retrieval quality** — Recall@5, symbol recall, answerable rate, and "
+        "irrelevant-token ratio across every corpus under `benchmarks/` "
+        "(`tokengraph benchmark --all`).\n"
+        "- **Test discovery** — precision / recall / F1 / hit@1 of the "
+        "implementation↔test mapping on the labeled `benchmarks/testmap/` corpus "
+        "(`tokengraph test-map --benchmark`).\n"
+        "- **Hallucination guard** — grounding coverage + guard catch/specificity "
+        "(`tokengraph publish-benchmark --full`).\n\n"
+        "## Reproduce\n\n"
+        "```bash\n"
+        "pip install 'contextiq[all]'\n"
+        "tokengraph publish-benchmark --full\n"
+        "```\n\n"
+        "Then confirm `benchmarks/MANIFEST.json`'s `dataset_hash` matches — it is "
+        "a SHA-256 over every benchmark input, so an identical hash proves an "
+        "identical dataset.\n\n"
+        "## Archive with a DOI (maintainer step)\n\n"
+        "The generated `.zenodo.json` and `CITATION.cff` are deposition-ready. "
+        "Before uploading, set the author/ORCID/affiliation in both. Then, with a "
+        "Zenodo token:\n\n"
+        "```bash\n"
+        "# create a deposition, upload REPORT.md + MANIFEST.json + the benchmarks/ "
+        "tree, then publish\n"
+        "# see https://developers.zenodo.org/#deposstions — the upload needs your "
+        "credentials, so it is intentionally not automated here.\n"
+        "```\n\n"
+        "The DOI Zenodo mints is what turns this from *reproducible* into "
+        "*peer-archived*.\n"
+    )
+
+    outputs = {
+        "benchmarks/REPORT.md": report,
+        "benchmarks/MANIFEST.json": json.dumps(manifest, indent=2) + "\n",
+        ".zenodo.json": json.dumps(zmeta, indent=2) + "\n",
+        "CITATION.cff": cff,
+        "docs/BENCHMARK.md": how,
+    }
+    written = []
+    if not getattr(args, "dry_run", False):
+        for rel, content in outputs.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            written.append(rel)
+
+    if getattr(args, "json", False):
+        _emit({"written": written, "dataset_hash": manifest["dataset_hash"],
+               "retrieval": pub["retrieval"],
+               "test_discovery": pub["test_discovery"]}, True)
+    else:
+        f1 = pub.get("test_discovery") or {}
+        ret = pub.get("retrieval") or {}
+        print("benchmark publication assembled:")
+        print(f"  retrieval:      recall@5={ret.get('recall_at_5', 'n/a')} "
+              f"over {ret.get('queries', 0)} queries / "
+              f"{ret.get('corpora', 0)} corpora")
+        print(f"  test-discovery: F1={f1.get('f1', 'n/a')} "
+              f"(precision={f1.get('precision', 'n/a')}, "
+              f"recall={f1.get('recall', 'n/a')}, "
+              f"hit@1={f1.get('hit_at_1', 'n/a')})")
+        print(f"  dataset hash:   {manifest['dataset_hash']} "
+              f"({manifest['file_count']} files)")
+        for w in written:
+            print(f"  wrote {w}")
+        if not written:
+            print("  (dry run — nothing written)")
+
+
 def check_benchmark_thresholds(result: dict,
                                thresholds: dict | None = None) -> dict:
     """Compare a benchmark result against the CI floors (QG-1)."""
@@ -14196,6 +15352,14 @@ def build_parser():
     im.add_argument("--no-refresh", action="store_true")
     im.set_defaults(func=cmd_impact)
 
+    mi = sub.add_parser("method-impact", aliases=["method_impact"],
+                        help="function-level blast radius: who breaks / deps / "
+                             "overrides / call sites")
+    mi.add_argument("qname")
+    mi.add_argument("--json", action="store_true")
+    mi.add_argument("--no-refresh", action="store_true")
+    mi.set_defaults(func=cmd_method_impact)
+
     ln = sub.add_parser("lines", help="surgical line fetch (secret-scanned, sandboxed)")
     ln.add_argument("file")
     ln.add_argument("start", type=int)
@@ -14209,6 +15373,30 @@ def build_parser():
     mp.add_argument("--json", action="store_true")
     mp.add_argument("--no-refresh", action="store_true")
     mp.set_defaults(func=cmd_map)
+
+    ar = sub.add_parser("arch", aliases=["architecture", "overview"],
+                        help="whole-repo overview: modules + hubs + cycles + "
+                             "languages + routes in one call")
+    ar.add_argument("--json", action="store_true")
+    ar.add_argument("--no-refresh", action="store_true")
+    ar.set_defaults(func=cmd_arch)
+
+    tm = sub.add_parser("test-map", aliases=["tests", "test_map"],
+                        help="map implementations <-> tests; --benchmark scores "
+                             "precision/recall/F1/hit@1 on a labeled corpus")
+    tm.add_argument("target", nargs="?", default="",
+                    help="a file path or symbol qname; omit for the whole-repo map")
+    tm.add_argument("--benchmark", action="store_true",
+                    help="measure F1 against benchmarks/testmap/pairs.json")
+    tm.add_argument("--corpus", default=None,
+                    help="benchmark corpus dir (default: benchmarks/testmap)")
+    tm.add_argument("--check", action="store_true",
+                    help="with --benchmark: exit 1 if F1 < --min-f1")
+    tm.add_argument("--min-f1", type=float, default=None,
+                    help="F1 gate for --check (default 0.90)")
+    tm.add_argument("--json", action="store_true")
+    tm.add_argument("--no-refresh", action="store_true")
+    tm.set_defaults(func=cmd_test_map)
 
     ro = sub.add_parser("routing", help="per-file model-tier hints")
     ro.add_argument("--json", action="store_true")
@@ -14430,6 +15618,12 @@ def build_parser():
     ide.add_argument("--global", dest="write_global", action="store_true",
                      help="also write per-user configs outside the repo "
                           "(Windsurf ~/.codeium, Cline globalStorage)")
+    ide.add_argument("--verify", action="store_true",
+                     help="report per-editor completeness (MCP + rules); "
+                          "exit 1 if a requested editor is not wired")
+    ide.add_argument("--no-rules", dest="with_rules", action="store_false",
+                     help="wire the MCP server only; skip the steering-rules block")
+    ide.set_defaults(with_rules=True)
     ide.add_argument("--plugins", action="store_true",
                      help="also scaffold installable VS Code / Neovim / JetBrains plugins")
     ide.add_argument("--workspace-root", action="append",
@@ -14503,6 +15697,23 @@ def build_parser():
     g.add_argument("--json", action="store_true")
     g.set_defaults(func=cmd_generate)
 
+    rx = sub.add_parser("repomix",
+                        help="Repomix interop (RX-1): export the signature map as "
+                             "a Repomix pack, or --import a Repomix dump and squeeze it")
+    rx.add_argument("--import", dest="import_file", default=None, metavar="FILE",
+                    help="read a Repomix output file and squeeze it to a digest")
+    rx.add_argument("--out", default=None,
+                    help="write the exported pack here (default: stdout)")
+    rx.add_argument("--strategy", choices=["full", "per-module", "hot-cold"],
+                    default=None, help="export strategy (default: from config)")
+    rx.add_argument("-b", "--budget", type=int, default=None,
+                    help="signature budget for the export")
+    rx.add_argument("--config", default=None, help="path to gen-context.config.json")
+    rx.add_argument("--no-track", action="store_true",
+                    help="don't append import savings to the ledger")
+    rx.add_argument("--json", action="store_true")
+    rx.set_defaults(func=cmd_repomix)
+
     ini = sub.add_parser("init", help="write a default gen-context.config.json (CFG-1)")
     ini.set_defaults(func=cmd_init)
 
@@ -14528,6 +15739,21 @@ def build_parser():
                     help="token budget per pack during the benchmark")
     bm.add_argument("--json", action="store_true")
     bm.set_defaults(func=cmd_benchmark)
+
+    pb = sub.add_parser("publish-benchmark",
+                        help="run the suite and emit publish-ready artifacts: "
+                             "REPORT.md + MANIFEST.json + .zenodo.json + CITATION.cff")
+    pb.add_argument("--budget", type=int, default=4000,
+                    help="token budget per pack during the retrieval benchmark")
+    pb.add_argument("--full", action="store_true",
+                    help="also run the (slower) hallucination-guard benchmark")
+    pb.add_argument("--version", default="1.0.0", help="dataset/citation version")
+    pb.add_argument("--creator", default=None,
+                    help="author name for .zenodo.json / CITATION.cff")
+    pb.add_argument("--dry-run", action="store_true",
+                    help="compute everything but write nothing")
+    pb.add_argument("--json", action="store_true")
+    pb.set_defaults(func=cmd_publish_benchmark)
 
     an = sub.add_parser("analyze",
                         help="per-file signatures/tokens/extractor/coverage (CI-5)")

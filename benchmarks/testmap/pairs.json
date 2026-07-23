@@ -1,0 +1,51 @@
+{
+  "description": "Labeled implementation<->test pairs across Python/Go/TS/Java for the test-discovery F1 benchmark. One pair (pricing.py<->test_pricing_rules.py) diverges in name on purpose so the file-naming heuristic's ceiling is measured honestly.",
+  "languages": [
+    "python",
+    "go",
+    "typescript",
+    "java"
+  ],
+  "pairs": [
+    {
+      "impl": "calc.py",
+      "test": "tests/test_calc.py"
+    },
+    {
+      "impl": "strutil.py",
+      "test": "tests/test_strutil.py"
+    },
+    {
+      "impl": "orders.py",
+      "test": "orders_test.py"
+    },
+    {
+      "impl": "pkg/cache/cache.go",
+      "test": "pkg/cache/cache_test.go"
+    },
+    {
+      "impl": "pkg/queue/queue.go",
+      "test": "pkg/queue/queue_test.go"
+    },
+    {
+      "impl": "src/auth.ts",
+      "test": "src/auth.test.ts"
+    },
+    {
+      "impl": "src/parse.ts",
+      "test": "src/parse.spec.ts"
+    },
+    {
+      "impl": "src/user.ts",
+      "test": "src/__tests__/user.spec.ts"
+    },
+    {
+      "impl": "java/Money.java",
+      "test": "java/MoneyTest.java"
+    },
+    {
+      "impl": "pricing.py",
+      "test": "tests/test_pricing_rules.py"
+    }
+  ]
+}

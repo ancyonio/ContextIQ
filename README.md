@@ -33,6 +33,31 @@ A context pack contains: relevant symbols (full body when small, signature when 
 
 ---
 
+## Model-agnostic — works with any LLM, including local models (no API key)
+
+ContextIQ is a **context layer, not a model**. It parses your repository, ranks
+what matters, and emits a plain-text/Markdown (or JSON) context pack. It never
+calls a hosted model to do its job — indexing, retrieval, budgeting, secret
+scanning, and the deterministic guards (`validate`, `judge`, `verify`,
+`evidence`) all run **fully offline on your machine** (set `TOKENGRAPH_OFFLINE=1`
+to also skip optional neural-embedding downloads; a deterministic hash embedding
+keeps semantic search working with zero network access).
+
+Because the output is just text, **any** model can consume it:
+
+| Setup | How ContextIQ fits |
+|---|---|
+| **Cloud agents** (Claude Code, Copilot, Cursor, Gemini CLI) | Register the MCP server once; the agent pulls packs on demand. |
+| **Local LLMs** (Ollama, llama.cpp, LM Studio, vLLM) | Pipe a pack straight into the prompt — `tokengraph context "task" \| ollama run llama3`. No API key, no telemetry, nothing leaves the box. |
+| **Your own harness / RAG pipeline** | Call the CLI (`context --json`) or the MCP tools and paste the pack into whatever model you already use. |
+
+The token savings are the same regardless of which model reads the pack — the
+whole point is to send a *small, relevant* prompt. That makes ContextIQ
+especially useful for **local models with tight context windows**, where sending
+whole files simply overflows the window.
+
+---
+
 ## Install
 
 The CLI needs **only Python 3.10+**. Pick a channel:
@@ -100,7 +125,12 @@ python tokengraph_all.py langs                          # parseable languages
 python tokengraph_all.py modules                        # token table of top-level dirs (call first)
 python tokengraph_all.py explain path/to/file.py        # signatures + imports + external callers
 python tokengraph_all.py impact my.module.func          # blast radius (callers/subclasses/tests)
+python tokengraph_all.py method-impact my.module.func   # function-level: who breaks / deps / overrides / call sites
+python tokengraph_all.py test-map                        # map implementations <-> their tests (+ coverage %)
+python tokengraph_all.py test-map my.module.func         # tests for one symbol (naming + call-graph)
+python tokengraph_all.py test-map --benchmark            # measured precision/recall/F1/hit@1 on a labeled corpus
 python tokengraph_all.py lines path/to/file.py 40 80    # exact line range (secret-scanned, sandboxed)
+python tokengraph_all.py arch                            # whole-repo overview: modules + hubs + cycles + languages + routes
 python tokengraph_all.py map imports                     # import graph (or: hierarchy | routes | hubs)
 python tokengraph_all.py map routes                      # HTTP endpoints (Flask/FastAPI/Express/Spring/Go)
 python tokengraph_all.py map hubs                        # fan-in/out ranking + import cycles
@@ -150,11 +180,17 @@ python tokengraph_all.py checkpoint "phase-1" --note "indexing done"
 python tokengraph_all.py generate --adapter claude --adapter cursor  # CLAUDE.md / .cursor/rules/*.mdc / copilot / AGENTS.md (per-host budgets)
 python tokengraph_all.py generate --monorepo --adapter copilot       # per-package context for every nested manifest-detected package
 python tokengraph_all.py generate --each --adapter claude            # per immediate sub-directory (workspace of repos)
-python tokengraph_all.py ide-setup                       # MCP wiring: VS Code / Cursor / Zed / Claude Code (project-local)
+python tokengraph_all.py repomix --out pack.xml          # export the signature map as a Repomix-compatible pack (interop)
+python tokengraph_all.py repomix --import repomix-output.xml  # squeeze an existing (huge) Repomix dump into a token-reduced digest
+python tokengraph_all.py ide-setup                       # one command: MCP server + steering rules for VS Code / Cursor / Zed / Continue / Claude (project-local)
+python tokengraph_all.py ide-setup --verify              # prove each editor is wired (MCP + rules); exit 1 if not ready
+python tokengraph_all.py ide-setup --no-rules            # wire the MCP server only (skip the steering-rules block)
 python tokengraph_all.py ide-setup --global              # also Windsurf + Cline, which only read per-user config paths
 python tokengraph_all.py serve --transport http --port 8756  # shared/remote server instead of stdio
 python tokengraph_all.py embed-warm                      # fetch the semantic model once (otherwise: hashing fallback)
 python tokengraph_all.py benchmark --check               # CI gate: answer-quality across 4 repos, exit 1 on regression
+python tokengraph_all.py test-map --benchmark --check     # CI gate: impl<->test F1 (exit 1 below --min-f1)
+python tokengraph_all.py publish-benchmark               # publish-ready artifacts: REPORT.md + MANIFEST.json (hashed) + .zenodo.json + CITATION.cff
 python tokengraph_all.py ide-setup --workspace-root repo-a --workspace-root repo-b  # multi-root wiring
 python tokengraph_all.py ide-plugin                      # scaffold installable plugins: VS Code .vsix / Neovim Lua / JetBrains
 python tokengraph_all.py freeze --build                  # build a standalone binary now (PyInstaller)
@@ -190,6 +226,15 @@ code still finds the right symbols. This is fully offline with **zero required
 deps** — the default backend is a deterministic hashing embedding (token +
 char-trigram). It captures lexical/structural overlap robustly but is not a true
 neural model.
+
+**Doc-comment enrichment (cross-language).** A symbol's leading documentation is
+often the closest thing in the code to how a human would *phrase the task* — so
+it is indexed alongside the signature for both lexical and semantic seeding.
+Python uses its AST docstring; every other language contributes its native doc
+comment: Go `// …`, Rust `/// …` / `//! …`, Java/JS/TS `/** … */`
+(Javadoc / JSDoc / TSDoc), C# `/// <summary>…`, and the long tail via a
+best-effort leading-comment scan. This measurably lifts retrieval on polyglot
+repos where the identifier alone doesn't match the query.
 
 For real neural semantic search:
 
@@ -445,8 +490,11 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 | `get_lines(file, start, end)` | Surgical fetch of an exact line range — clamped, **secret-scanned**, sandboxed to the repo |
 | `get_callers(qname)` / `get_callees(qname)` | Edges into / out of a symbol |
 | `get_impact(qname)` | Blast radius: direct + transitive callers, subclasses, files & tests touched |
+| `get_method_impact(qname)` | **Function-level** change safety: callers that break on a signature change (with file:line call sites), callees (dependencies), same-name overrides/overloads, transitive callers, tests touched |
 | `explain_file(file)` | Signatures + imports + external callers (who depends on a file) |
 | `get_map(kind)` | Project graph: `imports`, `hierarchy` (class inheritance), `routes` (HTTP endpoints), or `hubs` (fan-in/out + import cycles) |
+| `get_architecture_overview()` | Whole-repo shape in one call: module breakdown, hub files, import cycles, language mix, and route totals |
+| `get_test_map(target="")` | Map implementations ↔ tests (naming conventions + call graph). No target = whole-repo map + coverage %; a symbol = its tests. F1-benchmarked via `test-map --benchmark` |
 | `get_module_summary(file)` | Compact, few-token overview of a whole file |
 | `set_module_summary(file, summary)` | Cache an agent-written summary (persists until the file changes) |
 | `file_skeleton(file)` | Signatures for every definition in a file (no bodies) |
