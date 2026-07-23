@@ -191,6 +191,8 @@ python tokengraph_all.py embed-warm                      # fetch the semantic mo
 python tokengraph_all.py benchmark --check               # CI gate: answer-quality across 4 repos, exit 1 on regression
 python tokengraph_all.py test-map --benchmark --check     # CI gate: impl<->test F1 (exit 1 below --min-f1)
 python tokengraph_all.py publish-benchmark               # publish-ready artifacts: REPORT.md + MANIFEST.json (hashed) + .zenodo.json + CITATION.cff
+python tokengraph_all.py zenodo-publish --dry-run        # preview the Zenodo deposition (sandbox + draft by default)
+python tokengraph_all.py zenodo-publish --production --publish  # mint the permanent DOI (irreversible; needs ZENODO_TOKEN)
 python tokengraph_all.py ide-setup --workspace-root repo-a --workspace-root repo-b  # multi-root wiring
 python tokengraph_all.py ide-plugin                      # scaffold installable plugins: VS Code .vsix / Neovim Lua / JetBrains
 python tokengraph_all.py freeze --build                  # build a standalone binary now (PyInstaller)

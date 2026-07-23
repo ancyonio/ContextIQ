@@ -2,7 +2,7 @@
 
 > Reproducible, self-contained benchmark of ContextIQ (`tokengraph`) — token-efficient code context retrieval, cross-language test discovery, and hallucination guarding. Every input is content-hashed (see `benchmarks/MANIFEST.json`) so a third party can verify they ran the same dataset.
 
-- Generated: 2026-07-23 19:25 UTC
+- Generated: 2026-07-23 20:03 UTC
 - Dataset hash: `0443130df021f6f2d1a36a65f07de28a260d9dc264d044996ef2319e31eedbb3` (56 files)
 - Extractor: `3:bash,c,cpp,csharp,dart,erlang,go,haskell,java,javascript,julia,kotlin,lua,nim,ocaml,perl,php,powershell,r,ruby,rust,scala,solidity,swift,tsx,typescript` · Python 3.11.13
 
@@ -12,19 +12,19 @@
 |---|--:|
 | Queries | 96 |
 | Corpora | 4 |
-| Recall@5 | 0.989 |
-| Symbol recall | 0.745 |
-| Answerable rate | 0.584 |
-| Irrelevant-token ratio (waste) | 0.673 |
+| Recall@5 | 0.958 |
+| Symbol recall | 0.709 |
+| Answerable rate | 0.448 |
+| Irrelevant-token ratio (waste) | 0.704 |
 
 ### Per-corpus
 
 | Corpus | n | Recall@5 | Symbol recall | Answerable | Waste |
 |---|--:|--:|--:|--:|--:|
-| retrieval_tasks | 42 | 0.976 | 0.643 | 0.548 | 0.522 |
-| gosvc | 18 | 1.0 | 0.778 | 0.611 | 0.836 |
-| pyshop | 18 | 1.0 | 0.972 | 0.667 | 0.718 |
-| tsapi | 18 | 1.0 | 0.722 | 0.556 | 0.817 |
+| retrieval_tasks | 42 | 0.976 | 0.548 | 0.405 | 0.566 |
+| gosvc | 18 | 0.944 | 0.833 | 0.556 | 0.838 |
+| pyshop | 18 | 1.0 | 0.889 | 0.556 | 0.774 |
+| tsapi | 18 | 0.889 | 0.778 | 0.333 | 0.821 |
 
 ## 2. Test discovery (implementation ↔ test mapping)
 

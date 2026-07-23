@@ -1,7 +1,7 @@
 {
   "title": "ContextIQ: A Reproducible Benchmark for Token-Efficient, Verifiable AI Code Context",
   "upload_type": "dataset",
-  "description": "ContextIQ is a local code-graph server that gives AI coding agents token-efficient, verifiable context. This deposition archives its reproducible benchmark: retrieval quality (Recall@5=0.989 over 96 queries across 4 corpora), cross-language test-discovery (F1=0.9474), and a hallucination-guard measurement, plus a content-hashed dataset manifest for exact reproduction.",
+  "description": "ContextIQ is a local code-graph server that gives AI coding agents token-efficient, verifiable context. This deposition archives its reproducible benchmark: retrieval quality (Recall@5=0.958 over 96 queries across 4 corpora), cross-language test-discovery (F1=0.9474), and a hallucination-guard measurement, plus a content-hashed dataset manifest for exact reproduction.",
   "creators": [
     {
       "name": "ContextIQ maintainers"

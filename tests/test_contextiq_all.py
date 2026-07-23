@@ -3593,6 +3593,64 @@ class BenchmarkPublicationTests(unittest.TestCase):
         self.assertIn("cff-version", tg.citation_cff())
 
 
+class ZenodoPublishTests(unittest.TestCase):
+    """Zenodo deposition planning + safety guards (no network)."""
+
+    def _seed(self, root: Path):
+        _write(root, ".zenodo.json",
+               json.dumps({"title": "T", "upload_type": "dataset",
+                           "creators": [{"name": "X"}]}))
+        _write(root, "benchmarks/REPORT.md", "# report\n")
+        _write(root, "benchmarks/MANIFEST.json", "{}\n")
+        _write(root, "CITATION.cff", "cff-version: 1.2.0\n")
+
+    def test_plan_sandbox_draft_default(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            self._seed(root)
+            plan = tg.zenodo_plan(root)
+            self.assertIn("sandbox.zenodo.org", plan["base"])   # safe default
+            self.assertFalse(plan["publish"])
+            self.assertIn("benchmarks/REPORT.md", plan["files"])
+            # a draft plan never contains the irreversible publish action
+            self.assertFalse(any("publish" in s["path"] for s in plan["steps"]))
+
+    def test_plan_production_publish_adds_mint_step(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            self._seed(root)
+            plan = tg.zenodo_plan(root, sandbox=False, publish=True)
+            self.assertEqual(plan["base"], tg.ZENODO_API)       # production
+            self.assertTrue(any("actions/publish" in s["path"] for s in plan["steps"]))
+
+    def test_plan_requires_zenodo_json(self):
+        with TemporaryDirectory() as d:
+            with self.assertRaises(FileNotFoundError):
+                tg.zenodo_plan(Path(d))
+
+    def test_deposit_refuses_without_token(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            self._seed(root)
+            with self.assertRaises(RuntimeError):
+                tg.zenodo_deposit(root, token="")
+
+    def test_deposit_refuses_in_offline_mode(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            self._seed(root)
+            old = os.environ.get("TOKENGRAPH_OFFLINE")
+            os.environ["TOKENGRAPH_OFFLINE"] = "1"
+            try:
+                with self.assertRaises(RuntimeError):
+                    tg.zenodo_deposit(root, token="tok", sandbox=True)
+            finally:
+                if old is None:
+                    os.environ.pop("TOKENGRAPH_OFFLINE", None)
+                else:
+                    os.environ["TOKENGRAPH_OFFLINE"] = old
+
+
 class IdeCompletenessTests(unittest.TestCase):
     """One-command IDE completeness: MCP wiring + steering rules + verify."""
 

@@ -14693,18 +14693,24 @@ def cmd_publish_benchmark(args):
         "Then confirm `benchmarks/MANIFEST.json`'s `dataset_hash` matches — it is "
         "a SHA-256 over every benchmark input, so an identical hash proves an "
         "identical dataset.\n\n"
-        "## Archive with a DOI (maintainer step)\n\n"
-        "The generated `.zenodo.json` and `CITATION.cff` are deposition-ready. "
-        "Before uploading, set the author/ORCID/affiliation in both. Then, with a "
-        "Zenodo token:\n\n"
+        "## Archive with a DOI\n\n"
+        "The generated `.zenodo.json` and `CITATION.cff` are deposition-ready "
+        "(set the author/ORCID/affiliation first). `tokengraph zenodo-publish` "
+        "deposits the artifacts and mints the DOI directly — sandbox and *draft* "
+        "by default, so nothing is permanent until you opt in:\n\n"
         "```bash\n"
-        "# create a deposition, upload REPORT.md + MANIFEST.json + the benchmarks/ "
-        "tree, then publish\n"
-        "# see https://developers.zenodo.org/#deposstions — the upload needs your "
-        "credentials, so it is intentionally not automated here.\n"
+        "# 1. dry run — see exactly what will be uploaded, no token needed\n"
+        "tokengraph zenodo-publish --dry-run\n\n"
+        "# 2. create a DRAFT on the safe sandbox to review it\n"
+        "export ZENODO_TOKEN=...        # from sandbox.zenodo.org/account/settings/applications\n"
+        "tokengraph zenodo-publish\n\n"
+        "# 3. mint the PERMANENT DOI on production (irreversible)\n"
+        "export ZENODO_TOKEN=...        # from zenodo.org/account/settings/applications\n"
+        "tokengraph zenodo-publish --production --publish\n"
         "```\n\n"
         "The DOI Zenodo mints is what turns this from *reproducible* into "
-        "*peer-archived*.\n"
+        "*peer-archived*. Minting requires `--production --publish` together, so "
+        "a stray run can never publish by accident.\n"
     )
 
     outputs = {
@@ -14743,6 +14749,171 @@ def cmd_publish_benchmark(args):
             print(f"  wrote {w}")
         if not written:
             print("  (dry run — nothing written)")
+
+
+# ==========================================================================
+# Zenodo deposition (BM-DOI): mint a DOI for the benchmark, from stdlib only
+# ==========================================================================
+# `publish-benchmark` produces the deposition-ready artifacts; this uploads them
+# to Zenodo and (only on an explicit --publish) mints the DOI, closing the last
+# gap to a peer-archived benchmark. Safety is layered: sandbox by default, a
+# reversible *draft* by default, offline-gated, token never logged, and minting
+# a (permanent) DOI requires --production --publish together.
+
+ZENODO_API = "https://zenodo.org/api"
+ZENODO_SANDBOX_API = "https://sandbox.zenodo.org/api"
+
+# The reproducibility set uploaded by default. MANIFEST.json carries the
+# content hashes, so a reproducer can verify the exact dataset.
+ZENODO_DEFAULT_FILES = ("benchmarks/REPORT.md", "benchmarks/MANIFEST.json",
+                        "CITATION.cff", ".zenodo.json")
+
+
+def zenodo_plan(root: Path, *, sandbox: bool = True, publish: bool = False,
+                files: list[str] | None = None) -> dict:
+    """Build the deposition plan (endpoints + metadata + files) — no network."""
+    import json
+    root = Path(root).resolve()
+    zpath = root / ".zenodo.json"
+    if not zpath.exists():
+        raise FileNotFoundError(
+            ".zenodo.json not found — run `tokengraph publish-benchmark` first")
+    meta = json.loads(zpath.read_text(encoding="utf-8"))
+    rels = list(files) if files else list(ZENODO_DEFAULT_FILES)
+    present = [f for f in rels if (root / f).exists()]
+    missing = [f for f in rels if not (root / f).exists()]
+    base = ZENODO_SANDBOX_API if sandbox else ZENODO_API
+    steps = [{"method": "POST", "path": "/deposit/depositions",
+              "note": "create draft deposition"}]
+    for f in present:
+        steps.append({"method": "PUT", "path": "{bucket}/" + Path(f).name,
+                      "file": f, "note": "upload"})
+    steps.append({"method": "PUT", "path": "/deposit/depositions/{id}",
+                  "note": "set metadata"})
+    if publish:
+        steps.append({"method": "POST",
+                      "path": "/deposit/depositions/{id}/actions/publish",
+                      "note": "PUBLISH — mints a permanent DOI"})
+    return {"base": base, "sandbox": sandbox, "publish": publish,
+            "metadata": {"metadata": meta}, "files": present,
+            "missing_files": missing, "steps": steps}
+
+
+def _zenodo_http(method: str, url: str, token: str, *, json_body: dict | None = None,
+                 raw: bytes | None = None, content_type: str = "application/json"):
+    """One Zenodo REST call. Returns parsed JSON (or {} for empty 2xx)."""
+    import json
+    import urllib.request
+    import urllib.error
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = content_type
+    elif raw is not None:
+        data = raw
+        headers["Content-Type"] = "application/octet-stream"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"Zenodo {method} {url.split('?')[0]} -> "
+                           f"HTTP {e.code}: {detail}") from None
+
+
+def zenodo_deposit(root: Path, *, token: str, sandbox: bool = True,
+                   publish: bool = False, files: list[str] | None = None) -> dict:
+    """Create a deposition, upload artifacts, set metadata, optionally publish.
+
+    Returns the deposition id, its edit URL, and the (pre-reserved or minted)
+    DOI. Never prints the token. Refuses in offline mode.
+    """
+    if offline_mode():
+        raise RuntimeError("offline mode (TOKENGRAPH_OFFLINE) — refusing network upload")
+    if not token:
+        raise RuntimeError("no Zenodo token (pass --token or set ZENODO_TOKEN)")
+    plan = zenodo_plan(root, sandbox=sandbox, publish=publish, files=files)
+    base = plan["base"]
+    root = Path(root).resolve()
+
+    dep = _zenodo_http("POST", f"{base}/deposit/depositions", token, json_body={})
+    dep_id = dep["id"]
+    bucket = dep["links"]["bucket"]
+    for rel in plan["files"]:
+        data = (root / rel).read_bytes()
+        _zenodo_http("PUT", f"{bucket}/{Path(rel).name}", token, raw=data)
+    _zenodo_http("PUT", f"{base}/deposit/depositions/{dep_id}", token,
+                 json_body=plan["metadata"])
+    doi = (dep.get("metadata", {}).get("prereserve_doi", {}) or {}).get("doi")
+    published = False
+    if publish:
+        pub = _zenodo_http(
+            "POST", f"{base}/deposit/depositions/{dep_id}/actions/publish", token)
+        doi = pub.get("doi") or doi
+        published = True
+    return {
+        "deposition_id": dep_id,
+        "sandbox": sandbox,
+        "published": published,
+        "doi": doi,
+        "edit_url": f"{base.replace('/api', '')}/deposit/{dep_id}",
+        "uploaded": [Path(f).name for f in plan["files"]],
+    }
+
+
+def cmd_zenodo_publish(args):
+    root = Path(args.path).resolve()
+    token = getattr(args, "token", None) or os.environ.get("ZENODO_TOKEN", "")
+    sandbox = not getattr(args, "production", False)
+    publish = getattr(args, "publish", False)
+
+    if getattr(args, "dry_run", False) or (not token and not getattr(args, "force", False)):
+        try:
+            plan = zenodo_plan(root, sandbox=sandbox, publish=publish)
+        except FileNotFoundError as e:
+            sys.exit(str(e))
+        target = "sandbox.zenodo.org" if sandbox else "zenodo.org (PRODUCTION)"
+        if getattr(args, "json", False):
+            _emit(plan, True)
+        else:
+            print(f"Zenodo deposition plan → {target}"
+                  + ("  [DRY RUN]" if getattr(args, "dry_run", False)
+                     else "  (no token; showing plan only)"))
+            for f in plan["files"]:
+                print(f"  upload {f}")
+            for f in plan["missing_files"]:
+                print(f"  MISSING {f} (run publish-benchmark)")
+            for s in plan["steps"]:
+                print(f"  {s['method']:4} {s['path']}  — {s['note']}")
+            print(f"  metadata: {plan['metadata']['metadata'].get('title', '')[:60]}…")
+            if publish:
+                print("  NOTE: --publish will mint a PERMANENT DOI (irreversible).")
+            if not token:
+                print("  Set ZENODO_TOKEN (or --token) to execute.")
+        return
+
+    if publish and not sandbox:
+        print("! Publishing to PRODUCTION Zenodo mints a permanent, "
+              "non-deletable DOI.", file=sys.stderr)
+    try:
+        res = zenodo_deposit(root, token=token, sandbox=sandbox, publish=publish)
+    except (RuntimeError, KeyError) as e:
+        sys.exit(f"zenodo-publish failed: {e}")
+    if getattr(args, "json", False):
+        _emit(res, True)
+    else:
+        state = "PUBLISHED" if res["published"] else "draft (not yet published)"
+        print(f"Zenodo deposition {res['deposition_id']} — {state}"
+              + ("  [sandbox]" if res["sandbox"] else ""))
+        print(f"  uploaded: {', '.join(res['uploaded'])}")
+        if res["doi"]:
+            print(f"  DOI: {res['doi']}")
+        print(f"  review/edit: {res['edit_url']}")
+        if not res["published"]:
+            print("  (draft — review it, then re-run with --publish to mint the DOI)")
 
 
 def check_benchmark_thresholds(result: dict,
@@ -15770,6 +15941,22 @@ def build_parser():
                     help="compute everything but write nothing")
     pb.add_argument("--json", action="store_true")
     pb.set_defaults(func=cmd_publish_benchmark)
+
+    zp = sub.add_parser("zenodo-publish",
+                        help="deposit the benchmark artifacts to Zenodo and "
+                             "(with --publish) mint a DOI; sandbox + draft by default")
+    zp.add_argument("--token", default=None,
+                    help="Zenodo API token (or set ZENODO_TOKEN); omit to show the plan")
+    zp.add_argument("--production", action="store_true",
+                    help="target zenodo.org instead of the safe sandbox.zenodo.org")
+    zp.add_argument("--publish", action="store_true",
+                    help="mint a PERMANENT DOI (irreversible); default leaves a draft")
+    zp.add_argument("--dry-run", action="store_true",
+                    help="show the deposition plan without uploading")
+    zp.add_argument("--force", action="store_true",
+                    help="proceed to upload even though this needs a token")
+    zp.add_argument("--json", action="store_true")
+    zp.set_defaults(func=cmd_zenodo_publish)
 
     an = sub.add_parser("analyze",
                         help="per-file signatures/tokens/extractor/coverage (CI-5)")

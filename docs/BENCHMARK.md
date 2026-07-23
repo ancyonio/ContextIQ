@@ -17,13 +17,21 @@ tokengraph publish-benchmark --full
 
 Then confirm `benchmarks/MANIFEST.json`'s `dataset_hash` matches — it is a SHA-256 over every benchmark input, so an identical hash proves an identical dataset.
 
-## Archive with a DOI (maintainer step)
+## Archive with a DOI
 
-The generated `.zenodo.json` and `CITATION.cff` are deposition-ready. Before uploading, set the author/ORCID/affiliation in both. Then, with a Zenodo token:
+The generated `.zenodo.json` and `CITATION.cff` are deposition-ready (set the author/ORCID/affiliation first). `tokengraph zenodo-publish` deposits the artifacts and mints the DOI directly — sandbox and *draft* by default, so nothing is permanent until you opt in:
 
 ```bash
-# create a deposition, upload REPORT.md + MANIFEST.json + the benchmarks/ tree, then publish
-# see https://developers.zenodo.org/#deposstions — the upload needs your credentials, so it is intentionally not automated here.
+# 1. dry run — see exactly what will be uploaded, no token needed
+tokengraph zenodo-publish --dry-run
+
+# 2. create a DRAFT on the safe sandbox to review it
+export ZENODO_TOKEN=...        # from sandbox.zenodo.org/account/settings/applications
+tokengraph zenodo-publish
+
+# 3. mint the PERMANENT DOI on production (irreversible)
+export ZENODO_TOKEN=...        # from zenodo.org/account/settings/applications
+tokengraph zenodo-publish --production --publish
 ```
 
-The DOI Zenodo mints is what turns this from *reproducible* into *peer-archived*.
+The DOI Zenodo mints is what turns this from *reproducible* into *peer-archived*. Minting requires `--production --publish` together, so a stray run can never publish by accident.
