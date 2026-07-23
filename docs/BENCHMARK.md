@@ -1,6 +1,6 @@
-# Benchmark: methodology & how to archive
+# Benchmark: methodology, reproduction & DOI archival
 
-ContextIQ ships a reproducible benchmark. This document explains how to reproduce it and how to archive it with a DOI.
+ContextIQ ships a reproducible benchmark. This is the complete end-to-end runbook: measure → publish artifacts → verify → mint a DOI.
 
 ## What is measured
 
@@ -8,30 +8,51 @@ ContextIQ ships a reproducible benchmark. This document explains how to reproduc
 - **Test discovery** — precision / recall / F1 / hit@1 of the implementation↔test mapping on the labeled `benchmarks/testmap/` corpus (`tokengraph test-map --benchmark`).
 - **Hallucination guard** — grounding coverage + guard catch/specificity (`tokengraph publish-benchmark --full`).
 
-## Reproduce
+## End-to-end runbook
 
 ```bash
+# 0. install (single file; [all] pulls tree-sitter + tokenizers)
 pip install 'contextiq[all]'
+
+# 1. run the individual benchmarks (optional — step 2 runs them for you)
+tokengraph benchmark --all            # retrieval quality across all corpora
+tokengraph test-map --benchmark       # impl<->test precision/recall/F1/hit@1
+
+# 2. build the publish-ready artifacts (REPORT.md, MANIFEST.json,
+#    .zenodo.json, CITATION.cff). --full also runs the hallucination guard.
 tokengraph publish-benchmark --full
-```
 
-Then confirm `benchmarks/MANIFEST.json`'s `dataset_hash` matches — it is a SHA-256 over every benchmark input, so an identical hash proves an identical dataset.
+# 3. verify reproducibility: MANIFEST.json's dataset_hash is a SHA-256
+#    over every benchmark input, so an identical hash == identical dataset.
+tokengraph publish-benchmark --json | grep dataset_hash   # compare to a peer's
 
-## Archive with a DOI
+# 4. edit .zenodo.json + CITATION.cff — set the author name / ORCID /
+#    affiliation before archiving.
 
-The generated `.zenodo.json` and `CITATION.cff` are deposition-ready (set the author/ORCID/affiliation first). `tokengraph zenodo-publish` deposits the artifacts and mints the DOI directly — sandbox and *draft* by default, so nothing is permanent until you opt in:
-
-```bash
-# 1. dry run — see exactly what will be uploaded, no token needed
+# 5. preview the Zenodo deposition (no token needed, nothing uploaded)
 tokengraph zenodo-publish --dry-run
 
-# 2. create a DRAFT on the safe sandbox to review it
-export ZENODO_TOKEN=...        # from sandbox.zenodo.org/account/settings/applications
+# 6. create a DRAFT on the safe sandbox and review it in the web UI
+export ZENODO_TOKEN=...    # sandbox.zenodo.org/account/settings/applications
 tokengraph zenodo-publish
 
-# 3. mint the PERMANENT DOI on production (irreversible)
-export ZENODO_TOKEN=...        # from zenodo.org/account/settings/applications
+# 7. mint the PERMANENT DOI on production (irreversible — needs both flags)
+export ZENODO_TOKEN=...    # zenodo.org/account/settings/applications
 tokengraph zenodo-publish --production --publish
 ```
 
-The DOI Zenodo mints is what turns this from *reproducible* into *peer-archived*. Minting requires `--production --publish` together, so a stray run can never publish by accident.
+The DOI Zenodo mints turns the benchmark from *reproducible* into *peer-archived*.
+
+## `zenodo-publish` safety model
+
+Every default is the safe one; each escalation is explicit:
+
+| Guard | Default | Behavior |
+|---|---|---|
+| Target | sandbox | `sandbox.zenodo.org`; `--production` for the real site |
+| State | draft (reversible) | `--publish` required to actually publish |
+| DOI mint | off | needs `--production --publish` **together** — no accidental mint |
+| Offline | refuses | blocked when `TOKENGRAPH_OFFLINE` is set |
+| Token | none | `--token` or `ZENODO_TOKEN`; never logged; `--dry-run` needs none |
+
+What gets uploaded: `benchmarks/REPORT.md`, `benchmarks/MANIFEST.json`, `CITATION.cff`, and `.zenodo.json`. `zenodo-publish --dry-run` prints the exact deposition plan (endpoints, files, metadata) before anything leaves your machine.
