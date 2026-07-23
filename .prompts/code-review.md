@@ -11,4 +11,4 @@ Review the current diff for bugs, regressions, and maintainability risks.
 
 ## Instructions
 Check the @current_diff and reference specific lines in the source files.
-Cross-reference with the ContextIQ call graph (`get_callers`, `get_callees`) to assess the blast radius of changes.
+Assess the blast radius with the ContextIQ call graph: `get_diff_context` for a budgeted pack of exactly what the diff touches, and `get_method_impact(qname)` for any changed function (who breaks, dependencies, overrides, tests touched).

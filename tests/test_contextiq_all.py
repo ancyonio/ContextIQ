@@ -3511,6 +3511,37 @@ class TestDiscoveryTests(unittest.TestCase):
                 r.close()
 
 
+class GeneratedBlockTests(unittest.TestCase):
+    """Markdown files are listed, never skeleton-injected, in the context block."""
+
+    def test_markdown_is_listed_not_skeletonised(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            db = root / ".tokengraph" / "graph.db"
+            _write(root, "mod.py", SAMPLE)
+            _write(root, "README.md", "# Title\n## Section\ntext\n")
+            tg.index_repo(root, db)
+            r = tg.Retriever(root, db)
+            try:
+                payload = tg.build_context_payload(
+                    r, root, strategy="hot-cold", src_dirs=["."], budget=8000,
+                    hot_commits=10, diff=False, staged=False, config={})
+            finally:
+                r.close()
+            md = payload["markdown"]
+            # no markdown skeleton injected...
+            self.assertNotIn("# skeleton: README.md", md)
+            # ...but the code file is, and the prose file is still referenced by name
+            self.assertIn("# skeleton: mod.py", md)
+            self.assertIn("`README.md`", md)
+
+    def test_skeleton_injectable_predicate(self):
+        self.assertFalse(tg._skeleton_injectable("README.md"))
+        self.assertFalse(tg._skeleton_injectable(".cursor/rules/x.mdc"))
+        self.assertTrue(tg._skeleton_injectable("tokengraph_all.py"))
+        self.assertTrue(tg._skeleton_injectable("pkg/x.go"))
+
+
 class BenchmarkPublicationTests(unittest.TestCase):
     """Publish-ready benchmark artifacts (reproducible dataset + metadata)."""
 

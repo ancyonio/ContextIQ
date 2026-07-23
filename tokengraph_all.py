@@ -7140,12 +7140,26 @@ def _scan_todos(root: Path, files: list[str], cap: int = 10) -> list[str]:
     return hits
 
 
+# Files whose "skeleton" is prose, not code signatures. A markdown file's
+# skeleton is just its heading outline — noise in a signature map — and when the
+# file is itself a generated output (e.g. copilot-instructions.md) that lands in
+# the hot set, injecting its skeleton recursively duplicates the generated block.
+# These are listed by name instead of having a skeleton injected.
+SKELETON_EXCLUDED_EXTS = (".md", ".markdown", ".mdc", ".mdx")
+
+
+def _skeleton_injectable(path: str) -> bool:
+    """False for prose (markdown) files that should be listed, not skeletonised."""
+    return not path.lower().endswith(SKELETON_EXCLUDED_EXTS)
+
+
 def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
                           src_dirs: list[str], budget: int, hot_commits: int,
                           diff: bool, staged: bool, config: dict) -> dict:
     """Render the always-on context markdown for a strategy (TB-4) + metadata."""
     files = r.all_files(src_dirs)
-    skeletons = {f: r.file_skeleton(f) for f in files}
+    # Only code files get a skeleton; prose (markdown) is listed by name below.
+    skeletons = {f: r.file_skeleton(f) for f in files if _skeleton_injectable(f)}
     total_sig = sum(count_tokens(s) for s in skeletons.values())
     repo_total = r.store.repo_token_total()
     modules = [m for m in r.list_modules()
@@ -7202,7 +7216,7 @@ def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
         if not hot_files:
             hot_files = [f for f in git_recent_files(root, hot_commits) if f in skeletons]
         if not hot_files:                         # no git history → seed with a few
-            hot_files = files[:min(5, len(files))]
+            hot_files = [f for f in files if f in skeletons][:5]
         cold_files = [f for f in files if f not in set(hot_files)]
         body.append("## Hot — recently changed (full signatures injected)")
         used = 0
@@ -7224,7 +7238,9 @@ def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
         body.append("## Signatures")
         used = 0
         for f in files:
-            sk = skeletons[f]
+            sk = skeletons.get(f)
+            if sk is None:                         # prose file — no skeleton
+                continue
             est = count_tokens(sk)
             if used and used + est > budget:
                 body.append(f"_… {len([x for x in files])} files; budget {budget:,} "

@@ -103,6 +103,8 @@ Recommended files:
 
 This repo already uses `.github/copilot-instructions.md` and `CLAUDE.md` to tell agents to use ContextIQ first.
 
+One command wires both the MCP server and these steering files into every editor: `python tokengraph_all.py ide-setup` (add `--verify` to prove each editor is wired, `--global` for Windsurf/Cline). ContextIQ is **model-agnostic and offline** — it emits context packs and never calls an LLM, so the same setup serves cloud agents (Copilot, Claude Code, Cursor) and local models (Ollama, llama.cpp, vLLM) alike.
+
 ---
 
 ## 2. Use ContextIQ First
@@ -114,12 +116,15 @@ ContextIQ is the main token-saving mechanism in this repository. It indexes code
 Use this order when exploring code:
 
 1. `find_relevant_context(task)` - start here for most coding tasks.
-2. `search_semantic(query)` - use when you know the behavior but not the symbol name.
+2. `search_semantic(query)` - use when you know the behavior but not the symbol name. Cross-language doc comments (godoc/rustdoc/Javadoc/JSDoc/TSDoc) are indexed, so opaque identifiers still match by meaning.
 3. `get_symbol(qname)` - fetch the full source for one specific symbol.
 4. `get_callers(qname)` and `get_callees(qname)` - trace dependencies.
-5. `file_skeleton(file)` - inspect signatures without reading bodies.
-6. `get_module_summary(file)` - understand a file in a few tokens.
-7. `estimate_savings(task)` - compare context pack size with full-file reading.
+5. `get_method_impact(qname)` - function-level blast radius before an edit: who breaks (with call sites), dependencies, and overrides.
+6. `get_test_map(target)` - the tests for a file/symbol (naming + call graph); omit the target for the whole-repo impl↔test map and coverage %.
+7. `get_architecture_overview()` - one-call orientation: modules, hub files, import cycles, language mix, and route totals.
+8. `file_skeleton(file)` - inspect signatures without reading bodies.
+9. `get_module_summary(file)` - understand a file in a few tokens.
+10. `estimate_savings(task)` - compare context pack size with full-file reading.
 
 Only open full files when you need to edit them or when the context pack explicitly drops something required.
 
@@ -133,6 +138,10 @@ python tokengraph_all.py context "fix stale module summary invalidation" -b 4000
 python tokengraph_all.py semantic "call graph lookup"
 python tokengraph_all.py skeleton tokengraph_all.py
 python tokengraph_all.py measure "add retry support to MCP server startup"
+python tokengraph_all.py method-impact tokengraph_all.Retriever.get_impact  # who breaks / deps / call sites
+python tokengraph_all.py arch                                  # whole-repo overview in one call
+python tokengraph_all.py test-map                              # implementations <-> tests + coverage %
+python tokengraph_all.py repomix --out pack.xml                # export the signature map as a Repomix pack
 ```
 
 For another repository:
