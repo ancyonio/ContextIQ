@@ -340,6 +340,39 @@ MAX_NEIGHBOR_SIGS = 40          # neighbour signatures actually emitted
 # but the least explanatory of the three.
 NEIGHBOR_REASON_WEIGHT = {"callee": 1.0, "base": 0.95, "caller": 0.7}
 
+# SR-1: within-file completion.
+#
+# The benchmark exposed the failure this fixes. Retrieval finds the right FILE
+# almost always (recall@5 0.979) but used to leave the pack *half empty* while
+# omitting the one symbol the question was about: seeds and graph neighbours
+# were the only sources of content, so once both were exhausted assembly
+# stopped — a 6000-token budget routinely returned a 2000-token pack that did
+# not contain the answer. Measured on gosvc, "stop two workers ... writing
+# their version" returned 2455/6000 tokens with sixteen full bodies from seven
+# files and *not* `Store.UpdateStatus`, which was the answer, in the
+# second-ranked file.
+#
+# The completion sweep spends the leftover budget where the evidence already
+# points: remaining symbols of the files the pack has already committed to,
+# bodies first for the small ones (facts live in bodies, not signatures), then
+# signatures for breadth.
+SWEEP_FILES = 4             # files eligible for completion, by file score
+SWEEP_BODY_MAX_TOKENS = 420  # a body larger than this is swept in as a signature
+SWEEP_BODY_MAX_LINES = 90    # cheap pre-reject, so long bodies are never read
+SWEEP_BODY_SHARE = 0.6       # of the leftover budget; the rest buys breadth
+# Physical adjacency to already-included code was tried as a ranking signal —
+# the case for it is that a controlling constant is declared next to the code
+# that spends it, and no word overlap will ever connect them. It does not
+# survive measurement: as a multiplier it cost 28 points of answerability on
+# gosvc and as a mild additive term it still cost 5, because it reliably
+# promoted whatever the seeds happened to sit beside over the symbol the
+# question was actually about. Relevance, then breadth, beats locality.
+SWEEP_CANDIDATES_PER_FILE = 80   # cost-scoring cap; keeps large files cheap
+# Full bodies are only granted to seeds whose file is among the top few by
+# score. Bodies from weakly-ranked files were the dominant source of wasted
+# tokens: they cost the most and are least likely to be on target.
+BODY_FILE_RANK = 3
+
 
 # ==========================================================================
 # python parser (stdlib ast)
@@ -441,6 +474,24 @@ def _callee_name(call: ast.Call) -> Optional[str]:
     return None
 
 
+BINDING_SIGNATURE_CHARS = 240
+
+
+def _binding_signature(node: ast.AST, src_lines: list[str]) -> str:
+    """The assignment as written, collapsed to one line and bounded.
+
+    The *value* is the point — a constant whose signature is just its name
+    answers nothing. Long literals (a big dict of thresholds) are truncated
+    rather than dropped, and the body still carries the full text.
+    """
+    start = (node.lineno or 1) - 1
+    end = min(len(src_lines), getattr(node, "end_lineno", node.lineno) or node.lineno)
+    text = " ".join(line.strip() for line in src_lines[start:end])
+    text = " ".join(text.split())
+    return (text[:BINDING_SIGNATURE_CHARS] + " …"
+            if len(text) > BINDING_SIGNATURE_CHARS else text)
+
+
 def _base_name(base: ast.AST) -> Optional[str]:
     if isinstance(base, ast.Name):
         return base.id
@@ -494,6 +545,45 @@ class _Collector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node):
         self._visit_def(node, "class")
+
+    # --- module- and class-level bindings (CN-1) ---
+    #
+    # Constants were invisible to the graph: only defs and classes became
+    # symbols, so `MAX_LINES_PER_ORDER`, `RETRYABLE_STATUS` and
+    # `Retriever.GREP_WINDOW_LINES` could not be searched for, ranked, or
+    # pulled into a pack — yet "what is the limit / which statuses retry / how
+    # big is the window" is exactly the sort of question a controlling constant
+    # answers. The benchmark showed packs that found the right file and still
+    # missed the constant that *was* the answer.
+    #
+    # Only definitional scopes count. A local inside a function is
+    # implementation detail no question is ever about, and indexing locals
+    # would swamp the symbol table.
+    def _visit_binding(self, node, names: list[str]):
+        if not self._scope_is_definitional():
+            return
+        end = getattr(node, "end_lineno", node.lineno) or node.lineno
+        for name in names:
+            self.symbols.append(Symbol(
+                qname=self._qname(name), name=name, kind="constant",
+                file=self.file, lineno=node.lineno, end_lineno=end,
+                signature=_binding_signature(node, self.src_lines),
+                docstring="", parent=self._scope[-1],
+            ))
+
+    def visit_Assign(self, node):
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        self._visit_binding(node, names)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        if isinstance(node.target, ast.Name):
+            self._visit_binding(node, [node.target.id])
+        self.generic_visit(node)
+
+    def _scope_is_definitional(self) -> bool:
+        """True at module scope or directly inside a class body."""
+        return self._scope[-1] == self.module or self._is_class_scope()
 
     def visit_Call(self, node):
         owner = self._scope[-1]
@@ -632,6 +722,13 @@ class LanguageProfile:
     # (e.g. Ruby `helper` with no parens parses as a plain identifier). Edges
     # are speculative: the resolver only links them when a unique symbol matches.
     BARE_CALL_NODES: set[str] = set()
+    # CN-1: node types that bind a name to a value at file or type scope —
+    # `const`/`var` blocks, class fields, exported literals. These become
+    # `constant` symbols so a controlling value (a retry set, a size limit, a
+    # status code) is searchable and packable in its own right, instead of
+    # being reachable only by accident through a chunk. Locals are excluded:
+    # the walker only consults this at definitional scope.
+    BINDING_KINDS: dict[str, str] = {}
 
     def __init__(self, language):
         from tree_sitter import Parser  # type: ignore[import-not-found]
@@ -666,6 +763,31 @@ class LanguageProfile:
         """For lambdas assigned to names: (name, kind, def_node, body_node) or None."""
         return None
 
+    def binding_names(self, node) -> list[str]:
+        """Names bound by a BINDING_KINDS node (CN-1).
+
+        The default handles the shape every C-family grammar shares: one or
+        more declarator/spec children each carrying a `name` field. A single
+        statement may bind several names (`const a = 1, b = 2`; Go's
+        `var ( x int; y string )`), so this returns a list.
+        """
+        out: list[str] = []
+        for d in _descendants(node):
+            if d.type in self.BINDING_DECLARATORS:
+                n = d.child_by_field_name("name")
+                if n is not None and (txt := _text(n)):
+                    out.append(txt)
+        if not out:
+            n = node.child_by_field_name("name")
+            if n is not None and (txt := _text(n)):
+                out.append(txt)
+        return out
+
+    # Declarator/spec nodes searched by the default `binding_names`.
+    BINDING_DECLARATORS: set[str] = {
+        "variable_declarator", "const_spec", "var_spec", "init_declarator",
+    }
+
 
 class JavaProfile(LanguageProfile):
     name = "java"
@@ -677,6 +799,7 @@ class JavaProfile(LanguageProfile):
     }
     CALL_TYPES = {"method_invocation", "object_creation_expression"}
     IMPORT_TYPES = {"import_declaration"}
+    BINDING_KINDS = {"field_declaration": "constant"}
 
     def bases_of(self, node):
         out = []
@@ -710,6 +833,11 @@ class GoProfile(LanguageProfile):
     }
     CALL_TYPES = {"call_expression"}
     IMPORT_TYPES = {"import_spec"}
+    # Go keeps its tunables in package-level `const`/`var` blocks and its
+    # configuration in struct fields; both are answers to "what is the limit".
+    BINDING_KINDS = {"const_declaration": "constant",
+                     "var_declaration": "constant",
+                     "field_declaration": "field"}
 
     def kind_of(self, node, default):
         if node.type == "type_spec":
@@ -760,6 +888,12 @@ class TsJsProfile(LanguageProfile):
     }
     CALL_TYPES = {"call_expression", "new_expression"}
     IMPORT_TYPES = {"import_statement"}
+    # `const MAX_BODY_BYTES = 1_000_000` at module scope, and class fields.
+    # `synth_def` claims the arrow-function ones first, so a named lambda stays
+    # a function rather than being demoted to a constant.
+    BINDING_KINDS = {"lexical_declaration": "constant",
+                     "variable_declaration": "constant",
+                     "public_field_definition": "field"}
     _ARROW = {"arrow_function", "function", "function_expression",
               "generator_function"}
 
@@ -1470,9 +1604,30 @@ class _Walk:
         self.src = src
         self.symbols: list[Symbol] = []
         self.edges: list[PendingEdge] = []
+        # Scopes where a name binding is API rather than a local (CN-1).
+        self._type_scopes: set[str] = set()
 
     def run(self, root):
         self._walk(root, self.module)
+
+    def _is_definitional(self, scope: str) -> bool:
+        return scope == self.module or scope in self._type_scopes
+
+    def _record_binding(self, node, scope: str) -> None:
+        """Record file-scope constants and type fields as symbols (CN-1)."""
+        kind = self.p.BINDING_KINDS[node.type]
+        for name in self.p.binding_names(node):
+            self.symbols.append(Symbol(
+                qname=f"{scope}.{name}", name=name, kind=kind, file=self.file,
+                lineno=node.start_point[0] + 1,
+                end_lineno=node.end_point[0] + 1,
+                # The value is the whole point of a constant, so the signature
+                # carries the declaration as written rather than just the name.
+                signature=" ".join(
+                    self.src[node.start_byte:node.end_byte]
+                    .decode("utf-8", "replace").split())[:BINDING_SIGNATURE_CHARS],
+                docstring="", parent=scope,
+            ))
 
     def _signature(self, def_node, body_node) -> str:
         if (body_node is not None and body_node is not def_node
@@ -1495,6 +1650,8 @@ class _Walk:
             signature=self._signature(def_node, body_node),
             docstring="", parent=scope,
         ))
+        if kind in CLASS_KINDS:
+            self._type_scopes.add(qname)   # CN-1: its fields are API
         # `bases_of` is overridden only on type-like profiles and returns [] for
         # functions/methods, so calling it unconditionally is safe and lets
         # container kinds beyond CLASS_KINDS (contract, trait, protocol, …)
@@ -1541,6 +1698,14 @@ class _Walk:
                 self._record_def(node, name, kind, scope, self.p.body_of(node),
                                  kind in CLASS_KINDS)
                 return
+
+        # CN-1: a binding is a symbol only at file or type scope. Inside a
+        # function body the same node type is a local, which would swamp the
+        # symbol table without answering any question.
+        if t in self.p.BINDING_KINDS and self._is_definitional(scope):
+            self._record_binding(node, scope)
+            self._walk(node, scope)   # calls in the initialiser still count
+            return
 
         if t in self.p.CALL_TYPES:
             callee = self.p.callee_of(node)
@@ -2064,6 +2229,25 @@ def supported_extensions() -> set:
     return {".py"} | set(_profiles()) | set(GENERIC_LANGUAGE_EXTENSIONS)
 
 
+# EX-1: bump when extraction starts (or stops) producing symbols or edges that
+# an existing database would not already contain. Generation 2 added
+# module- and type-scope constants/fields (CN-1).
+EXTRACTOR_GENERATION = 2
+
+
+def extractor_version() -> str:
+    """Identity of the installed extraction stack (EX-1).
+
+    Covers both halves of "what this build can see": the generation of the
+    extractors themselves, and which tree-sitter grammars are actually
+    importable — installing `contextiq[languages]` upgrades a repository from
+    regex symbols to a real call graph, and that has to invalidate the index
+    just as surely as a code change does.
+    """
+    langs = ",".join(sorted({p.name for p in _profiles().values()}))
+    return f"{EXTRACTOR_GENERATION}:{langs}"
+
+
 def language_for_path(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".py":
@@ -2092,6 +2276,51 @@ def languages_available() -> dict:
     for name, exts in sorted(fallback.items()):
         out[f"{name} (regex fallback)"] = sorted(exts)
     return out
+
+
+# PF-1: what each extraction tier can actually promise.
+#
+# "Supports 55 languages" is true and misleading in the same breath: a regex
+# extractor finds symbol *names* and nothing else, so `get_callers` on a Zig
+# function is not a weaker answer than on a Python one — it is an empty one,
+# for a structural reason the caller cannot see. Every tier now states which
+# graph edges it produces, so a consumer can tell "no callers" from "callers
+# not extractable here" and escalate to reading the file instead of trusting
+# an empty blast radius.
+EXTRACTION_TIERS: dict[str, dict] = {
+    "ast": {
+        "rank": 3, "label": "AST (stdlib parser)",
+        "symbols": True, "calls": True, "imports": True, "inheritance": True,
+        "note": "exact spans and edges",
+    },
+    "tree-sitter": {
+        "rank": 2, "label": "tree-sitter grammar",
+        "symbols": True, "calls": True, "imports": True, "inheritance": True,
+        "note": "edges resolved by name, so cross-file targets are best-effort",
+    },
+    "regex": {
+        "rank": 1, "label": "regex symbol scan",
+        "symbols": True, "calls": False, "imports": False, "inheritance": False,
+        "note": "definitions only — the call graph is EMPTY for these files, "
+                "so an empty get_callers/get_impact result proves nothing",
+    },
+}
+
+
+def language_tier(language: str) -> str:
+    """Which extraction tier a language gets in this installation (PF-1)."""
+    if language == "python":
+        return "ast"
+    if any(p.name == language for p in _profiles().values()):
+        return "tree-sitter"
+    return "regex"
+
+
+def tier_for_path(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".py":
+        return "ast"
+    return "tree-sitter" if ext in _profiles() else "regex"
 
 
 def parse_path(repo_root: Path, path: Path):
@@ -2422,6 +2651,30 @@ class Store:
         v = self.graph_version() + 1
         self.set_meta("graph_version", str(v))
         return v
+
+    def content_fingerprint(self, exclude: set[str] | None = None) -> str:
+        """Hash of every indexed file's content hash (CFG-6).
+
+        Identifies *what the graph was built from*, so a generated artefact can
+        be checked against the code it claims to describe. Unlike
+        `graph_version`, which counts writes, this is stable across a reindex
+        that changed nothing — reindexing must not make a correct file look
+        stale.
+
+        `exclude` must carry the generated artefacts themselves. They are
+        indexed like any other Markdown, so counting them makes generation
+        invalidate its own output: write the file, the fingerprint moves, and
+        the freshly written context is instantly "stale".
+        """
+        skip = exclude or set()
+        rows = self.conn.execute(
+            "SELECT path, hash FROM files ORDER BY path").fetchall()
+        h = hashlib.blake2b(digest_size=16)
+        for r in rows:
+            if r["path"] in skip:
+                continue
+            h.update(f"{r['path']}\x1f{r['hash']}\x1e".encode("utf-8"))
+        return h.hexdigest()
 
     def cached_pack(self, key: str) -> Optional[sqlite3.Row]:
         row = self.conn.execute(
@@ -4202,6 +4455,17 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
         store.drop_stale_vectors()
         store.set_meta("embed_backend", backend)
 
+    # EX-1: the incremental fast path keys off file content, so a file that has
+    # not changed is never reparsed — which means *upgrading the extractor* had
+    # no effect until someone happened to edit each file. A graph missing the
+    # symbol kinds the installed version knows how to find is stale in a way no
+    # freshness check could see. Stamping the extractor's identity turns that
+    # into a one-off full reparse on upgrade.
+    extractor = extractor_version()
+    reparse_all = store.get_meta("extractor_version") != extractor
+    if reparse_all:
+        store.set_meta("extractor_version", extractor)
+
     pending: list[tuple[str, PendingEdge]] = []
     import_maps: dict[str, dict[str, str]] = {}
 
@@ -4217,7 +4481,8 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
         # read+hash entirely. This is what makes freshen-on-query cheap enough
         # to run before every retrieval.
         meta = store.file_meta(rel)
-        if meta and meta["mtime"] == st.st_mtime and meta["size"] == st.st_size:
+        if (not reparse_all and meta and meta["mtime"] == st.st_mtime
+                and meta["size"] == st.st_size):
             report.skipped += 1
             continue
 
@@ -4227,7 +4492,7 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
             report.errors.append(f"{rel}: {ex}")
             continue
         h = file_hash(text)
-        if meta and meta["hash"] == h:
+        if not reparse_all and meta and meta["hash"] == h:
             # Content identical despite a touched mtime — refresh stat only.
             store.touch_file(rel, st.st_mtime, st.st_size)
             report.skipped += 1
@@ -4349,9 +4614,15 @@ def import_scip_json(root: Path, db_path: Path, index_file: Path) -> dict:
             if source["id"] != destination["id"]:
                 store.add_edge(source["id"], destination["id"], "REFERENCES")
                 imported += 1
+        # PF-1: record that precise references exist for this repo, so fidelity
+        # reporting can say so instead of guessing from language alone.
+        import datetime as _dt
+        stamp = _dt.datetime.now().replace(microsecond=0).isoformat()
+        store.set_meta("scip_ingested_at", stamp)
         store.commit()
         return {"documents": len(documents), "definitions": len(definitions),
-                "references_imported": imported, "unresolved": unresolved}
+                "references_imported": imported, "unresolved": unresolved,
+                "scip_ingested_at": stamp}
     finally:
         store.close()
 
@@ -4796,6 +5067,77 @@ def summarize_conversation(transcript: str, max_tokens: int = 400) -> dict:
     }
 
 
+# CS-3: summarisation fidelity.
+#
+# `summarize_conversation` reported a reduction percentage and nothing else,
+# which measures only how much it threw away — a summary that deleted
+# everything would have scored best. What matters is the opposite: whether the
+# things a resumed session needs (the decisions taken, the constraints agreed,
+# the questions still open, the identifiers under discussion) survived the
+# compression. This scores that directly, against facts the caller declares.
+SUMMARY_FIDELITY_THRESHOLDS = {
+    "identifier_recall": 0.80,   # code entities still nameable afterwards
+    "fact_recall": 0.70,         # declared decisions/constraints still present
+}
+
+
+def score_summary_fidelity(summary: dict, required: dict) -> dict:
+    """Did compression keep what a resumed session actually needs (CS-3)?
+
+    `required` declares what must survive:
+      * ``identifiers`` — symbols, files and flags the conversation was about;
+      * ``facts`` — literal substrings standing for decisions, constraints and
+        unresolved issues.
+
+    Matching is case-insensitive substring containment over the *whole*
+    rendered summary — structured fields included — because a decision that
+    survives as an action item is still retained, and scoring by section would
+    punish correct behaviour.
+    """
+    rendered = "\n".join([
+        summary.get("summary", ""),
+        *summary.get("decisions", []), *summary.get("action_items", []),
+        *summary.get("open_questions", []), *summary.get("key_points", []),
+        *summary.get("entities", []),
+    ]).lower()
+
+    def _recall(items: list[str]) -> tuple[list[str], list[str]]:
+        kept, lost = [], []
+        for item in items:
+            (kept if str(item).lower() in rendered else lost).append(item)
+        return kept, lost
+
+    ids_kept, ids_lost = _recall(list(required.get("identifiers") or []))
+    facts_kept, facts_lost = _recall(list(required.get("facts") or []))
+    n_ids = len(ids_kept) + len(ids_lost)
+    n_facts = len(facts_kept) + len(facts_lost)
+    id_recall = (len(ids_kept) / n_ids) if n_ids else 1.0
+    fact_recall = (len(facts_kept) / n_facts) if n_facts else 1.0
+    return {
+        "identifier_recall": round(id_recall, 3),
+        "fact_recall": round(fact_recall, 3),
+        "identifiers_lost": ids_lost,
+        "facts_lost": facts_lost,
+        "reduction_pct": summary.get("reduction_pct", 0.0),
+        # A compression is only "good" when it is both small AND complete;
+        # reporting reduction alone rewarded deleting the answer.
+        "faithful": (id_recall >= SUMMARY_FIDELITY_THRESHOLDS["identifier_recall"]
+                     and fact_recall >= SUMMARY_FIDELITY_THRESHOLDS["fact_recall"]),
+    }
+
+
+def _span_overlaps(row, spans: list[tuple[int, int]]) -> bool:
+    """Does this symbol's source range touch a range the pack already shows?
+
+    Containment runs both ways and both are redundancy: a class body already
+    prints its methods, and a method printed on its own is re-printed the
+    moment its class arrives. Overlapping bodies are never worth their tokens.
+    """
+    lo = row["lineno"] or 0
+    hi = row["end_lineno"] or lo
+    return any(lo <= e and hi >= s for s, e in spans)
+
+
 @dataclass
 class Piece:
     qname: str
@@ -4891,6 +5233,20 @@ class Retriever:
         sig = row["signature"] or row["qname"]
         doc = row["docstring"]
         return f"{sig}{f'    # {doc}' if doc else ''}"
+
+    @staticmethod
+    def _render_cost(piece: "Piece") -> int:
+        """What a piece really costs once rendered into the pack markdown.
+
+        `Piece.token_est` counts the payload only. Every piece also carries a
+        heading, a path line and a fence — ~25 tokens of envelope. Assembly that
+        budgets on payload alone believes a 2500-token pack is 1250 tokens, and
+        the completion sweep would then overfill and immediately trim itself
+        away. Budget against what the caller is actually billed for.
+        """
+        envelope = (f"## `{piece.qname}`  ({piece.kind}, signature, {piece.reason})\n"
+                    f"`{piece.file}`\n```{_fence(piece.file)}\n```\n")
+        return piece.token_est + count_tokens(envelope)
 
     def _chunk_excerpt(self, text: str, task: str, max_tokens: int) -> str:
         tokens = set(_tokenize(task))
@@ -5132,6 +5488,15 @@ class Retriever:
                  if semantic else lexical)
         # de-prioritise module nodes as seeds; we want concrete defs
         seeds = [s for s in seeds if s["kind"] != "module"] or seeds
+        # Constants and fields (CN-1) are deliberately NOT excluded here.
+        # Barring them from seeding was the intuitive move — they are short and
+        # lexically dense, so they look like they should crowd out the
+        # functions that implement the behaviour — but it measured worse in
+        # aggregate: a question about a limit really is best anchored on the
+        # limit. The per-file seed cap below is what keeps them honest.
+        # Retrieval order before per-file diversification — the truest signal of
+        # which files the query is actually about (SR-1).
+        fused_order = list(seeds)
         # Spread seeds across files so one file cannot monopolise the pack.
         # The cap of 4 is load-bearing, not arbitrary: raising it measurably
         # *lowered* symbol recall on the benchmark suite, because extra
@@ -5152,6 +5517,22 @@ class Retriever:
             seeds = sorted(seeds, key=lambda s: weights.get(s["file"], 0.0), reverse=True)
         seed_ids = [s["id"] for s in seeds]
         chunk_rows = self.store.search_chunks(task, limit=8)
+
+        # SR-1: roll the evidence up to files. Same formula as rank_files(), but
+        # computed from rows already in hand rather than re-querying — this map
+        # decides which files deserve full bodies and which get completed by the
+        # sweep at the end.
+        file_scores: dict[str, float] = {}
+        for rank, row in enumerate(fused_order):
+            f = row["file"]
+            file_scores[f] = max(file_scores.get(f, 0.0), 1.0 / (rank + 1))
+        for rank, c in enumerate(chunk_rows):
+            file_scores[c["file"]] = (file_scores.get(c["file"], 0.0)
+                                      + 0.75 / (rank + 1))
+        for f in list(file_scores):
+            file_scores[f] += weights.get(f, 0.0) * 0.1
+        ranked_files = sorted(file_scores, key=lambda f: (-file_scores[f], f))
+        body_files = set(ranked_files[:BODY_FILE_RANK])
 
         # Collect neighbours via BFS over CALLS/REFERENCES (both directions)
         # and INHERITS, under a per-symbol fan-out cap and a global ceiling so
@@ -5205,7 +5586,13 @@ class Retriever:
                 pack.tokens_reused += prior["tokens"]
                 full_body_files.add(s["file"])
                 continue
-            if est > max_body_tokens or (pack.tokens + est > budget_tokens and pack.pieces):
+            # SR-1: a full body is the most expensive thing the pack can buy, so
+            # only files the query actually points at get one. A seed sitting in
+            # a weakly-ranked file still appears — as a signature — and the
+            # budget it would have eaten goes to completing the target file.
+            off_target = s["file"] not in body_files
+            if (est > max_body_tokens or off_target
+                    or (pack.tokens + est > budget_tokens and pack.pieces)):
                 # demote large bodies to signatures; indexed chunks below provide detail.
                 sig = self._sig_block(s)
                 est = count_tokens(sig)
@@ -5273,6 +5660,21 @@ class Retriever:
         # piece (e.g. an indexed chunk re-showing a seed body). Frees budget and
         # keeps the pack free of redundant tokens.
         pack.pieces, pack.deduped = _dedupe_pieces(pack.pieces)
+
+        # 4. SR-1 completion sweep: spend what is left of the budget finishing
+        #    the files the pack already committed to. See SWEEP_FILES above for
+        #    the failure this exists to fix.
+        before = len(pack.pieces)
+        self._complete_from_files(pack, task, budget_tokens, file_scores,
+                                  ranked_files, already)
+        # The sweep tracks line spans to avoid re-showing code, which catches
+        # structural overlap but not textual duplication (two near-identical
+        # small methods). Re-run DD-1 over the result so the no-redundant-piece
+        # guarantee covers swept content on the same terms as everything else.
+        if len(pack.pieces) != before:
+            pack.pieces, more = _dedupe_pieces(pack.pieces)
+            pack.deduped.extend(more)
+
         # Piece estimates exclude Markdown headings, fences, paths, and the
         # dropped list. Enforce the public contract against serialized output.
         while pack.pieces and pack.rendered_tokens > budget_tokens:
@@ -5288,6 +5690,188 @@ class Retriever:
                 for p in pack.pieces
                 if p.detail in ("body", "signature")])
         return pack
+
+    def _complete_from_files(self, pack: "ContextPack", task: str,
+                             budget_tokens: int, file_scores: dict[str, float],
+                             ranked_files: list[str], already: dict) -> None:
+        """Finish the files the pack already believes in, with the budget left.
+
+        Seeds and graph neighbours are both *pointwise*: they answer "which
+        symbols look like the query" and "what do those touch". Neither answers
+        "what else is in the file that turned out to be the right one" — so a
+        pack could name `internal/store/store.go` as the second-ranked file,
+        spend 2455 of 6000 tokens, and never include `Store.UpdateStatus`.
+
+        This closes that gap. Bodies come first and only for small symbols,
+        because the facts an answer needs (a default value, a `version =
+        version + 1`, a status constant) exist only in bodies; signatures then
+        buy breadth at ~20 tokens each. Nothing here re-reads a file the pack
+        did not already choose, so it cannot invent new irrelevance: it makes
+        the tokens already committed to a file actually pay for an answer.
+        """
+        focus = [f for f in ranked_files[:SWEEP_FILES] if file_scores.get(f, 0)]
+        if not focus:
+            return
+        spent = pack.rendered_tokens
+        if spent >= budget_tokens:
+            return
+
+        present = {p.qname for p in pack.pieces} | set(pack.reused)
+        # Line spans already shown, so the sweep never repeats a body or a
+        # chunk region that is on screen.
+        covered: dict[str, list[tuple[int, int]]] = {}
+        for p in pack.pieces:
+            if p.detail == "chunk" and ":" in p.qname and "-" in p.qname:
+                try:
+                    lo, hi = (int(x) for x in
+                              p.qname.rsplit(":", 1)[1].split("-", 1))
+                    covered.setdefault(p.file, []).append((lo, hi))
+                except ValueError:
+                    pass
+            elif p.detail == "body":
+                row = self.store.symbol_by_qname(p.qname)
+                if row is not None and row["lineno"]:
+                    covered.setdefault(p.file, []).append(
+                        (row["lineno"], row["end_lineno"] or row["lineno"]))
+
+        task_terms = set(_tokenize(task))
+        candidates: list[tuple[float, str, object]] = []
+        for f in focus:
+            fscore = file_scores.get(f, 0.0)
+            spans = covered.get(f, [])
+            rows = []
+            for row in self.store.file_symbols(f):
+                if row["kind"] == "module" or row["qname"] in present:
+                    continue
+                if _span_overlaps(row, spans):
+                    continue
+                text = " ".join(str(row[k] or "") for k in
+                                ("qname", "name", "signature", "docstring"))
+                terms = set(_tokenize(text))
+                overlap = ((len(task_terms & terms) / len(task_terms))
+                           if task_terms else 0.0)
+                score = fscore * (0.3 + overlap)
+                rows.append((score, row))
+            rows.sort(key=lambda t: (-t[0], t[1]["lineno"] or 0))
+            candidates.extend((score, f, row)
+                              for score, row in rows[:SWEEP_CANDIDATES_PER_FILE])
+
+        candidates.sort(key=lambda t: (-t[0], t[2]["file"], t[2]["lineno"] or 0))
+
+        swept: dict[str, int] = {}     # qname -> index in pack.pieces
+
+        def claim(row) -> None:
+            """Record a newly shown body so later passes see it as covered."""
+            covered.setdefault(row["file"], []).append(
+                (row["lineno"] or 0, row["end_lineno"] or row["lineno"] or 0))
+
+        def shown(row) -> bool:
+            return _span_overlaps(row, covered.get(row["file"], []))
+
+        def admit(row, detail: str, text: str) -> bool:
+            """Add a piece if it fits the *rendered* budget; report success."""
+            nonlocal spent
+            prior = already.get(row["qname"])
+            if prior is not None and prior["content_hash"] == _piece_hash(text):
+                pack.reused.append(row["qname"])
+                pack.tokens_reused += prior["tokens"]
+                present.add(row["qname"])
+                return True
+            piece = Piece(row["qname"], row["kind"], row["file"], detail, text,
+                          count_tokens(text), "file completion")
+            cost = self._render_cost(piece)
+            # Both budget contracts must hold: the payload sum and the rendered
+            # markdown the caller is billed for.
+            if spent + cost > budget_tokens or pack.tokens + piece.token_est > budget_tokens:
+                return False
+            swept[row["qname"]] = len(pack.pieces)
+            pack.pieces.append(piece)
+            present.add(row["qname"])
+            if detail == "body":
+                claim(row)
+            spent += cost
+            return True
+
+        bodies: dict[str, tuple[str, int] | None] = {}
+
+        def body_of(row) -> tuple[str, int] | None:
+            """Body text and cost, or None when it is too big to sweep in.
+
+            Memoised: passes 1 and 3 walk the same candidate list, and tokenising
+            a body is the most expensive thing in the sweep.
+            """
+            qname = row["qname"]
+            if qname in bodies:
+                return bodies[qname]
+            got: tuple[str, int] | None = None
+            if (row["end_lineno"] or 0) - (row["lineno"] or 0) <= SWEEP_BODY_MAX_LINES:
+                body = self._body(row)
+                if body:
+                    est = count_tokens(body)
+                    if est <= SWEEP_BODY_MAX_TOKENS:
+                        got = (body, est)
+            bodies[qname] = got
+            return got
+
+        # The two passes want the same budget for different things, and
+        # whichever runs unbounded starves the other: bodies-first spends
+        # everything on a handful of symbols (breadth collapses), and
+        # signatures-first leaves nothing to promote (every literal fact is
+        # lost). Splitting the remainder is what keeps both — measured as the
+        # difference between 0.63 and 0.72 answerable at equal recall.
+        body_ceiling = spent + int(SWEEP_BODY_SHARE * (budget_tokens - spent))
+
+        # Pass 1 — bodies for the best-scoring candidates, up to that ceiling.
+        # Behaviour and literal values live here: no signature will ever show
+        # that a status update also bumps a row version.
+        for _, _f, row in candidates:
+            if spent >= body_ceiling:
+                break
+            if row["qname"] in present or shown(row):
+                continue
+            got = body_of(row)
+            if got:
+                admit(row, "body", got[0])
+
+        # Pass 2 — signatures for everything still uncovered: cheap breadth, so
+        # a symbol the answer needs is at worst nameable rather than invisible.
+        # A constant's signature is its declaration, so its value arrives too.
+        for _, _f, row in candidates:
+            if spent >= budget_tokens:
+                break
+            if row["qname"] in present or shown(row):
+                continue
+            admit(row, "signature", self._sig_block(row))
+
+        # Pass 3 — anything still left over promotes a swept signature to its
+        # body, in place, so the pack never carries both.
+        for _, _f, row in candidates:
+            if spent >= budget_tokens:
+                break
+            idx = swept.get(row["qname"])
+            if idx is None or pack.pieces[idx].detail != "signature":
+                continue
+            if shown(row):
+                continue     # a body printed since pass 2 already covers it
+            got = body_of(row)
+            if not got:
+                continue
+            body, est = got
+            old = pack.pieces[idx]
+            upgraded = Piece(row["qname"], row["kind"], row["file"], "body",
+                             body, est, "file completion")
+            delta = self._render_cost(upgraded) - self._render_cost(old)
+            if (spent + delta > budget_tokens
+                    or pack.tokens - old.token_est + est > budget_tokens):
+                continue
+            pack.pieces[idx] = upgraded
+            claim(row)
+            spent += delta
+
+        # Anything the sweep pulled in is no longer "available but not
+        # included" — leaving it listed would advertise it as absent.
+        if pack.dropped:
+            pack.dropped = [d for d in pack.dropped if d not in present]
 
     # A competent agent that greps then reads around each hit does not read a
     # whole file. These model that behaviour for the honest baseline (MS-1).
@@ -5511,7 +6095,7 @@ class Retriever:
         files = sorted({r["file"] for r in direct})
         tests = [f for f in files if "test" in f.lower() or "spec" in f.lower()]
         subclasses = [r["qname"] for r in self.store.neighbors(row["id"], ["INHERITS"], "in")]
-        return {
+        out = {
             "symbol": qname,
             "found": True,
             "file": row["file"],
@@ -5522,6 +6106,22 @@ class Retriever:
             "tests_touched": tests,
             "blast_radius": len({r["qname"] for r in direct}) + len(transitive),
         }
+        # PF-1: a blast radius is a safety signal, and on a regex-tier file it
+        # is always zero — not because nothing calls this, but because no call
+        # edges were ever extracted. Saying so is the difference between "safe
+        # to change" and "unknown", and an agent must not read one as the other.
+        tier = tier_for_path(Path(row["file"]))
+        out["extraction_tier"] = tier
+        if not EXTRACTION_TIERS[tier]["calls"]:
+            out["blast_radius_reliable"] = False
+            out["warning"] = (
+                f"{row['file']} is extracted at the '{tier}' tier, which "
+                f"produces no call edges. This blast radius is NOT evidence "
+                f"that nothing depends on the symbol — verify by searching the "
+                f"repository before changing it.")
+        else:
+            out["blast_radius_reliable"] = True
+        return out
 
     # ---- get_map: import graph / class hierarchy ----
     def get_map(self, kind: str = "imports") -> dict:
@@ -6153,6 +6753,37 @@ def effective_budget(total_sig_tokens: int, coverage_target: float = 0.80,
 CLAUDE_BEGIN = "<!-- tokengraph:begin (generated — do not edit) -->"
 CLAUDE_END = "<!-- tokengraph:end -->"
 
+# CFG-6: generated artefacts record the fingerprint of the code they were built
+# from. Staleness used to be judged by wall-clock age, which is wrong in both
+# directions — it condemns a correct file that nobody happened to regenerate
+# this week, and it passes a file that went out of date an hour after it was
+# written. Comparing the stamp to the current index answers the question that
+# actually matters: does this describe the code as it stands?
+SOURCE_STAMP_PREFIX = "<!-- tokengraph:source "
+
+
+def generated_artifact_paths(cfg: dict | None = None) -> set[str]:
+    """Repo-relative paths ContextIQ writes, which are never "source" (CFG-6)."""
+    paths = {spec["path"] for spec in ADAPTERS.values() if spec.get("path")}
+    custom = (cfg or {}).get("output")
+    if custom:
+        paths.add(str(custom))
+    return paths
+
+
+def source_stamp(fingerprint: str) -> str:
+    return f"{SOURCE_STAMP_PREFIX}{fingerprint} -->"
+
+
+def read_source_stamp(text: str) -> str:
+    """The fingerprint a generated file was built from, or "" if unstamped."""
+    idx = text.find(SOURCE_STAMP_PREFIX)
+    if idx < 0:
+        return ""
+    rest = text[idx + len(SOURCE_STAMP_PREFIX):]
+    end = rest.find(" -->")
+    return rest[:end].strip() if end >= 0 else ""
+
 # Steering-file adapters: where each agent host looks for repo instructions.
 #
 # Every adapter is marker-scoped (see write_adapter) — the generated block is
@@ -6385,7 +7016,8 @@ def cache_blocks(payload: dict) -> list[dict]:
 
 
 def write_adapter(root: Path, adapter: str, content: str,
-                  custom_out: str | None = None) -> str:
+                  custom_out: str | None = None,
+                  fingerprint: str = "") -> str:
     spec = ADAPTERS[adapter]
     rel = custom_out if (custom_out and adapter == "copilot") else spec["path"]
     path = root / rel
@@ -6394,7 +7026,8 @@ def write_adapter(root: Path, adapter: str, content: str,
     # and any hand-written content outside them is preserved across re-runs
     # (MCP-5). This avoids clobbering human instructions in copilot/cursor/etc.
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    block = f"{CLAUDE_BEGIN}\n{content.rstrip()}\n{CLAUDE_END}\n"
+    stamp = f"{source_stamp(fingerprint)}\n" if fingerprint else ""
+    block = f"{CLAUDE_BEGIN}\n{stamp}{content.rstrip()}\n{CLAUDE_END}\n"
     if CLAUDE_BEGIN in existing and CLAUDE_END in existing:
         pre = existing.split(CLAUDE_BEGIN)[0].rstrip()
         post = existing.split(CLAUDE_END, 1)[1].lstrip("\n")
@@ -6524,9 +7157,20 @@ DEFAULT_GAIN_MODEL = "claude-sonnet"
 # into input (prompt) and output (completion). Used to price a call *before*
 # it's sent — unlike GAIN_PRICES_PER_1M, which projects savings after the fact.
 MODEL_PRICES_PER_1M: dict[str, dict[str, float]] = {
-    "claude-opus":      {"input": 15.0,  "output": 75.0},
-    "claude-sonnet":    {"input": 3.0,   "output": 15.0},
-    "claude-haiku":     {"input": 0.80,  "output": 4.0},
+    # Claude, verified against the vendor catalogue on the date in
+    # CLAUDE_PRICES_AS_OF below. Concrete model ids first; the bare family
+    # names after them are aliases kept so existing callers and the savings
+    # ledger keep resolving.
+    "claude-fable-5":    {"input": 10.0,  "output": 50.0},
+    "claude-opus-4-8":   {"input": 5.0,   "output": 25.0},
+    "claude-opus-4-7":   {"input": 5.0,   "output": 25.0},
+    "claude-opus-4-6":   {"input": 5.0,   "output": 25.0},
+    "claude-sonnet-5":   {"input": 3.0,   "output": 15.0},
+    "claude-sonnet-4-6": {"input": 3.0,   "output": 15.0},
+    "claude-haiku-4-5":  {"input": 1.0,   "output": 5.0},
+    "claude-opus":       {"input": 5.0,   "output": 25.0},
+    "claude-sonnet":     {"input": 3.0,   "output": 15.0},
+    "claude-haiku":      {"input": 1.0,   "output": 5.0},
     "gpt-4o":           {"input": 2.5,   "output": 10.0},
     "gpt-4o-mini":      {"input": 0.15,  "output": 0.60},
     "gpt-4.1":          {"input": 2.0,   "output": 8.0},
@@ -6538,13 +7182,46 @@ MODEL_PRICES_PER_1M: dict[str, dict[str, float]] = {
 }
 DEFAULT_COST_MODEL = "claude-sonnet"
 
+# CE-3: cached and batched tokens are not priced like fresh input, and a tool
+# whose entire thesis is "send fewer tokens" cannot then price the tokens it
+# does send incorrectly. Reading a cached prefix costs about a tenth of base
+# input — which is precisely why the prompt-cache ordering work (PC-1) is worth
+# doing — while *writing* the cache costs a premium that has to be earned back.
+# Expressed as multipliers on the model's input price so they survive a price
+# change, and keyed by family because the economics differ by vendor.
+CACHE_MULTIPLIERS: dict[str, dict[str, float]] = {
+    # Anthropic: read ≈0.1×, 5-minute write 1.25×, 1-hour write 2×.
+    "claude": {"read": 0.1, "write": 1.25, "write_1h": 2.0},
+    # OpenAI caches automatically and discounts reads; there is no write premium.
+    "gpt":    {"read": 0.5, "write": 1.0},
+    "gemini": {"read": 0.25, "write": 1.0},
+}
+# Asynchronous batch APIs trade latency for a discount on every token.
+BATCH_DISCOUNT: dict[str, float] = {"claude": 0.5, "gpt": 0.5, "gemini": 0.5}
+
+# Per-family provenance. A single global date was the wrong shape: it made a
+# freshly-verified Claude price look exactly as stale as a Llama price nobody
+# had checked in a year, so the staleness warning was either a false alarm or
+# ignored. Each family now ages on its own clock.
+FAMILY_PRICES_AS_OF: dict[str, str] = {
+    "claude": "2026-06-24",
+    "gpt": "2025-06-01",
+    "gemini": "2025-06-01",
+    "llama": "2025-06-01",
+}
+
 # ---- CE-2: pricing provenance and overrides -------------------------------
 # A hardcoded price table silently rots: vendors reprice, and a stale number
 # produces confidently wrong cost estimates. The table above is a *default*
 # with a known date. Anything derived from it carries that date, goes stale
 # out loud, and can be overridden without editing code.
-PRICES_AS_OF = "2025-06-01"
+# The global date is the OLDEST family's — so a single number can never claim
+# the catalogue is fresher than its weakest entry.
+PRICES_AS_OF = min(FAMILY_PRICES_AS_OF.values())
 PRICES_STALE_AFTER_DAYS = 180
+# Bumped whenever the catalogue's *shape* changes (new rate kinds, new
+# families), so an override file written against an older shape is detectable.
+PRICING_CATALOG_VERSION = 2
 PRICING_FILE_ENV = "TOKENGRAPH_PRICING_FILE"
 PRICING_FILENAME = "pricing.json"
 
@@ -6604,7 +7281,32 @@ def load_pricing(root: Path | None = None, refresh: bool = False) -> dict:
         stale = age_days > PRICES_STALE_AFTER_DAYS
     except (ValueError, TypeError):
         warnings.append(f"pricing: unparseable as_of {as_of!r}")
-    if stale:
+    # CE-3: age each vendor family separately and name the stale ones. A single
+    # global warning could not distinguish "every price here is a year old"
+    # from "one vendor we don't price against is", so it was noise either way.
+    families: dict[str, dict] = {}
+    stale_families: list[str] = []
+    for fam, fam_as_of in sorted(FAMILY_PRICES_AS_OF.items()):
+        fam_age = None
+        fam_stale = False
+        try:
+            y, m, d = (int(x) for x in fam_as_of.split("-"))
+            fam_age = (date.today() - date(y, m, d)).days
+            fam_stale = fam_age > PRICES_STALE_AFTER_DAYS
+        except (ValueError, TypeError):
+            pass
+        families[fam] = {"as_of": fam_as_of, "age_days": fam_age,
+                         "stale": fam_stale}
+        if fam_stale:
+            stale_families.append(f"{fam} ({fam_age}d)")
+    if stale_families and source == "built-in defaults":
+        warnings.append(
+            f"pricing is past its {PRICES_STALE_AFTER_DAYS}-day review window "
+            f"for: {', '.join(stale_families)}. Vendor list prices change; "
+            f"treat costs for those families as indicative. Refresh with "
+            f"`tokengraph pricing --check`, or override via "
+            f"{pricing_file_path(root)} or ${PRICING_FILE_ENV}.")
+    elif stale:
         warnings.append(
             f"pricing is {age_days} days old (as of {as_of}). Vendor list "
             f"prices change; treat costs as indicative. Override with "
@@ -6612,6 +7314,8 @@ def load_pricing(root: Path | None = None, refresh: bool = False) -> dict:
 
     _PRICING_CACHE = {"prices": prices, "as_of": as_of, "source": source,
                       "stale": stale, "age_days": age_days,
+                      "families": families,
+                      "catalog_version": PRICING_CATALOG_VERSION,
                       "warnings": warnings}
     return _PRICING_CACHE
 
@@ -6630,13 +7334,41 @@ def price_for(model: str, root: Path | None = None) -> dict:
     return table.get(DEFAULT_COST_MODEL, {"input": 3.0, "output": 15.0})
 
 
+def rate_card(model: str, root: Path | None = None) -> dict:
+    """Every per-1M rate that applies to a model, not just fresh input (CE-3).
+
+    Cached reads and batch submissions are the two levers that most change what
+    a call actually costs, and quoting only the list input price overstates the
+    bill for anyone using either.
+    """
+    base = price_for(model, root)
+    fam = model_family(model)
+    mult = CACHE_MULTIPLIERS.get(fam, {})
+    card = {
+        "model": model, "family": fam,
+        "input": base["input"], "output": base["output"],
+        "as_of": FAMILY_PRICES_AS_OF.get(fam, PRICES_AS_OF),
+    }
+    for key in ("read", "write", "write_1h"):
+        if key in mult:
+            card[f"cache_{key}"] = round(base["input"] * mult[key], 6)
+    if fam in BATCH_DISCOUNT:
+        card["batch_multiplier"] = BATCH_DISCOUNT[fam]
+    return card
+
+
 def estimate_cost(prompt: str | int, model: str = DEFAULT_COST_MODEL,
-                  expected_output_tokens: int = 500) -> dict:
-    """Price an API call *before* sending it (CE-1).
+                  expected_output_tokens: int = 500,
+                  cached_input_tokens: int = 0,
+                  cache_write_tokens: int = 0,
+                  batch: bool = False) -> dict:
+    """Price an API call *before* sending it (CE-1, CE-3).
 
     `prompt` may be the raw text (counted with the model-aware tokenizer) or a
-    pre-computed input-token integer. Returns a per-call USD breakdown so you
-    can compare models / trim context before spending. Deterministic, local.
+    pre-computed input-token integer. `cached_input_tokens` are billed at the
+    provider's cache-read rate and are *subtracted* from the fresh input count,
+    `cache_write_tokens` at the write premium, and `batch=True` applies the
+    asynchronous-batch discount to everything. Deterministic, local.
     """
     detail = None
     if isinstance(prompt, int):
@@ -6647,17 +7379,32 @@ def estimate_cost(prompt: str | int, model: str = DEFAULT_COST_MODEL,
     out_tok = max(0, int(expected_output_tokens))
     pricing = load_pricing()
     price = price_for(model)
-    in_usd = in_tok / 1_000_000 * price["input"]
-    out_usd = out_tok / 1_000_000 * price["output"]
+    card = rate_card(model)
+    # Cached and freshly-written tokens are part of the prompt, not extra to
+    # it: counting them on top would double-bill the same text.
+    cached = max(0, min(int(cached_input_tokens), in_tok))
+    written = max(0, min(int(cache_write_tokens), in_tok - cached))
+    fresh = in_tok - cached - written
+    batch_mult = card.get("batch_multiplier", 1.0) if batch else 1.0
+    in_usd = (fresh / 1_000_000 * price["input"]
+              + cached / 1_000_000 * card.get("cache_read", price["input"])
+              + written / 1_000_000 * card.get("cache_write", price["input"])
+              ) * batch_mult
+    out_usd = out_tok / 1_000_000 * price["output"] * batch_mult
     out = {
         "model": model,
         "input_tokens": in_tok,
         "output_tokens": out_tok,
+        "fresh_input_tokens": fresh,
+        "cached_input_tokens": cached,
+        "cache_write_tokens": written,
+        "batch": bool(batch),
         "input_usd": round(in_usd, 6),
         "output_usd": round(out_usd, 6),
         "total_usd": round(in_usd + out_usd, 6),
         "price_per_1m_input_usd": price["input"],
         "price_per_1m_output_usd": price["output"],
+        "rate_card": card,
         # CE-2: never hand back a bare number. The caller needs to know how the
         # tokens were counted and how old the prices are before trusting it.
         "prices_as_of": pricing["as_of"],
@@ -9028,9 +9775,28 @@ def _perturb_ident(leaf: str) -> str:
     return leaf[:i] + repl + leaf[i + 1:]
 
 
+# HB-1: what this benchmark may and may not claim.
+#
+# Three of the four numbers here are measured: grounding coverage, guard catch,
+# and guard specificity are all observed against the real index. The fourth —
+# "hallucination reduction %" — is not. It is arithmetic over an *assumed*
+# ungrounded fabrication rate, and with the previous default of 99.8 errors per
+# 100 facts it was pinned near 100% by construction, no matter how the guard
+# actually performed. Shipping that as a headline was the single least honest
+# number in the project.
+#
+# So the assumption no longer has a default. Ask for a projection and you must
+# supply the baseline *and* say where it came from; the reduction is then
+# clearly labelled a projection contingent on your figure. Ask for nothing and
+# you get the three measurements, which is what the tool can actually prove.
+DEFAULT_HALLUCINATION_BASELINE = None
+
+
 def hallucination_benchmark(retriever: "Retriever", sample_per_repo: int = 40,
-                            baseline_per_100: float = 99.8) -> dict:
-    """Reproducible, multi-repo codebase-fact hallucination benchmark.
+                            baseline_per_100: float | None
+                            = DEFAULT_HALLUCINATION_BASELINE,
+                            baseline_source: str = "") -> dict:
+    """Reproducible, multi-repo codebase-fact grounding benchmark (HB-1).
 
     Partitions the codebase by top-level directory (each = a "repo") and, per
     repo, measures three real structural quantities over sampled symbols:
@@ -9040,13 +9806,19 @@ def hallucination_benchmark(retriever: "Retriever", sample_per_repo: int = 40,
       • guard_catch — % of fabricated references verify() flags,
       • guard_specificity — % of real references verify() does NOT false-flag.
 
-    From these it models the residual codebase-fact error rate of a grounded
-    agent: a fact is only stated wrong if it could not be grounded AND the guard
-    missed the fabrication, i.e. residual = baseline · (1−coverage) · (1−catch).
-    `baseline_per_100` is the ungrounded fabrication rate to compare against
-    (default 99.8, the figure Sigmap measured with an LLM); the reduction is then
-    deterministic and reproducible without running a model. Reports a per-repo
-    spread (min/max) so the figure isn't a single-repo artifact."""
+    These are measurements. They are deterministic, need no model, and are the
+    benchmark's actual result.
+
+    Optionally it will also *project* the residual codebase-fact error rate of
+    a grounded agent — a fact is only stated wrong if it could not be grounded
+    AND the guard missed the fabrication, so residual = baseline · (1−coverage)
+    · (1−catch). That projection is only as good as `baseline_per_100`, the
+    ungrounded fabrication rate you are comparing against, which this tool
+    cannot observe. It therefore has no default: pass one you can defend,
+    together with `baseline_source` naming where it came from, or get only the
+    measurements. Reports a per-repo spread (min/max) either way, so nothing
+    here rests on a single partition.
+    """
     store = retriever.store
     files = sorted(store.all_indexed_files())
     parts: dict[str, list[str]] = {}
@@ -9079,68 +9851,136 @@ def hallucination_benchmark(retriever: "Retriever", sample_per_repo: int = 40,
             if retriever.verify(f"See `{leaf}` here.")["ok"]:
                 preserved += 1
         cov, catch, spec = groundable / n, caught / n, preserved / n
-        residual = round(baseline_per_100 * (1 - cov) * (1 - catch), 3)
-        rows.append({
+        row = {
             "repo": repo, "facts": n,
             "grounding_coverage_pct": round(100 * cov, 1),
             "guard_catch_pct": round(100 * catch, 1),
             "guard_specificity_pct": round(100 * spec, 1),
-            "modeled_with_grounding_per_100": residual,
-            "reduction_pct": round(100 * (baseline_per_100 - residual)
-                                   / baseline_per_100, 2),
-        })
+            # The share of facts that are BOTH ungroundable and would slip past
+            # the guard — measured, and the honest per-repo risk figure.
+            "unguarded_fact_share_pct": round(100 * (1 - cov) * (1 - catch), 2),
+        }
+        if baseline_per_100:
+            residual = round(baseline_per_100 * (1 - cov) * (1 - catch), 3)
+            row["projected_with_grounding_per_100"] = residual
+            row["projected_reduction_pct"] = round(
+                100 * (baseline_per_100 - residual) / baseline_per_100, 2)
+        rows.append(row)
 
     if not rows:
         return {"ok": True, "repos": 0, "note": "no symbols indexed"}
 
     total = sum(r["facts"] for r in rows)
     wmean = lambda k: round(sum(r[k] * r["facts"] for r in rows) / total, 2)
-    with_grounding = round(
-        sum(r["modeled_with_grounding_per_100"] * r["facts"] for r in rows) / total, 3)
-    reduction = round(100 * (baseline_per_100 - with_grounding) / baseline_per_100, 2)
-    reds = [r["reduction_pct"] for r in rows]
-    return {
+    spreads = [r["unguarded_fact_share_pct"] for r in rows]
+    out = {
         "ok": True,
-        "methodology": ("deterministic structural ablation (no LLM): residual = "
-                        "baseline*(1-grounding_coverage)*(1-guard_catch); baseline "
-                        f"= {baseline_per_100}/100 ungrounded fabrication rate"),
+        "methodology": (
+            "deterministic structural measurement (no LLM). Measured per repo "
+            "partition: grounding coverage, guard catch rate, guard "
+            "specificity. Unguarded fact share = (1-coverage)*(1-catch)."),
         "repos": len(rows),
         "facts_total": total,
-        "baseline_without_grounding_per_100": baseline_per_100,
-        "modeled_with_grounding_per_100": with_grounding,
-        "hallucination_reduction_pct": reduction,
-        "reduction_spread_pct": [min(reds), max(reds)],
         "mean_grounding_coverage_pct": wmean("grounding_coverage_pct"),
         "mean_guard_catch_pct": wmean("guard_catch_pct"),
         "mean_guard_specificity_pct": wmean("guard_specificity_pct"),
+        "unguarded_fact_share_pct": wmean("unguarded_fact_share_pct"),
+        "unguarded_spread_pct": [min(spreads), max(spreads)],
         "per_repo": rows,
         "deterministic": True,
-        "summary": (f"{reduction}% modeled codebase-fact hallucination reduction "
-                    f"across {len(rows)} repo-partition(s) "
-                    f"({baseline_per_100} -> {with_grounding} errors/100); "
-                    f"coverage {wmean('grounding_coverage_pct')}%, "
-                    f"guard catch {wmean('guard_catch_pct')}%"),
+        "measured": True,
+        "summary": (
+            f"measured across {len(rows)} repo-partition(s), {total} facts: "
+            f"grounding coverage {wmean('grounding_coverage_pct')}%, "
+            f"guard catch {wmean('guard_catch_pct')}%, "
+            f"guard specificity {wmean('guard_specificity_pct')}%; "
+            f"{wmean('unguarded_fact_share_pct')}% of facts are both "
+            f"ungroundable and unguarded"),
     }
+    if not baseline_per_100:
+        # HB-1: refuse to invent the comparison. Without an observed ungrounded
+        # fabrication rate there is no reduction to report, and a default one
+        # would make the headline a restatement of its own assumption.
+        out["hallucination_reduction_pct"] = None
+        out["projection"] = {
+            "available": False,
+            "why": ("no ungrounded-fabrication baseline supplied. ContextIQ "
+                    "cannot observe how often an un-grounded agent fabricates; "
+                    "pass baseline_per_100 (with baseline_source) measured on "
+                    "your own agent and model to get a projected reduction. "
+                    "The measured figures above stand on their own."),
+        }
+        return out
+    projected = round(
+        sum(r["projected_with_grounding_per_100"] * r["facts"]
+            for r in rows) / total, 3)
+    reduction = round(100 * (baseline_per_100 - projected) / baseline_per_100, 2)
+    reds = [r["projected_reduction_pct"] for r in rows]
+    out["projection"] = {
+        "available": True,
+        "baseline_without_grounding_per_100": baseline_per_100,
+        "baseline_source": baseline_source or "UNSTATED — provenance not given",
+        "projected_with_grounding_per_100": projected,
+        "projected_reduction_pct": reduction,
+        "projected_reduction_spread_pct": [min(reds), max(reds)],
+        "caveat": ("projected, not observed: this figure is arithmetic over "
+                   "the supplied baseline and is no more trustworthy than it. "
+                   "A high baseline forces a high reduction regardless of how "
+                   "the guard performs."),
+    }
+    out["hallucination_reduction_pct"] = reduction
+    out["summary"] += (f"; projected {reduction}% reduction against a supplied "
+                       f"baseline of {baseline_per_100}/100 (NOT observed)")
+    return out
 
 
 def hallucination_report_to_markdown(rep: dict) -> str:
     if not rep.get("per_repo"):
         return "# tokengraph hallucination benchmark\n\n(no symbols indexed)\n"
-    out = ["# tokengraph — codebase-fact hallucination benchmark", "",
+    proj = rep.get("projection") or {}
+    out = ["# tokengraph — codebase-fact grounding benchmark", "",
            f"_{rep['summary']}_", "",
-           f"- Methodology: {rep['methodology']}",
-           f"- Reproducible: deterministic, no LLM (same index -> same numbers)",
-           f"- Baseline (ungrounded): **{rep['baseline_without_grounding_per_100']}** errors/100",
-           f"- With grounding (modeled): **{rep['modeled_with_grounding_per_100']}** errors/100",
-           f"- **Hallucination reduction: {rep['hallucination_reduction_pct']}%** "
-           f"(per-repo spread {rep['reduction_spread_pct'][0]}-{rep['reduction_spread_pct'][1]}%)",
+           "## Measured",
            "",
-           "| Repo | Facts | Coverage % | Guard catch % | Guard spec. % | With-grounding /100 | Reduction % |",
-           "|---|--:|--:|--:|--:|--:|--:|"]
+           f"- Methodology: {rep['methodology']}",
+           "- Reproducible: deterministic, no LLM (same index -> same numbers)",
+           f"- Grounding coverage: **{rep['mean_grounding_coverage_pct']}%**",
+           f"- Guard catch rate: **{rep['mean_guard_catch_pct']}%**",
+           f"- Guard specificity: **{rep['mean_guard_specificity_pct']}%**",
+           f"- Facts both ungroundable and unguarded: "
+           f"**{rep['unguarded_fact_share_pct']}%** "
+           f"(per-repo spread {rep['unguarded_spread_pct'][0]}"
+           f"-{rep['unguarded_spread_pct'][1]}%)",
+           "",
+           "| Repo | Facts | Coverage % | Guard catch % | Guard spec. % | Unguarded % |",
+           "|---|--:|--:|--:|--:|--:|"]
     for r in rep["per_repo"]:
         out.append(f"| {r['repo']} | {r['facts']} | {r['grounding_coverage_pct']} "
                    f"| {r['guard_catch_pct']} | {r['guard_specificity_pct']} "
-                   f"| {r['modeled_with_grounding_per_100']} | {r['reduction_pct']} |")
+                   f"| {r['unguarded_fact_share_pct']} |")
+    out += ["", "## Hallucination reduction", ""]
+    if not proj.get("available"):
+        out += [
+            "**Not reported.** " + proj.get("why", "no baseline supplied."),
+            "",
+            "A reduction percentage requires knowing how often an ungrounded "
+            "agent fabricates on this codebase. ContextIQ does not observe "
+            "that, and assuming it would make the headline a restatement of "
+            "the assumption rather than a measurement.",
+        ]
+    else:
+        out += [
+            f"- Baseline (ungrounded, **supplied, not observed**): "
+            f"**{proj['baseline_without_grounding_per_100']}** errors/100",
+            f"- Baseline source: {proj['baseline_source']}",
+            f"- With grounding (projected): "
+            f"**{proj['projected_with_grounding_per_100']}** errors/100",
+            f"- **Projected reduction: {proj['projected_reduction_pct']}%** "
+            f"(per-repo spread {proj['projected_reduction_spread_pct'][0]}"
+            f"-{proj['projected_reduction_spread_pct'][1]}%)",
+            "",
+            f"> {proj['caveat']}",
+        ]
     out.append("")
     return "\n".join(out)
 
@@ -10589,14 +11429,26 @@ def build_mcp_server(root: Path, db: Path):
         return score_prompt(prompt)
 
     @mcp.tool
-    def summarize_chat(transcript: str, max_tokens: int = 400) -> dict:
+    def summarize_chat(transcript: str, max_tokens: int = 400,
+                       required_identifiers: list | None = None,
+                       required_facts: list | None = None) -> dict:
         """Compress a long chat transcript into a compact, token-cheap brief.
 
         Extracts decisions, action items, open questions and the code entities
         touched, capped at ~max_tokens. Use to carry a session forward without
         replaying the whole history.
+
+        Pass `required_identifiers` / `required_facts` — the symbols and the
+        decisions or constraints the next session must not lose — to also get a
+        `fidelity` score telling you whether they survived. Without it the only
+        feedback is a reduction percentage, which a summary that deleted
+        everything would maximise.
         """
         res = summarize_conversation(transcript, max_tokens=max_tokens)
+        if required_identifiers or required_facts:
+            res["fidelity"] = score_summary_fidelity(
+                res, {"identifiers": required_identifiers or [],
+                      "facts": required_facts or []})
         record_pack_savings(root, "mcp.summarize",
                             final_tokens=res.get("summary_tokens", 0),
                             baseline_tokens=res.get("original_tokens", 0), files=0)
@@ -10782,16 +11634,25 @@ def build_mcp_server(root: Path, db: Path):
 
     @mcp.tool
     def hallucination_benchmark(sample_per_repo: int = 40,
-                               baseline_per_100: float = 99.8) -> dict:
-        """Reproducible, multi-repo codebase-fact hallucination-reduction benchmark.
+                                baseline_per_100: float | None = None,
+                                baseline_source: str = "") -> dict:
+        """Reproducible, multi-repo codebase-fact grounding benchmark.
 
-        Partitions the repo, measures grounding coverage + guard catch/specificity,
-        and reports a modeled hallucination-reduction % vs an ungrounded baseline.
-        Deterministic — same index state yields the same figure (no LLM)."""
+        MEASURES grounding coverage, guard catch rate, and guard specificity
+        over the real index. Deterministic — same index state yields the same
+        numbers, no LLM involved.
+
+        Does NOT report a hallucination-reduction % unless you supply
+        `baseline_per_100`: the rate at which an un-grounded agent fabricates
+        is not something this tool can observe, and defaulting it would make
+        the headline a restatement of the assumption. Supply one you measured,
+        with `baseline_source`, to get a clearly-labelled projection."""
         r = _ret()
         try:
-            return hallucination_benchmark_fn(r, sample_per_repo=sample_per_repo,
-                                              baseline_per_100=baseline_per_100)
+            return hallucination_benchmark_fn(
+                r, sample_per_repo=sample_per_repo,
+                baseline_per_100=baseline_per_100,
+                baseline_source=baseline_source)
         finally:
             r.close()
 
@@ -11481,8 +12342,9 @@ def cmd_grounding(args):
 def cmd_hallucination(args):
     r = _open_retriever(args)
     try:
-        rep = hallucination_benchmark(r, sample_per_repo=args.sample,
-                                      baseline_per_100=args.baseline)
+        rep = hallucination_benchmark(
+            r, sample_per_repo=args.sample, baseline_per_100=args.baseline,
+            baseline_source=getattr(args, "baseline_source", ""))
     finally:
         r.close()
     if args.out:
@@ -11494,10 +12356,16 @@ def cmd_hallucination(args):
     else:
         print(rep.get("summary", rep.get("note", "")))
         for row in rep.get("per_repo", []):
-            print(f"  {row['repo']:16} facts={row['facts']:>3} "
-                  f"coverage={row['grounding_coverage_pct']}% "
-                  f"catch={row['guard_catch_pct']}% "
-                  f"reduction={row['reduction_pct']}%")
+            line = (f"  {row['repo']:16} facts={row['facts']:>3} "
+                    f"coverage={row['grounding_coverage_pct']}% "
+                    f"catch={row['guard_catch_pct']}% "
+                    f"unguarded={row['unguarded_fact_share_pct']}%")
+            if "projected_reduction_pct" in row:
+                line += f" projected={row['projected_reduction_pct']}%"
+            print(line)
+        proj = rep.get("projection") or {}
+        if not proj.get("available") and rep.get("per_repo"):
+            print(f"\n  note: {proj.get('why', '')}")
 
 
 def cmd_ide_setup(args):
@@ -11526,9 +12394,49 @@ def cmd_ide_setup(args):
             print(f"  {res['plugins']['note']}")
 
 
+# QG-3: the floor for the only experiment that directly tests the product's
+# thesis — that a pack answers as well as the full source it replaces. Below
+# `quality_retention` the compression is costing answers, which no amount of
+# token savings redeems.
+JUDGE_THRESHOLDS = {
+    "quality_retention": 0.90,   # pack score / full-source score
+    "pack_correct_rate": 0.60,   # share of questions answered fully correctly
+}
+# Where the last run is recorded, so "we have never actually checked" is a
+# visible state rather than a silent one.
+JUDGE_RESULT_FILE = "judge-eval.json"
+JUDGE_STALE_AFTER_DAYS = 30
+
+
+def judge_result_path(root: Path) -> Path:
+    return root / ".context" / JUDGE_RESULT_FILE
+
+
+def check_judge_thresholds(aggregate: dict,
+                           thresholds: dict | None = None) -> dict:
+    """Compare an LLM-judge aggregate against the QG-3 floors."""
+    th = dict(JUDGE_THRESHOLDS)
+    th.update(thresholds or {})
+    failures = []
+    for metric, limit in th.items():
+        actual = aggregate.get(metric)
+        if actual is None:
+            continue
+        if actual < limit:
+            failures.append({"metric": metric, "actual": actual,
+                             "threshold": limit, "direction": "min"})
+    return {"ok": not failures, "failures": failures, "thresholds": th}
+
+
 def cmd_judge_eval(args):
-    """Run the LLM-judged answer-quality evaluation (QG-2)."""
+    """Run the LLM-judged answer-quality evaluation (QG-2, QG-3).
+
+    This is the only measurement that tests the project's actual claim end to
+    end, so it also records *that it ran*: the deterministic gate can prove the
+    right symbols are present, and still not prove a model answers from them.
+    """
     import json
+    import time
     root = Path(args.path).resolve()
     corpora = ([Path(c) for c in args.corpus] if args.corpus
                else load_judge_corpora(root))
@@ -11541,24 +12449,42 @@ def cmd_judge_eval(args):
         print(f"judge-eval: {res['error']}", file=sys.stderr)
         print(f"  {res.get('hint','')}", file=sys.stderr)
         sys.exit(2)
+    a = res["aggregate"]
+    gate = check_judge_thresholds(a)
+    res["gate"] = gate
+    res["ran_at"] = time.time()
+    # Record the run where doctor and CI can see its age. Only the aggregate
+    # and the gate are persisted — never the graded answers, which contain
+    # source excerpts.
+    record = judge_result_path(root)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps(
+        {"ran_at": res["ran_at"], "model": a.get("model"),
+         "aggregate": a, "gate": gate}, indent=2, sort_keys=True),
+        encoding="utf-8")
     if args.out:
         Path(args.out).write_text(json.dumps(res, indent=2), encoding="utf-8")
     if getattr(args, "json", False):
         _emit(res, True)
-        return
-    a = res["aggregate"]
-    print(f"judge-eval: {a['graded']}/{a['questions']} graded "
-          f"across {len(a['repos'])} repos (model {a['model']})")
-    print(f"  pack score      {a['pack_mean_score']}  "
-          f"(fully correct: {a['pack_correct_rate']})")
-    print(f"  pack tokens     {a['mean_pack_tokens']:.0f} avg")
-    if "quality_retention" in a:
-        print(f"  full-file score {a['full_mean_score']}  "
-              f"({a['mean_full_tokens']:.0f} tokens avg)")
-        print(f"  QUALITY RETENTION {a['quality_retention']}  "
-              f"at {a['token_ratio']:.1%} of the tokens")
-    if a["errors"]:
-        print(f"  {a['errors']} question(s) errored")
+    else:
+        print(f"judge-eval: {a['graded']}/{a['questions']} graded "
+              f"across {len(a['repos'])} repos (model {a['model']})")
+        print(f"  pack score      {a['pack_mean_score']}  "
+              f"(fully correct: {a['pack_correct_rate']})")
+        print(f"  pack tokens     {a['mean_pack_tokens']:.0f} avg")
+        if "quality_retention" in a:
+            print(f"  full-file score {a['full_mean_score']}  "
+                  f"({a['mean_full_tokens']:.0f} tokens avg)")
+            print(f"  QUALITY RETENTION {a['quality_retention']}  "
+                  f"at {a['token_ratio']:.1%} of the tokens")
+        if a["errors"]:
+            print(f"  {a['errors']} question(s) errored")
+        print(f"  recorded in {record.relative_to(root).as_posix()}")
+    if getattr(args, "check", False) and not gate["ok"]:
+        for f in gate["failures"]:
+            print(f"FAIL {f['metric']}: {f['actual']} (min {f['threshold']})",
+                  file=sys.stderr)
+        raise SystemExit(1)
 
 
 def cmd_embed_warm(args):
@@ -11847,9 +12773,78 @@ def cmd_stats(args):
     s.close()
 
 
+def repo_fidelity(root: Path) -> dict:
+    """Per-language extraction fidelity for what is actually indexed (PF-1).
+
+    Answers the question a language table cannot: not "is Zig supported?" but
+    "for the Zig in *this* repository, does the call graph exist?" Coverage is
+    reported as the share of indexed files whose language produces graph edges,
+    so a repo that is 90% regex-tier reads as such instead of reporting a
+    healthy index.
+    """
+    store = Store(_db_path(root))
+    try:
+        rows = store.files_with_tokens()
+        scip = store.get_meta("scip_ingested_at", "")
+    finally:
+        store.close()
+    langs: dict[str, dict] = {}
+    for r in rows:
+        lang = r["language"] or "unknown"
+        tier = language_tier(lang)
+        entry = langs.setdefault(lang, {
+            "language": lang, "tier": tier,
+            **{k: EXTRACTION_TIERS[tier][k]
+               for k in ("label", "symbols", "calls", "imports",
+                         "inheritance", "note")},
+            "files": 0, "symbols": 0, "tokens": 0,
+        })
+        entry["files"] += 1
+        entry["symbols"] += r["symbols_count"] or 0
+        entry["tokens"] += r["token_est"] or 0
+    total = sum(e["files"] for e in langs.values()) or 1
+    graphed = sum(e["files"] for e in langs.values() if e["calls"])
+    return {
+        "languages": sorted(langs.values(),
+                            key=lambda e: (-e["files"], e["language"])),
+        "files": total,
+        "graph_coverage_pct": round(graphed / total * 100, 1),
+        "regex_only_files": total - graphed,
+        # SCIP lifts reference precision for languages whose native resolution
+        # is weak, but only where an external indexer has actually been run.
+        "scip_ingested": bool(scip),
+        "scip_ingested_at": scip,
+    }
+
+
 def cmd_langs(args):
+    """Language support, by extraction tier — and, with --repo, by real usage."""
+    if getattr(args, "repo", False):
+        rep = repo_fidelity(Path(args.path).resolve())
+        if getattr(args, "json", False):
+            _emit(rep, True)
+            return
+        print(f"indexed files: {rep['files']}   "
+              f"call-graph coverage: {rep['graph_coverage_pct']}%   "
+              f"regex-only: {rep['regex_only_files']}   "
+              f"SCIP: {'yes' if rep['scip_ingested'] else 'no'}")
+        print(f"{'language':14} {'tier':20} {'files':>6} {'symbols':>8}  edges")
+        for e in rep["languages"]:
+            edges = ("calls+imports+inheritance" if e["calls"]
+                     else "NONE (symbols only)")
+            print(f"{e['language'][:14]:14} {e['label'][:20]:20} "
+                  f"{e['files']:>6} {e['symbols']:>8}  {edges}")
+        return
+    if getattr(args, "json", False):
+        _emit({"tiers": EXTRACTION_TIERS,
+               "languages": languages_available()}, True)
+        return
     for lang, exts in languages_available().items():
         print(f"  {lang:28} {', '.join(exts)}")
+    print("\ntiers (what each can extract):")
+    for name, t in sorted(EXTRACTION_TIERS.items(),
+                          key=lambda kv: -kv[1]["rank"]):
+        print(f"  {t['label']:24} {t['note']}")
 
 
 def cmd_diagnose(args):
@@ -11965,6 +12960,9 @@ def cmd_generate(args):
     index_repo(root, _db_path(root))
     r = Retriever(root, _db_path(root))
     try:
+        # CFG-6: taken before generation so the stamp names the code the
+        # artefact actually describes.
+        fingerprint = r.store.content_fingerprint(generated_artifact_paths(cfg))
         total_sig = r.total_signature_tokens(src_dirs)
         if cfg.get("autoMaxTokens", True) and not args.budget:
             budget, warns = effective_budget(
@@ -12006,7 +13004,8 @@ def cmd_generate(args):
             hp = payloads[host_budget]
             for ad in ads:
                 custom = cfg.get("output") if ad == "copilot" else None
-                rel = write_adapter(root, ad, hp["markdown"], custom)
+                rel = write_adapter(root, ad, hp["markdown"], custom,
+                                    fingerprint=fingerprint)
                 entry = {"adapter": ad, "path": rel, "budget": host_budget,
                          "tokens": hp["tokens"]}
                 if fmt == "cache":
@@ -12199,17 +13198,25 @@ def load_benchmark_corpus(path: Path) -> list[dict]:
 # the product default budget of 6000 tokens across 96 cases in 4 repositories
 # (Python / TypeScript / Go):
 #
-#     recall_at_5 0.958 | symbol_recall 0.719 | answerable 0.51 | waste 0.785
+#     recall_at_5 0.979 | symbol_recall 0.865 | answerable 0.698 | waste 0.717
 #
-# The honest reading: ContextIQ nearly always finds the right FILE, but carries
-# every symbol AND fact an answer needs only about half the time at this budget.
-# Raising `answerable_rate` is the main open quality work; do not raise the
-# threshold without first raising the measurement.
+# Previously 0.958 / 0.719 / 0.510 / 0.785. The gain came from two fixes, both
+# aimed at the same finding — that retrieval located the right file and then
+# failed to carry the thing in it that answered the question:
+#
+#   * SR-1, the completion sweep, which stopped packs terminating at half the
+#     requested budget with the answer left on the floor; and
+#   * CN-1, indexing module- and type-scope constants, without which a
+#     controlling value was not a symbol and could not be retrieved at all.
+#
+# The honest reading is still that answerability is the weak metric: roughly a
+# third of packs remain short of some symbol or literal an answer needs. Do not
+# raise a threshold without first raising the measurement.
 BENCHMARK_THRESHOLDS = {
-    "recall_at_5": 0.90,        # the right file is in the top 5
-    "symbol_recall": 0.65,      # required symbols actually made it into the pack
-    "answerable_rate": 0.45,    # packs carrying EVERY required symbol + fact
-    "irrelevant_token_ratio": 0.85,   # ceiling — budget spent outside target files
+    "recall_at_5": 0.95,        # the right file is in the top 5
+    "symbol_recall": 0.80,      # required symbols actually made it into the pack
+    "answerable_rate": 0.60,    # packs carrying EVERY required symbol + fact
+    "irrelevant_token_ratio": 0.78,   # ceiling — budget spent outside target files
 }
 
 
@@ -12776,41 +13783,129 @@ def cmd_analyze(args):
         r.close()
 
 
+def cmd_pricing(args):
+    """Show the effective rate card and flag families due for review (CE-3).
+
+    `--check` is the CI gate: exit non-zero when any family the project prices
+    against has passed its review window. That is the automation the built-in
+    table needs — prices cannot be fetched offline, but going stale silently
+    is a choice, and this makes it fail loudly instead.
+    """
+    root = Path(args.path).resolve()
+    pricing = load_pricing(root, refresh=True)
+    models = args.models or sorted(pricing["prices"])
+    cards = [rate_card(m, root) for m in models]
+    # The gate covers the families this installation actually quotes costs in
+    # — the ones behind DEFAULT_COST_MODEL and DEFAULT_GAIN_MODEL — because
+    # those are the numbers a user is handed. Prices for families nobody here
+    # bills against are still printed as OVERDUE, but failing the build on them
+    # would only train people to pass --no-verify. `--all-families` gates
+    # everything, for projects that do quote all of them.
+    gated = ({model_family(DEFAULT_COST_MODEL), model_family(DEFAULT_GAIN_MODEL)}
+             if not getattr(args, "all_families", False)
+             else set(pricing["families"]))
+    overdue = [f for f, meta in pricing["families"].items()
+               if meta["stale"] and f in gated]
+    advisory = [f for f, meta in pricing["families"].items()
+                if meta["stale"] and f not in gated]
+    if getattr(args, "json", False):
+        _emit({"catalog_version": pricing["catalog_version"],
+               "source": pricing["source"], "as_of": pricing["as_of"],
+               "families": pricing["families"], "overdue": overdue,
+               "rate_cards": cards, "warnings": pricing["warnings"]}, True)
+    else:
+        print(f"pricing catalog v{pricing['catalog_version']}  "
+              f"source={pricing['source']}")
+        print(f"{'model':22} {'in':>8} {'out':>8} {'cache rd':>9} "
+              f"{'cache wr':>9} {'batch':>6}  as_of")
+        for c in cards:
+            print(f"{c['model'][:22]:22} {c['input']:>8.3f} {c['output']:>8.3f} "
+                  f"{c.get('cache_read', 0):>9.3f} {c.get('cache_write', 0):>9.3f} "
+                  f"{c.get('batch_multiplier', 1.0):>6.2f}  {c['as_of']}")
+        for f, meta in sorted(pricing["families"].items()):
+            mark = ("OVERDUE" if meta["stale"] and f in gated else
+                    "stale  " if meta["stale"] else "ok     ")
+            scope = "gated" if f in gated else "advisory"
+            print(f"  [{mark}] {f}: as of {meta['as_of']} "
+                  f"({meta['age_days']}d, {scope})")
+        for w in pricing["warnings"]:
+            print(f"  ! {w}", file=sys.stderr)
+    if getattr(args, "check", False):
+        if advisory:
+            print(f"note: {', '.join(sorted(advisory))} also past the review "
+                  f"window, but not gated (no default cost figure uses them; "
+                  f"use --all-families to gate them too)", file=sys.stderr)
+        if overdue:
+            print(f"FAIL pricing: {', '.join(sorted(overdue))} past the "
+                  f"{PRICES_STALE_AFTER_DAYS}-day review window",
+                  file=sys.stderr)
+            raise SystemExit(1)
+
+
 def cmd_doctor(args):
-    """Validate config, context, index freshness, coverage, MCP wiring (CFG-5)."""
-    import time
+    """Validate config, context, index freshness, coverage, MCP wiring (CFG-5).
+
+    Findings carry a severity. `fail` means something is broken or missing that
+    ContextIQ needs; `warn` means it works but could be better. Only failures
+    set the exit code, because a readiness check that reports "not ready" for an
+    optional file trains people to ignore it — which is exactly what a missing
+    `gen-context.config.json` used to do, despite the built-in defaults being
+    complete and valid. `--strict` opts into treating warnings as failures.
+    """
     root = Path(args.path).resolve()
     checks: list[dict] = []
 
-    def add(name, ok, fix=""):
-        checks.append({"check": name, "ok": bool(ok), "fix": fix})
+    def add(name, ok, fix="", severity="fail"):
+        checks.append({"check": name, "ok": bool(ok),
+                       "severity": "ok" if ok else severity, "fix": fix})
 
     cfg_path = root / CONFIG_NAME
     cfg = load_config(root)
-    add("config present", cfg_path.exists(), f"run: tokengraph init")
+    # Optional by design: load_config() starts from a complete default set, so
+    # its absence is a preference, not a fault.
+    add("config present (optional)", cfg_path.exists(),
+        "using built-in defaults — run `tokengraph init` to pin them",
+        severity="warn")
     add("config parses", "_error" not in cfg, cfg.get("_error", ""))
 
     db = _db_path(root)
     add("index built", db.exists(), "run: tokengraph index")
+    fingerprint = ""
     if db.exists():
         rep = index_repo(root, db)
+        # Advisory, not a failure: the graph refreshes on every call, so by the
+        # time this line runs the index *is* fresh. Reporting the reparse as a
+        # fault made a healthy repository look broken after any edit.
         add("index fresh", rep.parsed == 0,
-            f"{rep.parsed} file(s) changed — they were just reindexed")
+            f"{rep.parsed} file(s) had changed and were reindexed just now",
+            severity="warn")
+        store = Store(db)
+        try:
+            fingerprint = store.content_fingerprint(generated_artifact_paths(cfg))
+        finally:
+            store.close()
 
     outputs = cfg.get("outputs", ["copilot"])
-    any_ctx = False
     for ad in outputs:
         spec = ADAPTERS.get(ad)
         if not spec:
             continue
         rel = cfg.get("output") if ad == "copilot" and cfg.get("output") else spec["path"]
         p = root / rel
-        present = p.exists()
-        any_ctx = any_ctx or present
-        stale = present and (time.time() - p.stat().st_mtime) > 7 * 86400
-        add(f"context: {rel}", present and not stale,
-            "run: tokengraph generate" if not present else
-            ("stale >7d — run: tokengraph generate" if stale else ""))
+        if not p.exists():
+            add(f"context: {rel}", False, "run: tokengraph generate")
+            continue
+        # CFG-6: staleness is a content question, not a calendar one.
+        stamp = read_source_stamp(p.read_text(encoding="utf-8", errors="replace"))
+        if not stamp:
+            add(f"context: {rel}", False,
+                "generated before source stamping — run: tokengraph generate "
+                "once to make staleness checkable", severity="warn")
+        elif fingerprint and stamp != fingerprint:
+            add(f"context: {rel}", False,
+                "describes source that has since changed — run: tokengraph generate")
+        else:
+            add(f"context: {rel}", True)
 
     # A config file must actually *declare the tokengraph server* to count.
     # Previously the mere existence of .claude/settings.json (which may hold
@@ -12824,24 +13919,68 @@ def cmd_doctor(args):
                 f"{w['path']} exists but has no tokengraph server under "
                 f"`{w['key']}` — run: tokengraph ide-setup")
 
+    # QG-3: the deterministic gate proves the required symbols are *present*;
+    # only the LLM judge proves a model still *answers* from the smaller pack.
+    # Its absence is the project's biggest unproven claim, so it is reported —
+    # as an advisory, because it costs real API spend and cannot run offline.
+    import json as _json
+    import time as _time
+    jrec = judge_result_path(root)
+    if not jrec.exists():
+        add("LLM answer-quality eval", False,
+            "never run — the token savings are unproven end to end. "
+            "Run: tokengraph judge-eval --check (needs API access)",
+            severity="warn")
+    else:
+        try:
+            doc = _json.loads(jrec.read_text(encoding="utf-8"))
+            age = (_time.time() - float(doc.get("ran_at") or 0)) / 86400
+            gate_ok = (doc.get("gate") or {}).get("ok", True)
+            retention = (doc.get("aggregate") or {}).get("quality_retention")
+            label = (f"LLM answer-quality eval (retention {retention})"
+                     if retention is not None else "LLM answer-quality eval")
+            if not gate_ok:
+                add(label, False, "last run was BELOW the quality floor — "
+                                  "compression is costing answers")
+            elif age > JUDGE_STALE_AFTER_DAYS:
+                add(label, False,
+                    f"last run {int(age)}d ago (>{JUDGE_STALE_AFTER_DAYS}d) — "
+                    f"re-run: tokengraph judge-eval --check", severity="warn")
+            else:
+                add(label, True)
+        except (ValueError, TypeError) as ex:
+            add("LLM answer-quality eval", False,
+                f"unreadable {jrec.name}: {ex}", severity="warn")
+
     info = embed_backend_info()
     add(f"embeddings: {info['kind']}", True, "")
     if not info["semantic"]:
         add("semantic embeddings active", False,
             "search_semantic is using the lexical hash fallback — "
-            "pip install 'contextiq[embeddings]' && tokengraph embed-warm")
+            "pip install 'contextiq[embeddings]' && tokengraph embed-warm",
+            severity="warn")
 
-    ok = all(c["ok"] for c in checks)
+    failures = [c for c in checks if c["severity"] == "fail"]
+    warnings = [c for c in checks if c["severity"] == "warn"]
+    strict = getattr(args, "strict", False)
+    ok = not failures and not (strict and warnings)
     if getattr(args, "json", False):
-        _emit({"ok": ok, "checks": checks}, True)
+        _emit({"ok": ok, "checks": checks, "failures": len(failures),
+               "warnings": len(warnings), "strict": strict}, True)
     else:
+        marks = {"ok": "ok  ", "warn": "warn", "fail": "FIX "}
         for c in checks:
-            mark = "ok " if c["ok"] else "FIX"
-            line = f"[{mark}] {c['check']}"
+            line = f"[{marks[c['severity']]}] {c['check']}"
             if not c["ok"] and c["fix"]:
                 line += f"  -> {c['fix']}"
             print(line)
-        print("doctor: " + ("all good" if ok else "issues found"))
+        if failures:
+            print(f"doctor: {len(failures)} issue(s) found")
+        elif warnings:
+            print(f"doctor: ready ({len(warnings)} advisory)"
+                  + (" — failing because --strict" if strict else ""))
+        else:
+            print("doctor: all good")
     if not ok:
         raise SystemExit(1)
 
@@ -12996,7 +14135,13 @@ def build_parser():
     rp.set_defaults(func=cmd_report)
 
     sub.add_parser("stats").set_defaults(func=cmd_stats)
-    sub.add_parser("langs").set_defaults(func=cmd_langs)
+    lg = sub.add_parser("langs",
+                        help="language support by extraction tier (PF-1)")
+    lg.add_argument("--repo", action="store_true",
+                    help="report fidelity for THIS repository's indexed files, "
+                         "including how much of it has no call graph at all")
+    lg.add_argument("--json", action="store_true")
+    lg.set_defaults(func=cmd_langs)
     srv = sub.add_parser("serve", help="run the MCP server (stdio or HTTP)")
     srv.add_argument("--transport", default="stdio",
                      choices=["stdio", "http", "streamable-http", "sse"],
@@ -13025,6 +14170,8 @@ def build_parser():
     jd.add_argument("--corpus", action="append",
                     help="explicit judge.json path; repeatable")
     jd.add_argument("-o", "--out", default=None, help="write full JSON results")
+    jd.add_argument("--check", action="store_true",
+                    help="CI gate: exit 1 below the QG-3 quality floors")
     jd.add_argument("--json", action="store_true")
     jd.set_defaults(func=cmd_judge_eval)
 
@@ -13258,10 +14405,16 @@ def build_parser():
     gr.set_defaults(func=cmd_grounding)
 
     hb = sub.add_parser("hallucination",
-                        help="multi-repo, reproducible codebase-fact hallucination-reduction benchmark")
+                        help="multi-repo, reproducible codebase-fact grounding benchmark")
     hb.add_argument("--sample", type=int, default=40, help="symbols sampled per repo-partition")
-    hb.add_argument("--baseline", type=float, default=99.8,
-                    help="ungrounded fabrication rate per 100 to compare against")
+    hb.add_argument("--baseline", type=float, default=None,
+                    help="ungrounded fabrication rate per 100 to project a "
+                         "reduction against. No default on purpose: the tool "
+                         "cannot observe this, and assuming it manufactures the "
+                         "headline. Omit for measurements only.")
+    hb.add_argument("--baseline-source", default="",
+                    help="where --baseline came from (required for it to be "
+                         "reported as anything but unsubstantiated)")
     hb.add_argument("-o", "--out", default=None, help="write a markdown report")
     hb.add_argument("--json", action="store_true")
     hb.add_argument("--no-refresh", action="store_true")
@@ -13382,9 +14535,25 @@ def build_parser():
     an.add_argument("--json", action="store_true")
     an.set_defaults(func=cmd_analyze)
 
+    pr = sub.add_parser("pricing",
+                        help="effective rate card + price-staleness gate (CE-3)")
+    pr.add_argument("--models", nargs="*", default=None,
+                    help="limit to these models (default: the whole catalogue)")
+    pr.add_argument("--check", action="store_true",
+                    help="exit 1 if a family this project quotes costs in is "
+                         "past its review window")
+    pr.add_argument("--all-families", action="store_true",
+                    help="gate on every vendor family, not just the ones "
+                         "behind the default cost/gain models")
+    pr.add_argument("--json", action="store_true")
+    pr.set_defaults(func=cmd_pricing)
+
     dr = sub.add_parser("doctor",
                         help="validate config/context/index/MCP wiring (CFG-5)")
     dr.add_argument("--json", action="store_true")
+    dr.add_argument("--strict", action="store_true",
+                    help="treat advisories (optional config, missing extras) "
+                         "as failures too")
     dr.set_defaults(func=cmd_doctor)
 
     gn = sub.add_parser("gain",

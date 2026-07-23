@@ -1560,7 +1560,7 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         oc = res["output_check"]
         self.assertFalse(oc["ok"])
 
-    # ---- hallucination reduction: reproducible multi-repo benchmark ----
+    # ---- grounding: reproducible multi-repo benchmark (HB-1) ----
     def test_hallucination_benchmark_multi_repo_and_deterministic(self):
         r = self._retriever()
         try:
@@ -1572,14 +1572,54 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         self.assertGreaterEqual(rep1["repos"], 2)
         self.assertTrue(rep1["deterministic"])
         # reproducible: identical numbers on re-run (no LLM, no randomness)
-        self.assertEqual(rep1["hallucination_reduction_pct"],
-                         rep2["hallucination_reduction_pct"])
-        self.assertEqual(rep1["modeled_with_grounding_per_100"],
-                         rep2["modeled_with_grounding_per_100"])
-        # a real, quantified, multi-repo figure with a spread
-        self.assertGreater(rep1["hallucination_reduction_pct"], 0.0)
-        self.assertEqual(len(rep1["reduction_spread_pct"]), 2)
+        self.assertEqual(rep1["mean_guard_catch_pct"], rep2["mean_guard_catch_pct"])
+        self.assertEqual(rep1["unguarded_fact_share_pct"],
+                         rep2["unguarded_fact_share_pct"])
+        self.assertEqual(len(rep1["unguarded_spread_pct"]), 2)
         self.assertGreaterEqual(rep1["mean_grounding_coverage_pct"], 0.0)
+
+    def test_no_reduction_claim_without_a_supplied_baseline(self):
+        """HB-1: the tool must not invent the number it is being judged on.
+
+        The ungrounded fabrication rate cannot be observed from an index, so a
+        default for it turns the headline into a restatement of its own
+        assumption. Absent one, report the measurements and say why not.
+        """
+        r = self._retriever()
+        try:
+            rep = tg.hallucination_benchmark(r, sample_per_repo=10)
+        finally:
+            r.close()
+        self.assertIsNone(rep["hallucination_reduction_pct"])
+        self.assertFalse(rep["projection"]["available"])
+        self.assertIn("baseline", rep["projection"]["why"])
+        # …and the measured half is still fully reported.
+        self.assertTrue(rep["measured"])
+        self.assertIn("guard catch", rep["summary"])
+
+    def test_supplied_baseline_yields_a_labelled_projection(self):
+        r = self._retriever()
+        try:
+            rep = tg.hallucination_benchmark(
+                r, sample_per_repo=10, baseline_per_100=40.0,
+                baseline_source="internal eval, 2026-07")
+        finally:
+            r.close()
+        proj = rep["projection"]
+        self.assertTrue(proj["available"])
+        self.assertEqual(proj["baseline_without_grounding_per_100"], 40.0)
+        self.assertEqual(proj["baseline_source"], "internal eval, 2026-07")
+        self.assertIn("not observed", proj["caveat"])
+        self.assertIn("NOT observed", rep["summary"])
+
+    def test_unstated_baseline_source_is_called_out(self):
+        r = self._retriever()
+        try:
+            rep = tg.hallucination_benchmark(r, sample_per_repo=10,
+                                             baseline_per_100=40.0)
+        finally:
+            r.close()
+        self.assertIn("UNSTATED", rep["projection"]["baseline_source"])
 
     def test_hallucination_report_markdown(self):
         r = self._retriever()
@@ -1588,9 +1628,10 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         finally:
             r.close()
         md = tg.hallucination_report_to_markdown(rep)
-        self.assertIn("hallucination", md.lower())
-        self.assertIn("Reduction %", md)
+        self.assertIn("grounding", md.lower())
         self.assertIn("| Repo |", md)
+        # The report must state plainly that no reduction figure is available.
+        self.assertIn("Not reported", md)
 
     # ---- IDE integration: one-command MCP wiring for every editor ----
     def test_ide_setup_writes_editor_configs(self):
@@ -1801,6 +1842,282 @@ class DedupeTests(unittest.TestCase):
                 self.assertIsInstance(pack.deduped, list)
             finally:
                 r.close()
+
+
+_CONSTANTS_SAMPLE = '''\
+"""Order limits."""
+
+MAX_LINES_PER_ORDER = 40
+RETRYABLE_STATUS = frozenset({502, 503, 504})
+
+
+class Repository:
+    GREP_WINDOW_LINES = 40
+
+    def update_status(self, order_id, status):
+        """Persist a status change."""
+        self._rows[order_id] = status
+        self._version = self._version + 1
+        return self._version
+
+    def unrelated_helper(self, value):
+        """Nothing to do with the question."""
+        return value
+
+
+def build_repository():
+    """Construct the repository."""
+    return Repository()
+'''
+
+
+class ConstantExtractionTests(unittest.TestCase):
+    """CN-1: module- and class-scope bindings are symbols in their own right.
+
+    A controlling value that is not a symbol cannot be searched for, ranked, or
+    packed — which is how packs used to name the right file and still omit the
+    constant that answered the question.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+        _write(self.root, "shop.py", _CONSTANTS_SAMPLE)
+        tg.index_repo(self.root, self.db)
+        self.ret = tg.Retriever(self.root, self.db)
+
+    def tearDown(self):
+        self.ret.close()
+        self._tmp.cleanup()
+
+    def _kinds(self):
+        return {s["name"]: s["kind"] for s in self.ret.store.file_symbols("shop.py")}
+
+    def test_module_level_constants_become_symbols(self):
+        kinds = self._kinds()
+        self.assertEqual(kinds.get("MAX_LINES_PER_ORDER"), "constant")
+        self.assertEqual(kinds.get("RETRYABLE_STATUS"), "constant")
+
+    def test_class_level_constants_become_symbols(self):
+        self.assertEqual(self._kinds().get("GREP_WINDOW_LINES"), "constant")
+
+    def test_locals_are_not_indexed(self):
+        """A binding inside a function body is implementation detail."""
+        self.assertNotIn("_version", self._kinds())
+
+    def test_constant_signature_carries_its_value(self):
+        """A constant whose signature is just its name answers nothing."""
+        sig = self.ret.get_symbol("shop.MAX_LINES_PER_ORDER") or ""
+        self.assertIn("40", sig)
+
+    def test_constant_is_reachable_by_search(self):
+        hits = {r["qname"] for r in self.ret.store.search("retryable status", limit=10)}
+        self.assertIn("shop.RETRYABLE_STATUS", hits)
+
+
+class CompletionSweepTests(unittest.TestCase):
+    """SR-1: leftover budget finishes the files the pack committed to.
+
+    The regression this guards: retrieval located the right file, spent well
+    under half the requested budget, and returned without the symbol the
+    question was about.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+        _write(self.root, "shop.py", _CONSTANTS_SAMPLE)
+        tg.index_repo(self.root, self.db)
+        self.ret = tg.Retriever(self.root, self.db)
+
+    def tearDown(self):
+        self.ret.close()
+        self._tmp.cleanup()
+
+    def test_sweep_reaches_symbols_search_did_not_rank(self):
+        """The answer is in the file; a generous budget must actually carry it.
+
+        Asserted against the rendered pack rather than the piece list, because
+        a method is equally well delivered inside its class body — what matters
+        is that the querent can see it, not which piece carried it.
+        """
+        pack = self.ret.find_relevant_context("build the repository",
+                                              budget_tokens=4000)
+        self.assertIn("_version + 1", pack.to_markdown())
+
+    def test_sweep_marks_its_pieces(self):
+        pack = self.ret.find_relevant_context("build the repository",
+                                              budget_tokens=4000)
+        self.assertTrue(any(p.reason == "file completion" for p in pack.pieces))
+
+    def test_sweep_respects_both_budget_contracts(self):
+        """Payload sum and rendered markdown must each stay inside the budget."""
+        for budget in (300, 900, 4000):
+            pack = self.ret.find_relevant_context("update status version",
+                                                  budget_tokens=budget)
+            self.assertLessEqual(pack.tokens, budget, budget)
+            self.assertLessEqual(tg.count_tokens(pack.to_markdown()), budget, budget)
+
+    def test_sweep_does_not_show_the_same_lines_twice(self):
+        """A body and a symbol nested inside it are never both printed."""
+        pack = self.ret.find_relevant_context("repository status", budget_tokens=4000)
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for p in pack.pieces:
+            if p.detail != "body":
+                continue
+            row = self.ret.store.symbol_by_qname(p.qname)
+            if row is None or not row["lineno"]:
+                continue
+            lo, hi = row["lineno"], row["end_lineno"] or row["lineno"]
+            for s, e in spans.get(p.file, []):
+                self.assertFalse(lo <= e and hi >= s,
+                                 f"{p.qname} overlaps an already-shown body")
+            spans.setdefault(p.file, []).append((lo, hi))
+
+    def test_swept_symbols_are_not_also_advertised_as_missing(self):
+        pack = self.ret.find_relevant_context("build the repository",
+                                              budget_tokens=4000)
+        self.assertFalse({p.qname for p in pack.pieces} & set(pack.dropped))
+
+    def test_budget_is_actually_spent_when_there_is_material(self):
+        """The defect was a half-empty pack, not an over-full one.
+
+        Needs a repository larger than the budget, or "unspent" just means
+        "nothing left to say" — which is the one case where stopping early is
+        correct, and is why the small fixture above cannot test this.
+        """
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body = "\n\n".join(
+                f'def op_{i}(value):\n'
+                f'    """Operation number {i}."""\n'
+                f'    total = value * {i}\n'
+                f'    return total + {i}'
+                for i in range(60))
+            _write(root, "big.py", body)
+            _write(root, "shop.py", _CONSTANTS_SAMPLE)
+            db = root / ".tokengraph" / "graph.db"
+            tg.index_repo(root, db)
+            r = tg.Retriever(root, db)
+            try:
+                pack = r.find_relevant_context("operation total value",
+                                               budget_tokens=1500)
+                spent = tg.count_tokens(pack.to_markdown())
+                self.assertGreater(spent, 1500 * 0.6, "pack left the budget unspent")
+                self.assertLessEqual(spent, 1500)
+            finally:
+                r.close()
+
+
+class ExtractorVersionTests(unittest.TestCase):
+    """EX-1: upgrading the extractor invalidates an index built by an older one.
+
+    Without this the incremental fast path silently keeps a graph that predates
+    the symbol kinds this build knows how to find, until someone edits the file.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_version_covers_generation_and_grammars(self):
+        v = tg.extractor_version()
+        self.assertTrue(v.startswith(f"{tg.EXTRACTOR_GENERATION}:"))
+
+    def test_unchanged_files_are_skipped_normally(self):
+        _write(self.root, "mod.py", SAMPLE)
+        tg.index_repo(self.root, self.db)
+        rep = tg.index_repo(self.root, self.db)
+        self.assertEqual(rep.parsed, 0)
+        self.assertEqual(rep.skipped, 1)
+
+    def test_extractor_change_forces_reparse_of_unchanged_files(self):
+        _write(self.root, "mod.py", SAMPLE)
+        tg.index_repo(self.root, self.db)
+        store = tg.Store(self.db)
+        try:
+            store.set_meta("extractor_version", "0:stale")
+            store.commit()
+        finally:
+            store.close()
+        rep = tg.index_repo(self.root, self.db)
+        self.assertEqual(rep.parsed, 1, "stale extractor stamp must force a reparse")
+        store = tg.Store(self.db)
+        try:
+            self.assertEqual(store.get_meta("extractor_version"),
+                             tg.extractor_version())
+        finally:
+            store.close()
+
+
+_TRANSCRIPT = """\
+user: The checkout flow times out under load. Where should I look?
+assistant: The retry loop in `payments/gateway.py` is the likely cause. It uses
+a fixed backoff, so a slow upstream stacks requests instead of shedding them.
+user: Can we just raise the timeout?
+assistant: We decided to add jitter to the backoff rather than raise
+REQUEST_TIMEOUT_MS, because raising it hides the queueing problem.
+user: What about the retry budget?
+assistant: The constraint is that MAX_RETRIES must stay at 3 — the upstream
+contract caps us there. Still open: whether the circuit breaker should trip on
+timeouts or only on 5xx responses.
+assistant: Next step is to patch `charge_card` and add a load test.
+"""
+
+
+class SummaryFidelityTests(unittest.TestCase):
+    """CS-3: compression is only good if what an answer needs survives it.
+
+    A reduction percentage alone rewards deleting everything; these check the
+    opposite property — that decisions, constraints, open questions and the
+    identifiers under discussion are still there afterwards.
+    """
+
+    def _summary(self, max_tokens=400):
+        return tg.summarize_conversation(_TRANSCRIPT, max_tokens=max_tokens)
+
+    def test_a_faithful_summary_keeps_identifiers_and_facts(self):
+        score = tg.score_summary_fidelity(self._summary(), {
+            "identifiers": ["payments/gateway.py", "MAX_RETRIES"],
+            "facts": ["jitter", "circuit breaker"],
+        })
+        self.assertTrue(score["faithful"],
+                        f"lost {score['identifiers_lost']} / {score['facts_lost']}")
+        self.assertGreaterEqual(score["identifier_recall"], 0.8)
+
+    def test_missing_content_is_reported_not_hidden(self):
+        score = tg.score_summary_fidelity(self._summary(), {
+            "identifiers": ["a_symbol_never_mentioned"],
+            "facts": ["a fact never stated"],
+        })
+        self.assertFalse(score["faithful"])
+        self.assertEqual(score["identifier_recall"], 0.0)
+        self.assertIn("a_symbol_never_mentioned", score["identifiers_lost"])
+        self.assertIn("a fact never stated", score["facts_lost"])
+
+    def test_an_aggressive_budget_trades_fidelity_and_says_so(self):
+        """The point of the metric: a smaller summary is not automatically better."""
+        loose = tg.score_summary_fidelity(self._summary(400), {
+            "identifiers": ["payments/gateway.py", "MAX_RETRIES"],
+            "facts": ["jitter", "circuit breaker"],
+        })
+        tight = tg.score_summary_fidelity(self._summary(40), {
+            "identifiers": ["payments/gateway.py", "MAX_RETRIES"],
+            "facts": ["jitter", "circuit breaker"],
+        })
+        self.assertGreaterEqual(tight["reduction_pct"], loose["reduction_pct"])
+        self.assertLessEqual(tight["fact_recall"], loose["fact_recall"])
+
+    def test_empty_requirements_do_not_fabricate_a_score(self):
+        score = tg.score_summary_fidelity(self._summary(), {})
+        self.assertEqual(score["identifier_recall"], 1.0)
+        self.assertEqual(score["fact_recall"], 1.0)
 
 
 class PromptQualityTests(unittest.TestCase):

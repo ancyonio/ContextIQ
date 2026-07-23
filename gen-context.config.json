@@ -1,0 +1,23 @@
+{
+  "srcDirs": [
+    "src",
+    "app",
+    "lib",
+    "."
+  ],
+  "strategy": "hot-cold",
+  "hotCommits": 10,
+  "diffPriority": true,
+  "autoMaxTokens": true,
+  "coverageTarget": 0.8,
+  "modelContextLimit": 128000,
+  "maxTokensHeadroom": 0.2,
+  "outputs": [
+    "copilot"
+  ],
+  "retrieval": {
+    "topK": 10,
+    "recencyBoost": 1.5,
+    "preset": "balanced"
+  }
+}

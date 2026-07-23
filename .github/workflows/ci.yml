@@ -10,6 +10,14 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The LLM-judged evaluation below costs real API spend, so it cannot run on
+  # every push — but "too expensive for every PR" had quietly become "never
+  # runs at all", leaving the project's central claim untested. A weekly
+  # schedule plus manual dispatch is the compromise: routine, bounded, and
+  # visible when it regresses.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -90,3 +98,57 @@ jobs:
         with:
           python-version: '3.12'
       - run: python tools/validate_ai_config.py
+
+      - name: Pricing review window
+        # Built-in list prices go stale silently. This fails the build when a
+        # vendor family passes its review window, so the catalogue is refreshed
+        # deliberately instead of rotting until someone notices a wrong quote.
+        run: python tokengraph_all.py pricing --check
+
+  llm-quality:
+    name: LLM answer-quality (pack vs full source)
+    # Weekly and on demand only — every run makes paid API calls. Skipped
+    # automatically when no key is configured, so forks stay green.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . || true
+          pip install tiktoken anthropic
+
+      - name: Guard — API key present
+        id: key
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "no ANTHROPIC_API_KEY configured; skipping the paid evaluation"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Answers each held-out question twice — once from the ContextIQ pack,
+      # once from the full source — and gates on quality_retention. This is the
+      # only check that tests "fewer tokens, same answer" directly.
+      - name: Pack-vs-full-source evaluation
+        if: steps.key.outputs.present == 'true'
+        run: >
+          python tokengraph_all.py judge-eval --check
+          -o judge-eval.json --json
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.key.outputs.present == 'true'
+        with:
+          name: judge-eval-report
+          path: |
+            judge-eval.json
+            .context/judge-eval.json
