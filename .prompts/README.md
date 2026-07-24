@@ -11,6 +11,8 @@ whole-file reads.
 | [feature.md](feature.md) | Implement a feature against acceptance criteria |
 | [refactor.md](refactor.md) | Behavior-preserving change with a blast-radius check |
 | [performance.md](performance.md) | Find and remove a hot path |
+| [security-review.md](security-review.md) | Severity-ranked security review |
+| [migration.md](migration.md) | Blast-radius-driven, staged migration |
 | [code-review.md](code-review.md) | Risk-first review of a diff |
 | [test-generation.md](test-generation.md) | Targeted test creation |
 | [architecture-review.md](architecture-review.md) | Design / architecture review |

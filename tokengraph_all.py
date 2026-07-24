@@ -336,6 +336,21 @@ SEED_CANDIDATES = 20
 MAX_FANOUT_PER_SYMBOL = 150     # neighbours collected from any single symbol
 MAX_NEIGHBOR_CANDIDATES = 600   # global ceiling on collected candidates
 MAX_NEIGHBOR_SIGS = 40          # neighbour signatures actually emitted
+# NB-2: relevance floor applied before the top-N cap. A neighbour scoring below
+# this is graph-connected to a seed but has near-zero task overlap and/or is a
+# deep/hub-y node — the main source of "waste" tokens (budget spent on pieces
+# not connected to the answer). Kept deliberately low so real callees/bases
+# survive; tuned against the benchmark (see NB-2 note in find_relevant_context).
+# Override with TOKENGRAPH_NEIGHBOR_FLOOR to re-tune without editing code.
+#
+# Value chosen by a benchmark-gated sweep (0.0/0.03/0.06/0.12/0.18/0.25): 0.12
+# is the measured peak — it lifted answerable_rate 0.583 -> 0.656 and
+# symbol_recall 0.745 -> 0.797 on the fixture corpus with recall unchanged,
+# because pruning near-zero-overlap neighbour *signatures* frees budget the
+# completion sweep spends on answer-bearing *bodies*. Above ~0.18 it starts
+# pruning useful callees and regresses; the `or scored` fallback below prevents
+# an over-high floor from ever emptying the neighbour set.
+MIN_NEIGHBOR_SCORE = 0.12
 # Relevance weight by edge kind. A callee explains how the seed works; a base
 # class explains what it is; a caller is context about who needs it — useful,
 # but the least explanatory of the three.
@@ -5764,11 +5779,18 @@ class Retriever:
         # Rank candidates by task relevance; only the best are emitted.
         task_terms = set(_tokenize(task))
         degree_map = self.store.degrees(candidates.keys())
-        ranked = sorted(
-            candidates.values(),
-            key=lambda t: (-self._neighbor_score(t[0], t[1], t[2], task_terms,
-                                                 degree_map.get(t[0]["id"], 0)),
-                           t[0]["id"]))
+        scored = [
+            (r, reason, self._neighbor_score(r, reason, hop, task_terms,
+                                             degree_map.get(r["id"], 0)))
+            for (r, reason, hop) in candidates.values()]
+        # NB-2: drop neighbours below the relevance floor before the top-N cap.
+        # These are the pieces the "waste" metric counts — connected to a seed
+        # but not to the answer. Fall back to the unfiltered set if the floor
+        # would empty it, so a legitimately low-signal task still gets context.
+        floor = float(os.environ.get("TOKENGRAPH_NEIGHBOR_FLOOR",
+                                     MIN_NEIGHBOR_SCORE))
+        kept = [t for t in scored if t[2] >= floor] or scored
+        ranked = sorted(kept, key=lambda t: (-t[2], t[0]["id"]))
         pack.neighbors_considered = len(candidates)
         neighbor_rows = [(r, reason) for r, reason, _ in ranked[:MAX_NEIGHBOR_SIGS]]
         pack.neighbors_pruned = max(0, len(candidates) - len(neighbor_rows))
@@ -7990,6 +8012,41 @@ def render_prometheus(summary: dict) -> str:
         metric("contextiq_op_runs_total", "Runs, by operation.", "counter",
                [({"op": r["op"]}, r["runs"]) for r in by_op])
     return "\n".join(lines) + "\n"
+
+
+def render_grafana_dashboard(ds_uid: str = "prometheus") -> dict:
+    """A ready-to-import Grafana dashboard for the contextiq_* metrics (LX-2).
+
+    Static model (no live data), so `gain --grafana` emits a JSON a user can
+    import straight into Grafana once they scrape `gain --prometheus`. Pair it
+    with the Prometheus textfile collector or any scrape of the exported text.
+    """
+    ds = {"type": "prometheus", "uid": ds_uid}
+
+    def stat(title, expr, unit, x):
+        return {"type": "stat", "title": title, "datasource": ds,
+                "gridPos": {"h": 5, "w": 6, "x": x, "y": 0},
+                "fieldConfig": {"defaults": {"unit": unit}},
+                "targets": [{"expr": expr, "refId": "A", "datasource": ds}]}
+
+    return {
+        "title": "ContextIQ — Token Savings",
+        "schemaVersion": 39,
+        "version": 1,
+        "editable": True,
+        "tags": ["contextiq"],
+        "panels": [
+            stat("Tokens saved", "contextiq_tokens_saved_total", "short", 0),
+            stat("Reduction", "contextiq_reduction_ratio", "percentunit", 6),
+            stat("Cost avoided", "contextiq_cost_saved_usd", "currencyUSD", 12),
+            stat("Runs", "contextiq_runs_total", "short", 18),
+            {"type": "timeseries", "title": "Tokens saved by operation",
+             "datasource": ds, "gridPos": {"h": 9, "w": 24, "x": 0, "y": 5},
+             "targets": [{"expr": "contextiq_op_tokens_saved_total",
+                          "legendFormat": "{{op}}", "refId": "A",
+                          "datasource": ds}]},
+        ],
+    }
 
 
 def _gain_buckets(rows: list[dict], fmt: str) -> list[dict]:
@@ -10765,6 +10822,11 @@ def mcp_wiring_status(root: Path) -> list[dict]:
         (".vscode/mcp.json", "servers"),
         (".cursor/mcp.json", "mcpServers"),
         (".zed/settings.json", "context_servers"),
+        # opt-in hosts: only present when wired with `--editors …`, but if the
+        # file exists it must really declare the server under the host's key.
+        (".gemini/settings.json", "mcpServers"),
+        (".roo/mcp.json", "mcpServers"),
+        ("opencode.json", "mcp"),
     ]
     out: list[dict] = []
     for rel, key in specs:
@@ -11014,6 +11076,9 @@ _EDITOR_ADAPTERS = {
     "continue": "continue",  # .continue/rules/contextiq.md
     "cline": "cline",        # .clinerules/contextiq.md
     "claude": "claude",      # CLAUDE.md
+    "gemini": "gemini",      # GEMINI.md
+    "roo": "roo",            # .roo/rules/contextiq.md
+    "opencode": "agents",    # AGENTS.md (OpenCode reads the AGENTS.md standard)
 }
 
 
@@ -11077,6 +11142,9 @@ def verify_ide_wiring(root: Path, editors: list[str] | None = None) -> list[dict
         "continue": (".continue/config.yaml", None),
         "jetbrains": (".idea/mcp.xml", None),
         "nvim":     (".nvim/contextiq.lua", None),
+        "gemini":   (".gemini/settings.json", "mcpServers"),
+        "roo":      (".roo/mcp.json", "mcpServers"),
+        "opencode": ("opencode.json", "mcp"),
     }
     globals_ = global_mcp_targets()   # windsurf, cline (per-user paths)
 
@@ -12660,6 +12728,34 @@ def build_mcp_server(root: Path, db: Path):
                 return _json_mr.dumps(r.list_modules(), indent=2)
             finally:
                 r.close()
+
+        @mcp.resource("contextiq://conventions", mime_type="application/json",
+                      description="Detected house style: naming, layout, test "
+                                  "and export conventions + conformance score.")
+        def _res_conventions() -> str:
+            r = _ret()
+            try:
+                return _json_mr.dumps(analyze_conventions(r.store, root), indent=2)
+            finally:
+                r.close()
+
+        @mcp.resource("contextiq://test-map", mime_type="application/json",
+                      description="Whole-repo implementation<->test map + coverage %.")
+        def _res_test_map() -> str:
+            r = _ret()
+            try:
+                return _json_mr.dumps(r.get_test_map(), indent=2)
+            finally:
+                r.close()
+
+        @mcp.resource("contextiq://symbol/{qname}", mime_type="text/plain",
+                      description="Full source of one symbol by qualified name.")
+        def _res_symbol(qname: str) -> str:
+            r = _ret()
+            try:
+                return r.get_symbol(qname) or f"(symbol not found: {qname})"
+            finally:
+                r.close()
     except Exception as e:  # pragma: no cover - depends on FastMCP version
         print(f"tokengraph: MCP resources not registered ({e})", file=sys.stderr)
 
@@ -12682,6 +12778,39 @@ def build_mcp_server(root: Path, db: Path):
                     "2. conventions() then scaffold(name) for a house-style file.\n"
                     "3. get_method_impact(qname) before editing shared code.\n"
                     f"4. Implement, then verify with {test_command}.")
+
+        @mcp.prompt(name="refactor",
+                    description="Behavior-preserving refactor with a blast-radius check.")
+        def _prompt_refactor(target: str, outcome: str = "") -> str:
+            return (f"Task: refactor {target}"
+                    + (f" to {outcome}" if outcome else "")
+                    + " without changing observable behavior.\n\n"
+                    "1. get_symbol(target) to read it; get_method_impact(target) "
+                    "for call sites, deps, overrides, and tests.\n"
+                    "2. get_test_map(target) — run those tests as a baseline.\n"
+                    "3. Refactor with call-site signatures stable; re-run the "
+                    "baseline; review_diff() to confirm no scope-drift.")
+
+        @mcp.prompt(name="code_review",
+                    description="Risk-first review of the working/staged diff.")
+        def _prompt_code_review() -> str:
+            return ("Review the current diff for bugs, regressions, missing "
+                    "tests, and maintainability risk.\n\n"
+                    "1. review_diff() / get_diff_context() for exactly what "
+                    "changed plus its blast radius.\n"
+                    "2. Prioritize findings by severity with file:line refs.\n"
+                    "3. Do not rewrite code unless asked.")
+
+        @mcp.prompt(name="performance",
+                    description="Find and remove a hot path via ContextIQ.")
+        def _prompt_performance(slow_behavior: str,
+                                benchmark_command: str = "your benchmark") -> str:
+            return (f"Task: {slow_behavior} is too slow.\n\n"
+                    "1. search_semantic(slow_behavior) for the entry point.\n"
+                    "2. get_callees(qname) to trace downstream work; "
+                    "get_callers(qname) to learn how often the hot symbol runs.\n"
+                    "3. Fetch only hot symbols with get_symbol; apply the "
+                    f"smallest fix and re-measure with {benchmark_command}.")
     except Exception as e:  # pragma: no cover - depends on FastMCP version
         print(f"tokengraph: MCP prompts not registered ({e})", file=sys.stderr)
 
@@ -12736,6 +12865,57 @@ def cmd_context(args):
     else:
         print(out)
     r.close()
+
+
+def run_federated(roots: list, task: str, budget_tokens: int = 6000,
+                  depth: int = 1) -> dict:
+    """Retrieve across several repo roots and merge into one packet (FED-1).
+
+    Each root keeps its own isolated graph (`.tokengraph/graph.db`); this queries
+    all of them for the same task, splits the token budget across them, and
+    returns a single per-repo-sectioned pack — the cross-repo answer a monorepo
+    of separate services or a workspace of repos needs, without merging their
+    graphs. Files are reported repo-qualified so nothing is ambiguous.
+    """
+    resolved = [Path(r).resolve() for r in roots] or [Path(".").resolve()]
+    per = max(800, budget_tokens // max(1, len(resolved)))
+    sections: list[tuple[str, str, int]] = []
+    top_files: list[str] = []
+    for root in resolved:
+        if not root.exists():
+            sections.append((root.name, f"(skipped: {root} not found)", 0))
+            continue
+        db = _db_path(root)
+        index_repo(root, db)
+        r = Retriever(root, db)
+        try:
+            pack = r.find_relevant_context(task, budget_tokens=per,
+                                           expand_depth=depth)
+            md = pack.to_markdown()
+            files = sorted({p.file for p in pack.pieces})
+            tok = pack.rendered_tokens
+        finally:
+            r.close()
+        sections.append((root.name, md, tok))
+        top_files += [f"{root.name}/{f}" for f in files[:5]]
+    header = [f"# Federated context for: {task}",
+              f"_across {len(resolved)} repo(s), ~{per} tokens each_", ""]
+    body: list[str] = []
+    for name, md, tok in sections:
+        body += [f"## repo: {name}  (~{tok} tokens)", "", md, ""]
+    return {"markdown": "\n".join(header + body),
+            "repos": [str(x) for x in resolved],
+            "top_files": top_files, "budget_per_repo": per}
+
+
+def cmd_federated(args):
+    roots = args.root or [args.path]
+    res = run_federated(roots, args.task, budget_tokens=args.budget,
+                        depth=args.depth)
+    if getattr(args, "json", False):
+        _emit(res, True)
+    else:
+        print(res["markdown"])
 
 
 def cmd_skeleton(args):
@@ -13049,6 +13229,12 @@ def cmd_ask(args):
     r = _open_retriever(args)
     try:
         a = r.ask(args.task, budget_tokens=args.budget, depth=args.depth)
+        if getattr(args, "validate", False):
+            errs = schema_errors(a, ASK_OUTPUT_SCHEMA)
+            if errs:
+                for e in errs:
+                    print(f"schema: {e}", file=sys.stderr)
+                raise SystemExit(1)
         record_pack_savings(Path(args.path).resolve(), "ask",
                             final_tokens=a.get("pack_tokens", 0),
                             baseline_tokens=a.get("baseline_tokens", 0),
@@ -13153,6 +13339,43 @@ def cmd_squeeze(args):
               file=sys.stderr)
 
 
+def cmd_prompt(args):
+    """Print a `.prompts/<name>.md` template with {{VAR}} substitution (PT-1).
+
+    The no-templating-engine `--fill` path a harness can drive: `{{KEY}}` tokens
+    are replaced by `--fill KEY=VALUE` pairs; any left unfilled are reported to
+    stderr so nothing ships with a blank placeholder.
+    """
+    root = Path(args.path).resolve()
+    pdir = root / ".prompts"
+    available = (sorted(p.stem for p in pdir.glob("*.md")
+                        if p.stem.lower() != "readme")
+                 if pdir.is_dir() else [])
+    if getattr(args, "list", False) or not args.name:
+        if not available:
+            sys.exit("no .prompts/*.md templates found")
+        print("\n".join(available))
+        return
+    cand = pdir / f"{args.name}.md"
+    if not cand.exists():
+        alt = pdir / f"{args.name.replace('_', '-')}.md"
+        cand = alt if alt.exists() else cand
+    if not cand.exists():
+        sys.exit(f"prompt '{args.name}' not found. "
+                 f"Available: {', '.join(available) or '(none)'}")
+    text = cand.read_text(encoding="utf-8")
+    for pair in (args.fill or []):
+        if "=" not in pair:
+            sys.exit(f"--fill expects KEY=VALUE, got {pair!r}")
+        k, v = pair.split("=", 1)
+        text = text.replace("{{" + k.strip() + "}}", v)
+    import re as _re_p
+    remaining = sorted(set(_re_p.findall(r"\{\{([A-Za-z0-9_]+)\}\}", text)))
+    if remaining:
+        print(f"note: unfilled variables: {', '.join(remaining)}", file=sys.stderr)
+    print(text)
+
+
 def _read_text_arg(args) -> str:
     """Resolve inline --text / --text-file / stdin, in that order."""
     if getattr(args, "text_file", None):
@@ -13219,6 +13442,11 @@ def cmd_dedupe(args):
     raw = _read_text_arg(args)
     blocks = [b for b in raw.split(args.sep) if b.strip()] if args.sep \
         else [b for b in raw.split("\n\n") if b.strip()]
+    if getattr(args, "semantic", False) and embed_backend_id().startswith("hash"):
+        print("note: --semantic is running on the deterministic hash embedding, "
+              "which detects lexical/structural overlap but not true paraphrase. "
+              "Run `embed-warm` for a neural model to catch reworded duplicates.",
+              file=sys.stderr)
     res = dedupe_blocks(blocks, threshold=args.threshold,
                         semantic=getattr(args, "semantic", False))
     record_pack_savings(Path(args.path).resolve(), "dedupe",
@@ -13486,6 +13714,12 @@ def cmd_evidence(args):
         ev = build_evidence_pack(r, args.task, budget_tokens=args.budget)
     finally:
         r.close()
+    if getattr(args, "validate", False):
+        errs = schema_errors(ev, EVIDENCE_OUTPUT_SCHEMA)
+        if errs:
+            for e in errs:
+                print(f"schema: {e}", file=sys.stderr)
+            raise SystemExit(1)
     if args.out:
         import json
         Path(args.out).write_text(json.dumps(ev, indent=2), encoding="utf-8")
@@ -15532,15 +15766,89 @@ def discover_corpora(root: Path) -> list[Path]:
     return out
 
 
+def run_scale_benchmark(n_files: int = 500, budget_tokens: int = 6000,
+                        queries: int = 20) -> dict:
+    """Synthetic large-repo performance harness (PB-4).
+
+    Generates ``n_files`` two-symbol modules in a temp repo, indexes them, and
+    measures index build time and pack-assembly latency (p50/p95) — scale
+    numbers no shipped fixture corpus can provide, without committing a huge
+    repo. Deterministic structure; the temp tree is removed afterward.
+    """
+    import shutil
+    import tempfile
+    import time
+    tmp = Path(tempfile.mkdtemp(prefix="ciq-scale-"))
+    try:
+        for i in range(n_files):
+            (tmp / f"mod_{i}.py").write_text(
+                f'"""Module {i}."""\n'
+                f'def handler_{i}(x):\n'
+                f'    """Handle request {i} via helper_{i}."""\n'
+                f'    return helper_{i}(x) + {i}\n\n'
+                f'def helper_{i}(x):\n'
+                f'    """Helper for module {i}."""\n'
+                f'    return x * {i}\n', encoding="utf-8")
+        db = tmp / ".tokengraph" / "graph.db"
+        t0 = time.perf_counter()
+        index_repo(tmp, db)
+        index_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        r = Retriever(tmp, db)
+        lat: list[float] = []
+        try:
+            try:
+                symbols = int(r.store.stats().get("symbols", 0))
+            except Exception:
+                symbols = n_files * 2
+            for i in range(queries):
+                qi = (i * 7) % n_files
+                s0 = time.perf_counter()
+                r.find_relevant_context(f"handle request {qi}",
+                                        budget_tokens=budget_tokens)
+                lat.append((time.perf_counter() - s0) * 1000.0)
+        finally:
+            r.close()
+        lat.sort()
+
+        def _pct(p: float) -> float:
+            if not lat:
+                return 0.0
+            return round(lat[min(len(lat) - 1,
+                                 int(round(p / 100.0 * (len(lat) - 1))))], 2)
+        return {
+            "files": n_files, "symbols": symbols, "queries": queries,
+            "index_time_ms": index_ms,
+            "index_ms_per_file": round(index_ms / max(1, n_files), 3),
+            "pack_mean_ms": round(sum(lat) / len(lat), 2) if lat else 0.0,
+            "pack_p50_ms": _pct(50), "pack_p95_ms": _pct(95),
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def cmd_benchmark(args):
     """Corpus-driven retrieval benchmark across every fixture repo (QG-1).
 
     With `--all` (the CI mode) this runs every corpus — the self corpus plus
     each fixture repository — and scores answer quality, not just file recall:
     whether the pack actually contains the symbols and facts an answer needs.
-    `--check` turns the result into a build gate.
+    `--check` turns the result into a build gate. `--scale N` instead runs the
+    synthetic large-repo performance harness.
     """
     root = Path(args.path).resolve()
+    if getattr(args, "scale", 0):
+        res = run_scale_benchmark(int(args.scale), budget_tokens=args.budget)
+        if getattr(args, "json", False):
+            _emit(res, True)
+        else:
+            print(f"scale benchmark: {res['files']} files / "
+                  f"{res['symbols']} symbols")
+            print(f"  index: {res['index_time_ms']}ms "
+                  f"({res['index_ms_per_file']}ms/file)")
+            print(f"  pack latency: mean={res['pack_mean_ms']}ms "
+                  f"p50={res['pack_p50_ms']}ms p95={res['pack_p95_ms']}ms "
+                  f"over {res['queries']} queries")
+        return
     if getattr(args, "all", False) or getattr(args, "check", False):
         corpora = ([Path(args.corpus)] if args.corpus
                    else discover_corpora(root))
@@ -15828,6 +16136,22 @@ def cmd_doctor(args):
             "pip install 'contextiq[embeddings]' && tokengraph embed-warm",
             severity="warn")
 
+    # VB-2: report the vector backend and whether ANN is available/engaged.
+    _vb = os.environ.get("TOKENGRAPH_VECTOR_BACKEND", "auto").lower()
+    try:
+        import hnswlib  # type: ignore[import-not-found] # noqa: F401
+        _ann = True
+    except ImportError:
+        _ann = False
+    _thr = os.environ.get("TOKENGRAPH_ANN_THRESHOLD", "5000")
+    add(f"vector backend: {_vb}"
+        + (" (ANN available)" if _ann else " (exact only — hnswlib not installed)")
+        + f", ANN threshold {_thr}", True, "")
+    if _vb in ("auto", "hnsw") and not _ann:
+        add("ANN backend", False,
+            "large indexes will use exact cosine (slower) — "
+            "pip install 'contextiq[ann]' to enable hnsw", severity="warn")
+
     failures = [c for c in checks if c["severity"] == "fail"]
     warnings = [c for c in checks if c["severity"] == "warn"]
     strict = getattr(args, "strict", False)
@@ -15872,8 +16196,38 @@ def cmd_gain(args):
     s = summarize_gain(root, since=getattr(args, "since", None),
                        model=args.model, top=getattr(args, "top", None),
                        trends=getattr(args, "all", False))
+    if getattr(args, "push_gateway", None):
+        import urllib.request
+        job = getattr(args, "job", None) or "contextiq"
+        target = args.push_gateway.rstrip("/") + f"/metrics/job/{job}"
+        data = render_prometheus(s).encode("utf-8")
+        req = urllib.request.Request(target, data=data, method="PUT",
+                                     headers={"Content-Type": "text/plain"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"pushed {len(data)} bytes to {target} "
+                      f"(HTTP {getattr(resp, 'status', '?')})")
+        except Exception as e:
+            sys.exit(f"push failed: {e}")
+        return
+    if getattr(args, "grafana", False):
+        import json as _json_g
+        text = _json_g.dumps(render_grafana_dashboard(), indent=2)
+        out = getattr(args, "out", None)
+        if out:
+            Path(out).write_text(text, encoding="utf-8")
+            print(f"wrote {out}")
+        else:
+            print(text)
+        return
     if getattr(args, "prometheus", False):
-        print(render_prometheus(s), end="")
+        text = render_prometheus(s)
+        out = getattr(args, "out", None)
+        if out:
+            Path(out).write_text(text, encoding="utf-8")
+            print(f"wrote {out}")
+        else:
+            print(text, end="")
         return
     if getattr(args, "html", None):
         payload = build_report_payload(root, model=args.model,
@@ -15969,6 +16323,18 @@ def build_parser():
     c.add_argument("--no-track", action="store_true",
                    help="don't append this run's savings to .context/gain.ndjson")
     c.set_defaults(func=cmd_context)
+
+    fd = sub.add_parser("federated",
+                        help="retrieve across multiple repo roots and merge "
+                             "into one per-repo-sectioned pack")
+    fd.add_argument("task")
+    fd.add_argument("--root", action="append", metavar="PATH",
+                    help="a repo root to include (repeatable); defaults to --path")
+    fd.add_argument("-b", "--budget", type=int, default=6000,
+                    help="total token budget, split across the roots")
+    fd.add_argument("-d", "--depth", type=int, default=1)
+    fd.add_argument("--json", action="store_true")
+    fd.set_defaults(func=cmd_federated)
 
     sk = sub.add_parser("skeleton")
     sk.add_argument("file")
@@ -16133,6 +16499,8 @@ def build_parser():
     ak.add_argument("--json", action="store_true")
     ak.add_argument("--schema", action="store_true",
                     help="print the JSON Schema of the --json output and exit")
+    ak.add_argument("--validate", action="store_true",
+                    help="validate the output against the schema; exit 1 if it drifts")
     ak.add_argument("--no-refresh", action="store_true")
     ak.add_argument("--no-track", action="store_true")
     ak.set_defaults(func=cmd_ask)
@@ -16210,6 +16578,15 @@ def build_parser():
                          "pair with a higher --threshold (~0.9)")
     dd.add_argument("--json", action="store_true")
     dd.set_defaults(func=cmd_dedupe)
+
+    pt = sub.add_parser("prompt",
+                        help="print a .prompts template with {{VAR}} substitution")
+    pt.add_argument("name", nargs="?", default="",
+                    help="template name (e.g. bug-fix); omit or --list to list")
+    pt.add_argument("--fill", action="append", metavar="KEY=VALUE",
+                    help="substitute {{KEY}} with VALUE (repeatable)")
+    pt.add_argument("--list", action="store_true", help="list available templates")
+    pt.set_defaults(func=cmd_prompt)
 
     le = sub.add_parser("learn", help="reinforce/penalise a file's local ranking weight")
     le.add_argument("file")
@@ -16307,6 +16684,8 @@ def build_parser():
     ev.add_argument("-o", "--out", default=None)
     ev.add_argument("--schema", action="store_true",
                     help="print the JSON Schema of the evidence pack and exit")
+    ev.add_argument("--validate", action="store_true",
+                    help="validate the pack against the schema; exit 1 if it drifts")
     ev.add_argument("--no-refresh", action="store_true")
     ev.set_defaults(func=cmd_evidence)
 
@@ -16462,6 +16841,9 @@ def build_parser():
                     help="CI gate: implies --all and exits 1 below thresholds")
     bm.add_argument("--budget", type=int, default=6000,
                     help="token budget per pack during the benchmark")
+    bm.add_argument("--scale", type=int, default=0, metavar="N",
+                    help="run the synthetic large-repo perf harness on N "
+                         "generated files (index time + pack p50/p95)")
     bm.add_argument("--json", action="store_true")
     bm.set_defaults(func=cmd_benchmark)
 
@@ -16543,6 +16925,17 @@ def build_parser():
     gn.add_argument("--prometheus", action="store_true",
                     help="emit the ledger totals as Prometheus/OpenMetrics text "
                          "for scraping into Grafana / an OTel collector")
+    gn.add_argument("--grafana", action="store_true",
+                    help="emit an importable Grafana dashboard JSON for the "
+                         "contextiq_* metrics")
+    gn.add_argument("--out", default=None,
+                    help="write --prometheus / --grafana output to this path "
+                         "(e.g. a node_exporter textfile-collector .prom file)")
+    gn.add_argument("--push-gateway", default=None, metavar="URL",
+                    help="PUT the Prometheus metrics to a Pushgateway at URL "
+                         "(dep-free push; pairs with --job)")
+    gn.add_argument("--job", default="contextiq",
+                    help="job label for --push-gateway (default: contextiq)")
     gn.set_defaults(func=cmd_gain)
 
     stt = sub.add_parser("status",

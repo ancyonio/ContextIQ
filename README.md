@@ -70,8 +70,10 @@ docker run --rm -v "$PWD:/repo" -w /repo contextiq context "the task"
 ```
 
 The `[all]` extra pulls `tree-sitter-language-pack` (deep parsing for all 25+ languages),
-`fastmcp` (MCP `serve`), `tiktoken` (accurate token counts), and `sentence-transformers`.
-Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`, and `[ann]`.
+`fastmcp` (MCP `serve`), `tiktoken` (accurate token counts), `sentence-transformers`,
+and `hnswlib`+`numpy` — so the **ANN vector backend is available out of the box**
+with `[all]` (the `auto` backend then uses it automatically on large indexes).
+Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`, and `[ann]` (ANN only).
 With zero extras the single file still runs the full CLI (regex parsing +
 heuristic token counts).
 
@@ -108,6 +110,7 @@ python tokengraph_all.py index
 
 # Get a token-budgeted context pack for a task (prints markdown)
 python tokengraph_all.py context "add retry logic to the http client" -b 6000
+python tokengraph_all.py federated "find the auth middleware" --root ../svc-a --root ../svc-b  # query several repos, merged
 
 # Other lookups
 python tokengraph_all.py semantic "retry with backoff"  # find symbols by meaning
@@ -123,6 +126,8 @@ python tokengraph_all.py gain --since 30d --all         # window + daily/weekly/
 python tokengraph_all.py gain --report                  # per-workspace dashboard -> .tokengraph/token-usage.html
 python tokengraph_all.py gain --serve                   # live dashboard on 127.0.0.1 (no Streamlit/deps)
 python tokengraph_all.py gain --prometheus              # ledger totals as Prometheus/OpenMetrics text (scrape into Grafana/OTel)
+python tokengraph_all.py gain --prometheus --out ciq.prom  # write to a node_exporter textfile-collector file
+python tokengraph_all.py gain --grafana --out board.json   # importable Grafana dashboard for the contextiq_* metrics
 python tokengraph_all.py status                         # one-line repo snapshot (branch/index/savings)
 python tokengraph_all.py stats                          # graph counts
 python tokengraph_all.py langs                          # parseable languages
@@ -145,6 +150,7 @@ python tokengraph_all.py import-scip index.scip.json     # add precise external 
 # Decision support, gating, and cost control
 python tokengraph_all.py ask "the task" --json          # focused pack + intent/coverage/risk/cost
 python tokengraph_all.py ask --schema                    # JSON Schema of the --json output (also: evidence --schema)
+python tokengraph_all.py ask "the task" --json --validate # validate output against the schema; exit 1 if it drifts
 python tokengraph_all.py validate "the task"            # coverage gate (exit 1 if insufficient)
 python tokengraph_all.py judge --answer "..." --context-file ctx.md  # groundedness (exit 1 if not)
 python tokengraph_all.py verify --answer-file reply.md  # flag fabricated files/symbols (exit 1 if any)
@@ -451,7 +457,12 @@ python tokengraph_all.py serve --transport http --port 8756      # one index, se
 ```
 
 HTTP binds to loopback unless you override `--host`, and warns loudly if you do —
-the server exposes repository source.
+the server exposes repository source. This **is** the shared-index story: one
+process holds the graph (with server-side ANN when `[ann]` is installed and the
+index is large enough) and many clients query it over HTTP. A distributed,
+sharded-across-machines index is deliberately **out of scope** — repo-scale
+graphs fit one process, and the HTTP server already covers the multi-client case
+without the operational cost of a cluster.
 
 `ide-setup` merges non-destructively into each editor's MCP config and can repeat
 `--workspace-root` for multi-root workspaces. `ide-plugin` emits packageable plugin
@@ -680,6 +691,7 @@ worth distrusting, so it is measured and enforced in CI rather than asserted.
 ```bash
 python tokengraph_all.py benchmark --all     # 96 cases across 4 repos, answer-quality scored
 python tokengraph_all.py benchmark --check   # CI gate: exit 1 when quality regresses
+python tokengraph_all.py benchmark --scale 2000  # synthetic large-repo perf: index time + pack p50/p95
 python tokengraph_all.py measure "task"      # savings vs a grep+targeted-read baseline
 python tokengraph_all.py gain --all          # cumulative realized savings (tokens + $)
 ```
@@ -711,6 +723,18 @@ current per-corpus breakdown.
 carries everything an answer needs a little over half the time. Raising
 `answerable_rate` is the main open quality work. Give it a larger budget, or call
 `get_symbol` for anything the pack lists as dropped.
+
+> **On the `irrelevant_token_ratio` (waste) metric — and a win it led to.** A
+> neighbour **relevance floor** (`TOKENGRAPH_NEIGHBOR_FLOOR`, default `0.12`,
+> chosen by a benchmark-gated sweep) drops graph neighbours with near-zero task
+> overlap before they reach the pack. It did **not** move waste — the tell that
+> the remaining "waste" is load-bearing graph context (callees/bases/chunks the
+> strict metric counts as off-target). But pruning those weak neighbour
+> *signatures* frees budget the completion sweep spends on answer-bearing
+> *bodies*, which measurably **raised `answerable_rate` 0.583 → 0.656 and
+> `symbol_recall` 0.745 → 0.797** on the fixture corpus (recall unchanged) and
+> halved pack-assembly latency. So waste ≈0.74 sits near the efficient frontier
+> — but the budget it represents was retargeted onto the metric that matters.
 
 ### LLM-judged quality (opt-in)
 
@@ -749,10 +773,10 @@ For the hallucination-guard's effect, run `python tokengraph_all.py grounding` (
 Use these repo assets to keep GHCP and Claude Code focused and avoid large token consumption:
 
 - [docs/TokenEfficiency.md](docs/TokenEfficiency.md) — full guide with context strategy, anti-patterns, checklists, and measurable savings workflows.
-- [.prompts/bug-fix.md](.prompts/bug-fix.md) — minimal-context bug fixing template.
-- [.prompts/code-review.md](.prompts/code-review.md) — risk-first review template.
-- [.prompts/test-generation.md](.prompts/test-generation.md) — targeted test creation template.
-- [.prompts/architecture-review.md](.prompts/architecture-review.md) — architecture review template.
+- [.prompts/](.prompts/) — bug-fix, feature, refactor, performance, code-review,
+  test-generation, and architecture-review templates. `python tokengraph_all.py
+  prompt <name> --fill KEY=VALUE` prints one with its `{{VAR}}` placeholders
+  substituted (`prompt --list` to see them); see [.prompts/README.md](.prompts/README.md).
 
 Suggested daily flow:
 

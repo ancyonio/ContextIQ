@@ -4181,6 +4181,229 @@ class MedWinsTests(unittest.TestCase):
                         f"architecture resource missing: {uris}")
 
 
+class GapClosureTests(unittest.TestCase):
+    """Coverage for the partial-gap closures: prompt --fill, Grafana dashboard,
+    scale benchmark, new-host wiring status, schema self-validation, and the
+    expanded MCP resources/prompts.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    # #18
+    def test_prompt_command_fills_and_reports_unfilled(self):
+        import contextlib
+        import io
+        import types
+        _write(self.root, ".prompts/demo.md",
+               "Do {{ACTION}} on {{TARGET}}; verify {{CMD}}.\n")
+        args = types.SimpleNamespace(path=str(self.root), name="demo",
+                                     fill=["ACTION=refactor", "TARGET=Store"],
+                                     list=False)
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            tg.cmd_prompt(args)
+        self.assertIn("Do refactor on Store", buf.getvalue())
+        self.assertIn("CMD", err.getvalue())        # unfilled variable reported
+
+    def test_prompt_list_excludes_readme(self):
+        import contextlib
+        import io
+        import types
+        _write(self.root, ".prompts/alpha.md", "x")
+        _write(self.root, ".prompts/README.md", "index")
+        args = types.SimpleNamespace(path=str(self.root), name="", fill=None,
+                                     list=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tg.cmd_prompt(args)
+        listed = buf.getvalue().split()
+        self.assertIn("alpha", listed)
+        self.assertNotIn("README", listed)
+
+    # #20
+    def test_grafana_dashboard_is_serializable_model(self):
+        d = tg.render_grafana_dashboard()
+        self.assertIn("panels", d)
+        self.assertTrue(any(p.get("type") == "timeseries" for p in d["panels"]))
+        json.dumps(d)   # must be JSON-serializable
+
+    # #3
+    def test_scale_benchmark_reports_perf(self):
+        res = tg.run_scale_benchmark(n_files=15, budget_tokens=1200, queries=4)
+        for k in ("files", "symbols", "index_time_ms", "index_ms_per_file",
+                  "pack_p50_ms", "pack_p95_ms"):
+            self.assertIn(k, res)
+        self.assertEqual(res["files"], 15)
+        self.assertGreater(res["symbols"], 0)
+
+    # #13
+    def test_wiring_status_covers_new_hosts(self):
+        tg.ide_setup(self.root, editors=["gemini", "roo", "opencode"])
+        status = {s["path"]: s for s in tg.mcp_wiring_status(self.root)}
+        for rel in (".gemini/settings.json", ".roo/mcp.json", "opencode.json"):
+            self.assertIn(rel, status)
+            self.assertTrue(status[rel]["declares_tokengraph"], rel)
+
+    # #10
+    def test_ask_validate_passes_on_real_output(self):
+        for i in range(4):
+            _write(self.root, f"m{i}.py",
+                   f"def f{i}(x):\n    \"\"\"do {i}\"\"\"\n    return x\n")
+        tg.index_repo(self.root, self.db)
+        r = tg.Retriever(self.root, self.db)
+        try:
+            out = r.ask("do thing", budget_tokens=1200)
+        finally:
+            r.close()
+        self.assertEqual(tg.schema_errors(out, tg.ASK_OUTPUT_SCHEMA), [])
+
+    # #14
+    def test_extra_mcp_resources_and_prompts(self):
+        try:
+            import fastmcp  # noqa: F401
+        except ImportError:
+            self.skipTest("fastmcp not installed")
+        import asyncio
+        import inspect
+        for i in range(3):
+            _write(self.root, f"m{i}.py", f"def f{i}():\n    return {i}\n")
+        tg.index_repo(self.root, self.db)
+        mcp = tg.build_mcp_server(self.root, self.db)
+        lr = getattr(mcp, "_list_resources", None)
+        if lr is None:
+            self.skipTest("FastMCP lacks _list_resources")
+        res = lr()
+        if inspect.iscoroutine(res):
+            res = asyncio.run(res)
+        uris = {str(getattr(x, "uri", x)) for x in res}
+        self.assertTrue(any("contextiq://conventions" in u for u in uris), uris)
+        lp = getattr(mcp, "_list_prompts", None)
+        if lp is not None:
+            pr = lp()
+            if inspect.iscoroutine(pr):
+                pr = asyncio.run(pr)
+            names = {getattr(p, "name", None) for p in pr}
+            self.assertIn("refactor", names)
+
+
+class HardItemTests(unittest.TestCase):
+    """Coverage for the hard-item work: the neighbour relevance floor (#5) and
+    the multi-repo federated query.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_neighbor_floor_constant_and_override(self):
+        self.assertIsInstance(tg.MIN_NEIGHBOR_SCORE, float)
+        _write(self.root, "svc.py",
+               "def handler(x):\n    \"\"\"handle a request\"\"\"\n"
+               "    return helper(x)\n"
+               "def helper(x):\n    \"\"\"helper for handler\"\"\"\n"
+               "    return x * 2\n")
+        tg.index_repo(self.root, self.db)
+        r = tg.Retriever(self.root, self.db)
+        try:
+            os.environ["TOKENGRAPH_NEIGHBOR_FLOOR"] = "0.0"     # keep everything
+            p = r.find_relevant_context("handle a request", budget_tokens=1500)
+        finally:
+            r.close()
+            os.environ.pop("TOKENGRAPH_NEIGHBOR_FLOOR", None)
+        self.assertLessEqual(p.rendered_tokens, 1500)
+        self.assertTrue(p.pieces)   # still returns context with floor disabled
+
+    def test_neighbor_floor_never_empties_the_pack(self):
+        # An absurdly high floor must fall back to the unfiltered set, not blank.
+        _write(self.root, "svc.py",
+               "def handler(x):\n    \"\"\"handle a request\"\"\"\n"
+               "    return helper(x)\n"
+               "def helper(x):\n    return x\n")
+        tg.index_repo(self.root, self.db)
+        r = tg.Retriever(self.root, self.db)
+        try:
+            os.environ["TOKENGRAPH_NEIGHBOR_FLOOR"] = "999"
+            p = r.find_relevant_context("handle a request", budget_tokens=1500)
+        finally:
+            r.close()
+            os.environ.pop("TOKENGRAPH_NEIGHBOR_FLOOR", None)
+        self.assertTrue(p.pieces)
+
+    def test_federated_queries_multiple_roots(self):
+        rA, rB = self.root / "repoA", self.root / "repoB"
+        _write(rA, "auth.py",
+               "def login(u):\n    \"\"\"authenticate a user\"\"\"\n    return u\n")
+        _write(rB, "pay.py",
+               "def charge(c):\n    \"\"\"charge a card\"\"\"\n    return c\n")
+        res = tg.run_federated([rA, rB], "authenticate a user", budget_tokens=3000)
+        self.assertEqual(len(res["repos"]), 2)
+        self.assertIn("repo: repoA", res["markdown"])
+        self.assertIn("repo: repoB", res["markdown"])
+        self.assertLessEqual(res["budget_per_repo"], 3000)
+
+    def test_federated_skips_missing_root(self):
+        rA = self.root / "repoA"
+        _write(rA, "a.py", "def f():\n    return 1\n")
+        res = tg.run_federated([rA, self.root / "nope"], "f", budget_tokens=2000)
+        self.assertIn("not found", res["markdown"])
+
+
+class SuggestionClosureTests(unittest.TestCase):
+    """Coverage for the follow-up suggestions: --verify host coverage, the
+    tuned neighbour-floor default, the shipped Grafana dashboard, and the
+    expanded template library.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_verify_ide_wiring_covers_new_hosts(self):
+        tg.ide_setup(self.root, editors=["gemini", "roo", "opencode"])
+        rows = {r["editor"]: r for r in tg.verify_ide_wiring(
+            self.root, editors=["gemini", "roo", "opencode"])}
+        for ed in ("gemini", "roo", "opencode"):
+            self.assertIn(ed, rows)
+            self.assertTrue(rows[ed]["mcp_wired"], f"{ed} not detected as wired")
+
+    def test_neighbor_floor_default_is_tuned_value(self):
+        # Guards the benchmark-tuned optimum against accidental revert.
+        self.assertAlmostEqual(tg.MIN_NEIGHBOR_SCORE, 0.12, places=3)
+
+    def test_shipped_grafana_dashboard_is_valid(self):
+        p = Path(tg.__file__).resolve().parent / "docs" / "grafana-dashboard.json"
+        self.assertTrue(p.exists(), "docs/grafana-dashboard.json not shipped")
+        d = json.loads(p.read_text(encoding="utf-8"))
+        self.assertIn("panels", d)
+        self.assertTrue(d["panels"])
+
+    def test_expanded_prompt_templates_exist(self):
+        pdir = Path(tg.__file__).resolve().parent / ".prompts"
+        for t in ("security-review", "migration", "feature", "refactor",
+                  "performance"):
+            self.assertTrue((pdir / f"{t}.md").exists(), f"{t} template missing")
+
+    def test_gain_push_gateway_flag_parses(self):
+        p = tg.build_parser()
+        ns = p.parse_args(["gain", "--push-gateway", "http://localhost:9091",
+                           "--job", "ciq"])
+        self.assertEqual(ns.push_gateway, "http://localhost:9091")
+        self.assertEqual(ns.job, "ciq")
+
+
 class DocsDriftTests(unittest.TestCase):
     """CI gate against README claims drifting from the code.
 
