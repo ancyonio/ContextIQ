@@ -3445,6 +3445,121 @@ class NamedToolTests(unittest.TestCase):
             self.assertIn(key, a)
 
 
+class StdioEmbeddingDefaultTests(unittest.TestCase):
+    """A stdio MCP server defaults to the hash embedding for stability (EM-1)."""
+
+    def test_defaults_off_when_unset(self):
+        saved = os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+        try:
+            self.assertTrue(tg._stdio_embedding_default())
+            self.assertEqual(os.environ["TOKENGRAPH_EMBEDDINGS"], "off")
+        finally:
+            os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+            if saved is not None:
+                os.environ["TOKENGRAPH_EMBEDDINGS"] = saved
+
+    def test_respects_explicit_choice(self):
+        saved = os.environ.get("TOKENGRAPH_EMBEDDINGS")
+        os.environ["TOKENGRAPH_EMBEDDINGS"] = "auto"          # operator opted in
+        try:
+            self.assertFalse(tg._stdio_embedding_default())
+            self.assertEqual(os.environ["TOKENGRAPH_EMBEDDINGS"], "auto")
+        finally:
+            if saved is None:
+                os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+            else:
+                os.environ["TOKENGRAPH_EMBEDDINGS"] = saved
+
+
+class LedgerBootstrapTests(unittest.TestCase):
+    """`.context/` ledger is created alongside `.tokengraph/` on index (TB-6)."""
+
+    _ENV = ("TOKENGRAPH_NO_TRACK", "SIGMAP_NO_TRACK")
+
+    def _save_env(self):
+        return {k: os.environ.get(k) for k in self._ENV}
+
+    def _restore_env(self, saved):
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_index_creates_context_ledger_when_tracking_on(self):
+        saved = self._save_env()
+        for k in self._ENV:
+            os.environ.pop(k, None)                     # force tracking on
+        try:
+            with TemporaryDirectory() as d:
+                root = Path(d)
+                _write(root, "mod.py", SAMPLE)
+                tg.index_repo(root, root / ".tokengraph" / "graph.db")
+                self.assertTrue((root / ".tokengraph").is_dir())
+                self.assertTrue((root / ".context").is_dir())
+                self.assertTrue((root / ".context" / "gain.ndjson").exists())
+                self.assertTrue((root / ".context" / "usage.ndjson").exists())
+        finally:
+            self._restore_env(saved)
+
+    def test_no_track_env_suppresses_context_ledger(self):
+        saved = self._save_env()
+        os.environ["TOKENGRAPH_NO_TRACK"] = "1"
+        try:
+            with TemporaryDirectory() as d:
+                root = Path(d)
+                _write(root, "mod.py", SAMPLE)
+                tg.index_repo(root, root / ".tokengraph" / "graph.db")
+                self.assertTrue((root / ".tokengraph").is_dir())
+                self.assertFalse((root / ".context").exists())
+        finally:
+            self._restore_env(saved)
+
+    def test_index_seeds_empty_state_dashboard(self):
+        saved = self._save_env()
+        for k in self._ENV:
+            os.environ.pop(k, None)                     # force tracking on
+        try:
+            with TemporaryDirectory() as d:
+                root = Path(d)
+                _write(root, "mod.py", SAMPLE)
+                tg.index_repo(root, root / ".tokengraph" / "graph.db")
+                html = root / ".tokengraph" / "token-usage.html"
+                self.assertTrue(html.exists())          # dashboard exists from day one
+                self.assertGreater(html.stat().st_size, 0)
+        finally:
+            self._restore_env(saved)
+
+    def test_no_track_env_suppresses_dashboard(self):
+        saved = self._save_env()
+        os.environ["TOKENGRAPH_NO_TRACK"] = "1"
+        try:
+            with TemporaryDirectory() as d:
+                root = Path(d)
+                _write(root, "mod.py", SAMPLE)
+                tg.index_repo(root, root / ".tokengraph" / "graph.db")
+                self.assertFalse(
+                    (root / ".tokengraph" / "token-usage.html").exists())
+        finally:
+            self._restore_env(saved)
+
+    def test_ensure_ledger_is_idempotent_and_preserves_data(self):
+        saved = self._save_env()
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        try:
+            with TemporaryDirectory() as d:
+                root = Path(d)
+                tg.ensure_ledger(root)
+                (root / ".context" / "gain.ndjson").write_text(
+                    '{"ts":1,"saved":10}\n', encoding="utf-8")
+                tg.ensure_ledger(root)                  # must not clobber data
+                self.assertIn("saved", (root / ".context" / "gain.ndjson")
+                              .read_text(encoding="utf-8"))
+        finally:
+            self._restore_env(saved)
+
+
 class TestDiscoveryTests(unittest.TestCase):
     """get_test_map + the F1-benchmarked impl<->test mapping."""
 

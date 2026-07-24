@@ -3459,6 +3459,23 @@ def embed_model_name() -> str:
     return os.environ.get("TOKENGRAPH_EMBED_MODEL", "all-MiniLM-L6-v2")
 
 
+def _stdio_embedding_default() -> bool:
+    """Default a stdio MCP server to the hash embedding unless the operator
+    explicitly chose a backend. Returns True iff it applied the default.
+
+    A stdio server speaks JSON-RPC over stdout and must stay fast and alive.
+    Loading the neural backend (sentence-transformers / TensorFlow) on the first
+    `ask` / `find_relevant_context` call can take tens of seconds and, on some
+    platforms, crash or write to stdout — either of which drops the connection
+    (-32000: Connection closed). The deterministic hash embedding is instant and
+    robust; neural stays a one-line opt-in (`TOKENGRAPH_EMBEDDINGS=auto`).
+    """
+    if os.environ.get("TOKENGRAPH_EMBEDDINGS") is None:
+        os.environ["TOKENGRAPH_EMBEDDINGS"] = "off"
+        return True
+    return False
+
+
 def _embed_model():
     """Load sentence-transformers when it is installed (EM-1).
 
@@ -4539,6 +4556,9 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
     ignores = (ignores or set()) | DEFAULT_IGNORES
     root = root.resolve()
     store = Store(db_path)
+    # The graph dir (.tokengraph/) now exists; give the savings ledger a home
+    # next to it so orientation-only usage still creates .context/ (TB-6).
+    ensure_ledger(root)
     report = IndexReport(errors=[])
 
     gitignore = GitIgnore.load(root) if respect_gitignore else None
@@ -4701,6 +4721,13 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
     if pending:
         report.stats["edge_resolution_pct"] = round(100 * resolved_n / len(pending), 1)
     store.close()
+    # Seed an empty-state dashboard the first time a workspace is indexed, so
+    # .tokengraph/token-usage.html exists from the start (showing the workspace
+    # with zero savings yet) instead of 404-ing until the first retrieval.
+    # Only when missing (cheap) and tracking is enabled; savings ops keep it
+    # fresh thereafter. Runs after store.close() to avoid a read/write lock.
+    if not _tracking_disabled(False) and not usage_report_path(root).exists():
+        write_usage_report(root)
     return report
 
 
@@ -7355,6 +7382,30 @@ def write_cache_sidecar(root: Path, adapter_rel: str, payload: "dict | str") -> 
 def _tracking_disabled(no_track_flag: bool) -> bool:
     return bool(no_track_flag or os.environ.get("SIGMAP_NO_TRACK")
                 or os.environ.get("TOKENGRAPH_NO_TRACK"))
+
+
+def ensure_ledger(root: Path, no_track: bool = False) -> None:
+    """Create the `.context/` savings-ledger home next to `.tokengraph/` (TB-6).
+
+    The ledger files were created lazily — only on the first savings-recording
+    retrieval — so a workspace used purely for orientation (`list_modules`,
+    `get_symbol`, `file_skeleton`, `get_impact`, …) got a `.tokengraph/` graph
+    but no `.context/` folder, which is surprising. This makes the two appear
+    together. Empty ndjson files are valid (zero records); the tracking opt-out
+    (`--no-track` / `TOKENGRAPH_NO_TRACK`) still suppresses them. Best-effort —
+    never breaks indexing.
+    """
+    if _tracking_disabled(no_track):
+        return
+    try:
+        ctx = root / ".context"
+        ctx.mkdir(parents=True, exist_ok=True)
+        for name in ("gain.ndjson", "usage.ndjson"):
+            f = ctx / name
+            if not f.exists():
+                f.touch()
+    except Exception:
+        pass
 
 
 _GAIN_LOCK = threading.Lock()
@@ -13501,12 +13552,32 @@ def cmd_watch(args):
     root = Path(args.path).resolve()
     db = _db_path(root)
     rep = index_repo(root, db)
+    # Keep the per-workspace dashboard current for the whole session, so you can
+    # leave .tokengraph/token-usage.html open and watch it update. Refresh only
+    # when the graph or the savings ledger actually changed — no wasteful renders.
+    ledger = root / ".context" / "gain.ndjson"
+
+    def _ledger_mtime() -> float:
+        try:
+            return ledger.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    if not _tracking_disabled(False):
+        write_usage_report(root)
+    last_ledger = _ledger_mtime()
     print(f"watching {root} (interval={args.interval}s) — initial graph: {rep.stats}")
     try:
         while True:
             time.sleep(max(1, args.interval))
             rep = index_repo(root, db)
-            if rep.parsed or rep.removed:
+            graph_changed = bool(rep.parsed or rep.removed)
+            ledger_now = _ledger_mtime()
+            if (graph_changed or ledger_now != last_ledger) \
+                    and not _tracking_disabled(False):
+                write_usage_report(root)
+                last_ledger = ledger_now
+            if graph_changed:
                 print(f"updated: parsed={rep.parsed} removed={rep.removed} "
                       f"graph={rep.stats}")
     except KeyboardInterrupt:
@@ -13631,6 +13702,14 @@ def cmd_serve(args):
 
     transport = (getattr(args, "transport", None) or "stdio").lower()
     if transport == "stdio":
+        if _stdio_embedding_default():
+            print("tokengraph: stdio MCP server is using the deterministic hash "
+                  "embedding for stability. The neural backend (sentence-"
+                  "transformers/TensorFlow) can take tens of seconds to load on "
+                  "the first ask/find_relevant_context call and, on some "
+                  "platforms, drop the connection — so it is opt-in here: set "
+                  "TOKENGRAPH_EMBEDDINGS=auto (and pre-warm with `tokengraph "
+                  "embed-warm`) to enable it.", file=sys.stderr)
         server.run()
         return
 
