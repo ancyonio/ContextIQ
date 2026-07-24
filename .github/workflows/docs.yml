@@ -1,0 +1,67 @@
+name: Docs
+
+# Build the VitePress site (docs-vp/, which renders guide/*.md) and publish it
+# to GitHub Pages on every push to main that touches the docs.
+#
+# One-time setup: repo Settings -> Pages -> Build and deployment -> Source =
+# "GitHub Actions". The site publishes to https://<owner>.github.io/contextiq/
+# (matches `base: '/contextiq/'` in docs-vp/.vitepress/config.mjs).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'guide/**'
+      - 'docs-vp/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# Allow the deploy job to publish to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs-vp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # lastUpdated needs full git history
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build with VitePress
+        run: npm run docs:build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-vp/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

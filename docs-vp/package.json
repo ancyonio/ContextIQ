@@ -1,0 +1,18 @@
+{
+  "name": "contextiq-docs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VitePress documentation site for ContextIQ (renders ../guide/*.md).",
+  "scripts": {
+    "sync": "node sync-guide.mjs",
+    "predocs:dev": "node sync-guide.mjs",
+    "docs:dev": "vitepress dev",
+    "predocs:build": "node sync-guide.mjs",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  }
+}
