@@ -3,9 +3,9 @@
 # ContextIQ
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21535772.svg)](https://doi.org/10.5281/zenodo.21535772)
-[![Docs](https://img.shields.io/badge/docs-genaivikky.github.io%2FContextIQ-3c8772)](https://ancyonio.github.io/ContextIQ/)
+[![Docs](https://img.shields.io/badge/docs-ancyonio.github.io%2FContextIQ-3c8772)](https://ancyonio.github.io/ContextIQ/)
 
-📖 **[Read the docs →](https://genaivikky.github.io/ContextIQ/)** &nbsp;·&nbsp; [Quick start](guide/quick-start.md) &nbsp;·&nbsp; [CLI reference](guide/cli.md) &nbsp;·&nbsp; [When to use what](guide/when-to-use.md)
+📖 **[Read the docs →](https://ancyonio.github.io/ContextIQ/)** &nbsp;·&nbsp; [Quick start](guide/quick-start.md) &nbsp;·&nbsp; [CLI reference](guide/cli.md) &nbsp;·&nbsp; [When to use what](guide/when-to-use.md)
 
 A local, single-file **AST code graph** that gives AI coding agents token-efficient context. Instead of letting the agent read whole files (and re-read them every session), ContextIQ indexes your repo into a local SQLite graph of symbols + call/inheritance edges, then serves a **token-budgeted "context pack"** of only the symbols relevant to a task.
 
