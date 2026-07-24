@@ -10,8 +10,9 @@ import { defineConfig } from 'vitepress'
 //   npm run docs:dev       # local preview at http://localhost:5173
 //   npm run docs:build     # static HTML -> docs-vp/dist
 //
-// GitHub Pages serves from a sub-path (https://<user>.github.io/contextiq/),
-// so `base` defaults to '/contextiq/'. Override for a custom domain / user page:
+// GitHub Pages serves from a sub-path (https://genaivikky.github.io/ContextIQ/),
+// so `base` defaults to '/ContextIQ/' — it must match the repo name exactly,
+// case included. Override for a custom domain / user page:
 //   DOCS_BASE=/ npm run docs:build
 export default defineConfig({
   title: 'ContextIQ',
@@ -24,7 +25,7 @@ export default defineConfig({
   outDir: './dist',
   cacheDir: './.vitepress/cache',
 
-  base: process.env.DOCS_BASE || '/contextiq/',
+  base: process.env.DOCS_BASE || '/ContextIQ/',
   cleanUrls: true,
   lastUpdated: true,
   ignoreDeadLinks: true,
@@ -43,7 +44,7 @@ export default defineConfig({
       {
         text: 'v1.0',
         items: [
-          { text: 'GitHub', link: 'https://github.com/contextiq/contextiq' },
+          { text: 'GitHub', link: 'https://github.com/GenAIVikky/ContextIQ' },
           { text: 'Zenodo DOI', link: 'https://doi.org/10.5281/zenodo.21535772' }
         ]
       }
@@ -93,13 +94,14 @@ export default defineConfig({
     ],
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/contextiq/contextiq' }
+      { icon: 'github', link: 'https://github.com/GenAIVikky/ContextIQ' }
     ],
 
     search: { provider: 'local' },
 
     editLink: {
-      pattern: 'https://github.com/contextiq/contextiq/edit/main/guide/:path',
+      pattern: 'https://github.com/GenAIVikky/ContextIQ/edit/main/guide/:path',
+      // NOTE: :path is the file under guide/ (e.g. quick-start.md)
       text: 'Edit this page on GitHub'
     },
 

@@ -22,8 +22,9 @@ npm run docs:preview    # serve the built site locally
 ## How it's wired
 
 - `srcDir` points at `../guide`, so every `guide/*.md` becomes a page.
-- `base` defaults to `/contextiq/` for GitHub Pages project sites. For a custom
-  domain or user/org page, build with `DOCS_BASE=/ npm run docs:build`.
+- `base` defaults to `/ContextIQ/` (must match the repo name exactly) for GitHub
+  Pages project sites. For a custom domain or user/org page, build with
+  `DOCS_BASE=/ npm run docs:build`.
 - `.github/workflows/docs.yml` builds this project and deploys `dist/` to Pages
   on every push to `main` that touches `guide/**` or `docs-vp/**`.
 
@@ -31,4 +32,4 @@ npm run docs:preview    # serve the built site locally
 
 Repo **Settings → Pages → Build and deployment → Source = "GitHub Actions"**.
 After the first successful run, the site is live at
-`https://<owner>.github.io/contextiq/`.
+`https://genaivikky.github.io/ContextIQ/`.

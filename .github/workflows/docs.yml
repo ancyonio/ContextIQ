@@ -4,8 +4,8 @@ name: Docs
 # to GitHub Pages on every push to main that touches the docs.
 #
 # One-time setup: repo Settings -> Pages -> Build and deployment -> Source =
-# "GitHub Actions". The site publishes to https://<owner>.github.io/contextiq/
-# (matches `base: '/contextiq/'` in docs-vp/.vitepress/config.mjs).
+# "GitHub Actions". The site publishes to https://genaivikky.github.io/ContextIQ/
+# (matches `base: '/ContextIQ/'` in docs-vp/.vitepress/config.mjs).
 
 on:
   push:
