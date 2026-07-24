@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextiq"
-version = "0.2.0"
+version = "1.0.0"
 description = "ContextIQ — local code-graph MCP server for token-efficient context (registered as tokengraph)"
 readme = "README.md"
 requires-python = ">=3.10"
