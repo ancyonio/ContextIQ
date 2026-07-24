@@ -32,6 +32,14 @@ Repository = "https://github.com/contextiq/contextiq"
 Issues = "https://github.com/contextiq/contextiq/issues"
 
 [project.optional-dependencies]
+# Test toolchain for the CI `test` job. Most of the suite is stdlib-only and
+# skips cleanly when an optional dep is absent, but a few tests exercise real
+# behaviour that has no fallback and do NOT skip: deep-parse of grammar-only
+# languages (e.g. solidity nesting `Token.mint`) needs the language pack, and
+# the squeeze-savings / cost tests need the real tiktoken counter. So `dev`
+# pulls the same grammars + token counter the suite measures — otherwise those
+# genuine features would fail (or, if guarded away, ship untested) in CI.
+dev = ["contextiq[langpack,tokens]", "pytest"]
 mcp = ["fastmcp"]
 embeddings = ["sentence-transformers"]
 ann = ["hnswlib", "numpy"]

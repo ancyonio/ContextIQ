@@ -49,7 +49,12 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" || pip install -e . || pip install pytest
+          # Install the test toolchain directly (the [dev] extra provides the
+          # pytest runner). The previous `|| pip install -e . || pip install
+          # pytest` cascade masked failures: `-e .` succeeds without pytest, so
+          # the fallback never fired and the test step died with "No module
+          # named pytest". Fail loudly on a real install error instead.
+          pip install -e ".[dev]"
 
       - name: Unit tests
         run: python -m pytest tests/ -q
@@ -68,7 +73,14 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e . || true
+          # The gate measures Go and TypeScript corpora, which have NO regex
+          # fallback — they are only indexed when their tree-sitter grammar is
+          # installed. The [treesitter] extra is therefore REQUIRED here, not
+          # optional: without it gosvc/tsapi silently index to zero symbols and
+          # score 0.0, and the gate reports a phantom quality regression rather
+          # than the real cause. Install hard (no `|| true`) so a grammar
+          # install failure fails the build loudly instead of masquerading.
+          pip install -e ".[treesitter]"
           pip install tiktoken
 
       - name: Extractor self-test
@@ -123,7 +135,10 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e . || true
+          # Same grammar requirement as the quality gate — the judge evaluates
+          # the Go and TypeScript corpora, which need their tree-sitter grammars
+          # to be indexed at all.
+          pip install -e ".[treesitter]"
           pip install tiktoken anthropic
 
       - name: Guard — API key present

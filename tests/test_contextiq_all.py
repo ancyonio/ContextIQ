@@ -1263,6 +1263,52 @@ class RegexFallbackStillWorksTests(unittest.TestCase):
             self.assertEqual(got[0], expected, lang)
 
 
+class MissingGrammarGuardTests(unittest.TestCase):
+    """Go/TypeScript have no regex fallback: without their grammar a corpus
+    scores 0.0. The benchmark must flag that as a missing dependency, not let it
+    read as a retrieval regression (the failure mode this guard was added for)."""
+
+    def _corpus(self, root: Path, languages: list[str]) -> Path:
+        p = root / "tasks.json"
+        p.write_text(json.dumps({
+            "languages": languages,
+            "cases": [{"task": "x", "expected_files": ["a"]}],
+        }), encoding="utf-8")
+        return p
+
+    def test_flags_treesitter_only_language_when_grammar_absent(self):
+        original = tg._profiles
+        tg._profiles = lambda: {}  # simulate an env with no grammars installed
+        try:
+            with TemporaryDirectory() as td:
+                corpus = self._corpus(Path(td), ["go", "typescript", "python"])
+                missing = tg.missing_corpus_grammars([corpus])
+        finally:
+            tg._profiles = original
+        # Python is parsed by stdlib ast and must never be flagged.
+        self.assertEqual(missing, ["go", "typescript"])
+
+    def test_no_false_alarm_when_grammar_present(self):
+        original = tg._profiles
+        tg._profiles = lambda: {".go": object(), ".ts": object()}
+        try:
+            with TemporaryDirectory() as td:
+                corpus = self._corpus(Path(td), ["go", "typescript"])
+                self.assertEqual(tg.missing_corpus_grammars([corpus]), [])
+        finally:
+            tg._profiles = original
+
+    def test_pure_python_corpus_never_flagged(self):
+        original = tg._profiles
+        tg._profiles = lambda: {}
+        try:
+            with TemporaryDirectory() as td:
+                corpus = self._corpus(Path(td), ["python"])
+                self.assertEqual(tg.missing_corpus_grammars([corpus]), [])
+        finally:
+            tg._profiles = original
+
+
 class ComprehensiveSolutionGapTests(unittest.TestCase):
     """Close the gaps vs. Sigmap: conventions, grounded-creation, evidence pack,
     grounding ablation, and scope-aware call resolution."""

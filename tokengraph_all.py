@@ -15766,6 +15766,37 @@ def discover_corpora(root: Path) -> list[Path]:
     return out
 
 
+# Languages with NO regex fallback: they are indexed only when their tree-sitter
+# grammar is installed (Python is parsed by the stdlib `ast` and always works).
+# A corpus in one of these languages scores a misleading 0.0 when the grammar is
+# absent — an environment gap, not a quality regression — so the benchmark must
+# say so explicitly rather than let it read as a retrieval failure.
+_TREESITTER_ONLY_LANGUAGES: dict[str, str] = {
+    "go": ".go", "typescript": ".ts", "tsx": ".tsx",
+    "javascript": ".js", "java": ".java",
+}
+
+
+def missing_corpus_grammars(corpus_paths: list[Path]) -> list[str]:
+    """Corpus languages whose (required) tree-sitter grammar isn't installed."""
+    import json
+    profiles = _profiles()
+    missing: set[str] = set()
+    for cpath in corpus_paths:
+        cpath = Path(cpath)
+        if not cpath.exists():
+            continue
+        try:
+            data = json.loads(cpath.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for lang in data.get("languages", []):
+            ext = _TREESITTER_ONLY_LANGUAGES.get(str(lang).lower())
+            if ext and ext not in profiles:
+                missing.add(str(lang).lower())
+    return sorted(missing)
+
+
 def run_scale_benchmark(n_files: int = 500, budget_tokens: int = 6000,
                         queries: int = 20) -> dict:
     """Synthetic large-repo performance harness (PB-4).
@@ -15854,6 +15885,21 @@ def cmd_benchmark(args):
                    else discover_corpora(root))
         if not corpora:
             sys.exit("benchmark: no corpora found under benchmarks/")
+        # Guard: a corpus language with no installed grammar indexes to zero
+        # symbols and scores 0.0. That is an environment gap, not a retrieval
+        # regression — fail with a clear remedy instead of a phantom threshold
+        # breach that sends people hunting through the retriever.
+        absent = missing_corpus_grammars(corpora)
+        if absent:
+            msg = (
+                "benchmark: tree-sitter grammar(s) not installed for corpus "
+                f"language(s): {', '.join(absent)}. These languages have no "
+                "regex fallback, so their corpora score 0.0 — this is a missing "
+                "dependency, not a quality regression. Install with: "
+                "pip install \"contextiq[treesitter]\"  (or [langpack]).")
+            if getattr(args, "check", False):
+                sys.exit(msg)
+            print(msg, file=sys.stderr)
         suite = run_benchmark_suite(corpora, budget_tokens=args.budget,
                                     limit=args.limit if args.limit else 0)
         gate = check_benchmark_thresholds(suite["aggregate"])
