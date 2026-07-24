@@ -3930,6 +3930,257 @@ class RepomixInteropTests(unittest.TestCase):
         self.assertIn("def f()", blocks[0][1])
 
 
+class EasyWinsTests(unittest.TestCase):
+    """Coverage for the token-optimization 'easy win' features:
+    assistant-specific ignore files, the per-tier budget knob, the
+    build-time ledger field, and the core MCP tool profile.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_assistant_ignore_files_are_honored(self):
+        _write(self.root, "keep.py", "def kept(): return 1\n")
+        _write(self.root, "vendored.py", "def vendored(): return 2\n")
+        _write(self.root, "scratch.py", "def scratch(): return 3\n")
+        # No .gitignore — the exclusions live only in assistant-specific files.
+        _write(self.root, ".claudeignore", "vendored.py\n")
+        _write(self.root, ".cursorignore", "scratch.py\n")
+        tg.index_repo(self.root, self.db, respect_gitignore=True)
+        store = tg.Store(self.db)
+        try:
+            self.assertIsNotNone(store.symbol_by_qname("keep.kept"))
+            self.assertIsNone(store.symbol_by_qname("vendored.vendored"))
+            self.assertIsNone(store.symbol_by_qname("scratch.scratch"))
+        finally:
+            store.close()
+
+    def test_ignore_file_list_covers_documented_assistants(self):
+        for name in (".gitignore", ".contextiqignore", ".claudeignore",
+                     ".cursorignore", ".codeiumignore", ".aiexclude"):
+            self.assertIn(name, tg.GitIgnore.IGNORE_FILES)
+
+    def test_sweep_body_share_is_clamped_and_budget_holds(self):
+        for i in range(6):
+            _write(self.root, f"m{i}.py",
+                   f"def f{i}(x):\n    \"\"\"do thing {i}\"\"\"\n    return x + {i}\n")
+        tg.index_repo(self.root, self.db)
+        r = tg.Retriever(self.root, self.db)
+        try:
+            # extremes and an out-of-range value must not raise and must still
+            # respect the token budget
+            for share in (0.0, 1.0, 5.0, -3.0):
+                pack = r.find_relevant_context("do thing", budget_tokens=800,
+                                               sweep_body_share=share)
+                self.assertLessEqual(pack.rendered_tokens, 800)
+        finally:
+            r.close()
+
+    def test_build_ms_is_recorded_in_the_ledger(self):
+        saved_env = {k: os.environ.pop(k, None)
+                     for k in ("TOKENGRAPH_NO_TRACK", "SIGMAP_NO_TRACK")}
+        try:
+            tg.record_pack_savings(self.root, "context", final_tokens=1000,
+                                   baseline_tokens=50000, files=3, build_ms=12.3)
+        finally:
+            for k, v in saved_env.items():
+                if v is not None:
+                    os.environ[k] = v
+        ledger = self.root / ".context" / "gain.ndjson"
+        self.assertTrue(ledger.exists())
+        rec = json.loads(ledger.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(rec["build_ms"], 12.3)
+
+    def test_core_tool_profile_hides_non_core_tools(self):
+        class _TM:
+            def __init__(self):
+                self._tools = {"find_relevant_context": 1, "get_symbol": 1,
+                               "squeeze": 1, "gain": 1, "list_modules": 1}
+
+        class _MCP:
+            def __init__(self):
+                self._tool_manager = _TM()
+
+        m = _MCP()
+        tg._apply_tool_profile(m, tg.CORE_MCP_TOOLS)
+        remaining = set(m._tool_manager._tools)
+        self.assertEqual(remaining,
+                         {"find_relevant_context", "get_symbol", "list_modules"})
+        self.assertNotIn("squeeze", remaining)
+
+    def test_core_tool_profile_is_resilient_to_unknown_internals(self):
+        # A FastMCP whose internals don't match must not raise (server still starts)
+        tg._apply_tool_profile(object(), tg.CORE_MCP_TOOLS)
+
+    def test_core_tool_names_are_real_tool_definitions(self):
+        src = Path(tg.__file__).resolve().read_text(encoding="utf-8")
+        for name in tg.CORE_MCP_TOOLS:
+            self.assertRegex(src, rf"\n    def {re.escape(name)}\(",
+                             f"core tool {name!r} has no tool definition")
+
+    def test_core_profile_applies_to_a_real_fastmcp_server(self):
+        try:
+            import fastmcp  # noqa: F401
+        except ImportError:
+            self.skipTest("fastmcp not installed")
+        mcp = tg.build_mcp_server(self.root, self.db)
+        names = set(tg._mcp_tool_names(mcp))
+        self.assertTrue(tg.CORE_MCP_TOOLS <= names,
+                        "full server should expose every core tool")
+        self.assertIn("squeeze", names)  # a non-core tool, present before filter
+        tg._apply_tool_profile(mcp, tg.CORE_MCP_TOOLS)
+        after = set(tg._mcp_tool_names(mcp))
+        self.assertEqual(after, set(tg.CORE_MCP_TOOLS))
+
+
+class MedWinsTests(unittest.TestCase):
+    """Coverage for the medium-effort optimization features: ANN backend
+    default, benchmark latency/index-time, embedding dedup, Prometheus export,
+    ask/evidence output schemas, and the new MCP wiring / primitives.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _index_small(self):
+        for i in range(6):
+            _write(self.root, f"m{i}.py",
+                   f"def f{i}(x):\n    \"\"\"do thing {i}\"\"\"\n    return x + {i}\n")
+        tg.index_repo(self.root, self.db)
+
+    # #16 embedding paraphrase dedup
+    def test_dedupe_semantic_mode_collapses_duplicates(self):
+        blocks = ["def add(a, b): return a + b",
+                  "def add(a, b): return a + b",   # exact dup
+                  "class Foo: pass"]
+        res = tg.dedupe_blocks(blocks, threshold=0.9, semantic=True)
+        self.assertEqual(res["kept_blocks"], 2)
+        self.assertGreaterEqual(res["tokens_saved"], 0)
+
+    # #20 Prometheus export
+    def test_prometheus_export_has_metric_lines(self):
+        summary = {"saved_tokens": 1000, "baseline_tokens": 5000,
+                   "final_tokens": 4000, "runs": 2, "reduction_pct": 20.0,
+                   "saved_usd": 0.003, "model": "claude-sonnet",
+                   "by_op": [{"op": "context", "runs": 2, "saved": 1000,
+                              "baseline": 5000, "final": 4000}]}
+        text = tg.render_prometheus(summary)
+        self.assertIn("contextiq_tokens_saved_total 1000", text)
+        self.assertIn("# TYPE contextiq_runs_total counter", text)
+        self.assertIn('contextiq_op_tokens_saved_total{op="context"} 1000', text)
+
+    # #10 output schemas
+    def test_ask_output_conforms_to_schema(self):
+        self._index_small()
+        r = tg.Retriever(self.root, self.db)
+        try:
+            out = r.ask("do thing", budget_tokens=1500)
+        finally:
+            r.close()
+        self.assertEqual(tg.schema_errors(out, tg.ASK_OUTPUT_SCHEMA), [])
+
+    def test_evidence_output_conforms_to_schema(self):
+        self._index_small()
+        r = tg.Retriever(self.root, self.db)
+        try:
+            ev = tg.build_evidence_pack(r, "do thing", budget_tokens=1500)
+        finally:
+            r.close()
+        self.assertEqual(tg.schema_errors(ev, tg.EVIDENCE_OUTPUT_SCHEMA), [])
+
+    def test_schema_errors_detects_violations(self):
+        errs = tg.schema_errors({"intent": "x"}, tg.ASK_OUTPUT_SCHEMA)
+        self.assertTrue(any("missing required" in e for e in errs))
+        # bool must never satisfy 'integer'
+        bad = tg.schema_errors({"pack_tokens": True},
+                               {"type": "object",
+                                "properties": {"pack_tokens": {"type": "integer"}}})
+        self.assertTrue(bad)
+
+    # #3 benchmark latency + index time
+    def test_benchmark_reports_latency_and_index_time(self):
+        _write(self.root, "svc.py",
+               "def handler(req):\n    \"\"\"handle a request\"\"\"\n"
+               "    return validate(req)\n"
+               "def validate(req):\n    return bool(req)\n")
+        corpus = {"repo": ".", "languages": ["python"],
+                  "cases": [{"task": "handle an incoming request",
+                             "expected_files": ["svc.py"],
+                             "expected_symbols": ["svc.handler"]}]}
+        cpath = self.root / "tasks.json"
+        cpath.write_text(json.dumps(corpus), encoding="utf-8")
+        suite = tg.run_benchmark_suite([cpath], budget_tokens=1500)
+        agg = suite["aggregate"]
+        for k in ("mean_latency_ms", "p95_latency_ms", "index_time_ms_total"):
+            self.assertIn(k, agg)
+        self.assertGreaterEqual(agg["index_time_ms_total"], 0.0)
+        self.assertIn("p50_latency_ms", suite["suites"][0])
+
+    # #13 new MCP wiring
+    def test_ide_setup_wires_gemini_roo_opencode(self):
+        tg.ide_setup(self.root, editors=["gemini", "roo", "opencode"])
+        gem = json.loads((self.root / ".gemini" / "settings.json")
+                         .read_text(encoding="utf-8"))
+        self.assertIn("tokengraph", gem["mcpServers"])
+        roo = json.loads((self.root / ".roo" / "mcp.json")
+                         .read_text(encoding="utf-8"))
+        self.assertIn("tokengraph", roo["mcpServers"])
+        oc = json.loads((self.root / "opencode.json").read_text(encoding="utf-8"))
+        self.assertEqual(oc["mcp"]["tokengraph"]["type"], "local")
+        self.assertIsInstance(oc["mcp"]["tokengraph"]["command"], list)
+
+    # #2 vector backend default
+    def test_vector_backend_auto_default_does_not_crash(self):
+        self._index_small()
+        old = os.environ.get("TOKENGRAPH_ANN_THRESHOLD")
+        old_be = os.environ.pop("TOKENGRAPH_VECTOR_BACKEND", None)
+        os.environ["TOKENGRAPH_ANN_THRESHOLD"] = "1"  # force the ANN branch
+        try:
+            r = tg.Retriever(self.root, self.db)
+            try:
+                rows = r.semantic_search("do thing", limit=3)
+            finally:
+                r.close()
+            self.assertIsInstance(rows, list)
+        finally:
+            if old is not None:
+                os.environ["TOKENGRAPH_ANN_THRESHOLD"] = old
+            else:
+                os.environ.pop("TOKENGRAPH_ANN_THRESHOLD", None)
+            if old_be is not None:
+                os.environ["TOKENGRAPH_VECTOR_BACKEND"] = old_be
+
+    # #14 MCP resources + prompts
+    def test_mcp_resources_and_prompts_registered(self):
+        try:
+            import fastmcp  # noqa: F401
+        except ImportError:
+            self.skipTest("fastmcp not installed")
+        import asyncio
+        import inspect
+        self._index_small()
+        mcp = tg.build_mcp_server(self.root, self.db)
+        lr = getattr(mcp, "_list_resources", None)
+        if lr is None:
+            self.skipTest("FastMCP lacks _list_resources")
+        res = lr()
+        if inspect.iscoroutine(res):
+            res = asyncio.run(res)
+        uris = {str(getattr(x, "uri", x)) for x in res}
+        self.assertTrue(any("contextiq://architecture" in u for u in uris),
+                        f"architecture resource missing: {uris}")
+
+
 class DocsDriftTests(unittest.TestCase):
     """CI gate against README claims drifting from the code.
 

@@ -76,9 +76,12 @@ With zero extras the single file still runs the full CLI (regex parsing +
 heuristic token counts).
 
 Set `TOKENGRAPH_OFFLINE=1` to disable remote configuration loading and optional
-neural-model loading. The deterministic hash embedding remains available. For large
-indexes, install `[ann]` and set `TOKENGRAPH_VECTOR_BACKEND=hnsw`; exact cosine remains
-the default and fallback.
+neural-model loading. The deterministic hash embedding remains available. The
+vector backend is `auto` by default: it uses exact cosine at repo scale and
+switches to ANN (`hnsw`) automatically once the vector set crosses
+`TOKENGRAPH_ANN_THRESHOLD` (5000) — but only when `[ann]` is installed,
+otherwise it stays on exact. Force it either way with
+`TOKENGRAPH_VECTOR_BACKEND=exact|hnsw`.
 
 To ship binaries / publish, run `tokengraph dist` (CI release workflow, Dockerfile,
 Homebrew formula, `install.sh`) and `tokengraph freeze --build` for a local binary.
@@ -119,6 +122,7 @@ python tokengraph_all.py gain                           # realized savings from 
 python tokengraph_all.py gain --since 30d --all         # window + daily/weekly/monthly trends
 python tokengraph_all.py gain --report                  # per-workspace dashboard -> .tokengraph/token-usage.html
 python tokengraph_all.py gain --serve                   # live dashboard on 127.0.0.1 (no Streamlit/deps)
+python tokengraph_all.py gain --prometheus              # ledger totals as Prometheus/OpenMetrics text (scrape into Grafana/OTel)
 python tokengraph_all.py status                         # one-line repo snapshot (branch/index/savings)
 python tokengraph_all.py stats                          # graph counts
 python tokengraph_all.py langs                          # parseable languages
@@ -140,6 +144,7 @@ python tokengraph_all.py import-scip index.scip.json     # add precise external 
 
 # Decision support, gating, and cost control
 python tokengraph_all.py ask "the task" --json          # focused pack + intent/coverage/risk/cost
+python tokengraph_all.py ask --schema                    # JSON Schema of the --json output (also: evidence --schema)
 python tokengraph_all.py validate "the task"            # coverage gate (exit 1 if insufficient)
 python tokengraph_all.py judge --answer "..." --context-file ctx.md  # groundedness (exit 1 if not)
 python tokengraph_all.py verify --answer-file reply.md  # flag fabricated files/symbols (exit 1 if any)
@@ -153,6 +158,7 @@ python tokengraph_all.py cost --text "the prompt" --model claude-sonnet --output
 python tokengraph_all.py cost --text-file prompt.txt --compare   # rank GPT/Claude/Gemini/Llama cheapest-first
 python tokengraph_all.py prompt-score --text "fix the retry logic in count_tokens"  # rate a prompt 0–100 + tips
 cat snippets.txt | python tokengraph_all.py dedupe --threshold 0.8  # drop near-duplicate context blocks
+cat snippets.txt | python tokengraph_all.py dedupe --semantic --threshold 0.9  # collapse paraphrases (embedding cosine)
 python tokengraph_all.py summarize-chat --text-file session.txt --max-tokens 400   # compress a chat transcript
 
 # Grounded creation: retrieval -> safe code generation
@@ -217,6 +223,7 @@ python tokengraph_all.py --path /some/repo index
 | `-b, --budget` | 6000 | Max tokens in the pack |
 | `-d, --depth` | 1 | How far to expand along call/inheritance edges |
 | `--max-body` | 1600 | Largest symbol body shown in full before falling back to signature + chunks |
+| `--sweep-body-share` | 0.6 | Fraction (0–1) of the completion sweep's leftover budget spent on full bodies vs. breadth. Raise it to favor literal facts in bodies; lower it to favor more signatures |
 | `-o, --out` | — | Write the pack to a file instead of stdout |
 | `--no-refresh` | off | Skip the freshen-on-query reindex and use the graph as-is |
 
@@ -264,7 +271,9 @@ re-embed instead of silently comparing incompatible vector spaces. Set
 for reproducible scores).
 
 Vectors live in the `vectors` table (float32 blobs) and are compared by cosine in
-Python — fine for repo-scale symbol counts.
+Python — fine for repo-scale symbol counts. Above `TOKENGRAPH_ANN_THRESHOLD`
+(5000 vectors) the default `auto` backend switches to an `hnswlib` ANN index
+when `[ann]` is installed, so large monorepos don't pay the exact-scan cost.
 
 ---
 
@@ -411,9 +420,16 @@ rather than one identical blob.
 | Cline | VS Code globalStorage — **`--global`** | `.clinerules/contextiq.md` |
 | Continue | `.continue/config.yaml` | `.continue/rules/contextiq.md` |
 | Codex / Aider / Jules | (AGENTS.md standard) | `AGENTS.md`, `CONVENTIONS.md` |
-| Gemini CLI | — | `GEMINI.md` |
-| Roo Code | — | `.roo/rules/contextiq.md` |
+| Gemini CLI | `.gemini/settings.json` — **opt-in** (`--editors gemini`) | `GEMINI.md` |
+| Roo Code | `.roo/mcp.json` — **opt-in** (`--editors roo`) | `.roo/rules/contextiq.md` |
+| OpenCode | `opencode.json` (`mcp`, `type: local`) — **opt-in** (`--editors opencode`) | `AGENTS.md` |
 | JetBrains / Neovim | printed snippet (manual) | — |
+
+The three opt-in MCP configs (Gemini / Roo / OpenCode) are written only when
+named explicitly, so a project isn't littered with configs for tools it doesn't
+use. Beyond tools, the server also exposes MCP **resources**
+(`contextiq://architecture`, `contextiq://modules`) and **prompts** (`bug_fix`,
+`feature`) for hosts that surface those primitives.
 
 Two notes worth knowing:
 
@@ -483,12 +499,15 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 > Using a venv? Change `"command": "python"` to the venv interpreter by absolute
 > path, e.g. `".venv/Scripts/python.exe"` (Windows) or `.venv/bin/python`.
 > `TOKENGRAPH_ROOT` sets the repo root the server indexes (honored by `--path`).
+> Set `TOKENGRAPH_TOOL_PROFILE=core` to expose only the ten essential tools
+> (orient → retrieve → drill-in → impact) instead of all 50+ — useful for
+> smaller local models whose context a long tool list would otherwise crowd.
 
 ### Tools the server exposes
 
 | Tool | Purpose |
 |---|---|
-| `find_relevant_context(task, budget_tokens=6000, depth=1, max_body_tokens=1600)` | **Start here.** Token-budgeted pack (hybrid lexical+semantic seeding) of the most relevant symbols + chunks + summaries |
+| `find_relevant_context(task, budget_tokens=6000, depth=1, max_body_tokens=1600, session="")` | **Start here.** Token-budgeted pack (hybrid lexical+semantic seeding) of the most relevant symbols + chunks + summaries. Pass a stable `session` id to enable **cross-turn dedup** — symbols already sent to that conversation and unchanged since are referenced by name instead of resent, making repeated retrievals substantially cheaper |
 | `ask(task, budget_tokens=6000, depth=1)` | Like `find_relevant_context` but returns structured metadata: intent, coverage %, risk, cost/savings, top files + the pack |
 | `list_modules()` | Token-count table of top-level directories — **call first** to scope retrieval to one module |
 | `search_semantic(query, limit=12)` | Find symbols by meaning when you don't know the name |
@@ -633,7 +652,7 @@ source files ──parse──► symbols + edges + embeddings + summaries ─�
 - **Precise references:** `import-scip` and the MCP `ingest_scip` tool consume JSON from `scip print --json`, map definition/reference occurrences to indexed symbols, and add `REFERENCES` edges used by context expansion and impact analysis. The built-in AST/tree-sitter resolver remains the zero-dependency fallback.
 - **Retrieve:** hybrid seed search (lexical + semantic, reciprocal-rank fused) → BFS over `CALLS`/`INHERITS` edges → tiered budget fill (full bodies → signatures → **module summaries** → indexed chunks → dropped-by-name).
 
-`.gitignore` is respected by default (a lightweight matcher; also skips `.git`, `node_modules`, `__pycache__`, `build`, `dist`, virtualenvs, etc.).
+`.gitignore` is respected by default (a lightweight matcher; also skips `.git`, `node_modules`, `__pycache__`, `build`, `dist`, virtualenvs, etc.). To exclude paths from AI context **without** changing what git tracks, add any of the assistant-specific ignore files ContextIQ also honors — `.contextiqignore`, `.claudeignore`, `.cursorignore`, `.codeiumignore` (Windsurf/Cline), or `.aiexclude` (Gemini) — using the same glob syntax; their rules are unioned with `.gitignore`.
 
 ---
 

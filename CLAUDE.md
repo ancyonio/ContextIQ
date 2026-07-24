@@ -43,6 +43,10 @@ need to call `reindex` manually.
 ## Tips
 
 - Spend a tight budget: `find_relevant_context(task, budget_tokens=4000)`.
+- Pass a stable `session` id (any string identifying this conversation) to
+  `find_relevant_context(task, session="…")`: symbols already sent this session
+  and unchanged since are referenced by name instead of resent, so repeated
+  retrievals in one conversation cost far fewer tokens.
 - If you write a good mental summary of a module, persist it with
   `set_module_summary(file, summary)` so future packs reuse it.
 - The CLI mirror is `python tokengraph_all.py context "task"` if you need it.

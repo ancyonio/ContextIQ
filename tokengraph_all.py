@@ -3758,10 +3758,25 @@ class GitIgnore:
                 result = not neg
         return result
 
+    # Ignore files honored, in load order (later files can re-include with `!`).
+    # `.gitignore` is the baseline; the rest let a user exclude paths from AI
+    # context *without* changing what git tracks. The assistant-specific names
+    # match the conventions each host already documents, so an existing
+    # `.cursorignore` / `.aiexclude` is picked up with no extra config.
+    IGNORE_FILES = (
+        ".gitignore",        # git baseline
+        ".contextignore",    # ContextIQ (legacy name)
+        ".contextiqignore",  # ContextIQ
+        ".claudeignore",     # Claude Code
+        ".cursorignore",     # Cursor
+        ".codeiumignore",    # Windsurf / Codeium / Cline
+        ".aiexclude",        # Gemini CLI / Code Assist
+    )
+
     @classmethod
     def load(cls, root: Path) -> "GitIgnore":
         patterns: list[str] = []
-        for name in (".gitignore", ".contextignore"):
+        for name in cls.IGNORE_FILES:
             try:
                 patterns += (root / name).read_text(
                     encoding="utf-8", errors="replace").splitlines()
@@ -4853,7 +4868,8 @@ def _dedup_similarity(a: set, b: set) -> float:
     return inter / min(len(a), len(b))
 
 
-def dedupe_blocks(blocks: list[str], threshold: float = 0.8) -> dict:
+def dedupe_blocks(blocks: list[str], threshold: float = 0.8,
+                  semantic: bool = False) -> dict:
     """Remove near-duplicate text blocks, keeping the first (longest-wins) copy.
 
     General-purpose context dedup: feed a list of retrieved snippets / tool
@@ -4861,19 +4877,38 @@ def dedupe_blocks(blocks: list[str], threshold: float = 0.8) -> dict:
     token saving. Deterministic, order-stable (longer blocks are preferred as
     the canonical copy). See also the automatic per-pack dedup in
     find_relevant_context.
+
+    The default is 5-gram shingle containment — precise, but blind to heavy
+    paraphrase. Pass ``semantic=True`` to compare by **embedding cosine**
+    instead, which collapses two blocks that say the same thing in different
+    words (at some precision cost). It uses the active embedding backend, so it
+    stays offline on the deterministic hash embedding when no neural model is
+    warmed. A cosine ``threshold`` near 0.9 is a sensible paraphrase cutoff.
     """
     indexed = sorted(enumerate(blocks), key=lambda it: -len(it[1] or ""))
-    kept: list[tuple[int, str, set]] = []
+    if semantic:
+        def _sig(text: str):
+            return embed_text(text or "")
+
+        def _sim(a, b) -> float:
+            return cosine(a, b)
+    else:
+        def _sig(text: str):
+            return _dedup_shingles(text or "")
+
+        def _sim(a, b) -> float:
+            return _dedup_similarity(a, b)
+    kept: list[tuple[int, str, object]] = []
     removed: list[dict] = []
     for idx, text in indexed:
-        shingles = _dedup_shingles(text or "")
+        sig = _sig(text)
         dup_of = None
-        for kidx, _ktext, kshingles in kept:
-            if _dedup_similarity(shingles, kshingles) >= threshold:
+        for kidx, _ktext, ksig in kept:
+            if _sim(sig, ksig) >= threshold:
                 dup_of = kidx
                 break
         if dup_of is None:
-            kept.append((idx, text, shingles))
+            kept.append((idx, text, sig))
         else:
             removed.append({"index": idx, "duplicate_of": dup_of})
     kept_order = [text for idx, text, _ in sorted(kept, key=lambda it: it[0])]
@@ -5483,10 +5518,16 @@ class Retriever:
         if not self.store.has_vectors():
             return list(self.store.search(query, limit=limit))
         qv = embed_text(query)
-        backend = os.environ.get("TOKENGRAPH_VECTOR_BACKEND", "exact").lower()
+        backend = os.environ.get("TOKENGRAPH_VECTOR_BACKEND", "auto").lower()
         threshold = int(os.environ.get("TOKENGRAPH_ANN_THRESHOLD", "5000"))
         vector_count = self.store.vector_count()
-        if backend == "hnsw" and vector_count >= threshold:
+        # ANN is opt-out above the threshold (VB-2): `auto` (the default)
+        # engages hnsw once the vector set is large enough to make exact cosine
+        # the bottleneck — but only if hnswlib is importable, otherwise the
+        # except-clause below degrades to exact. `hnsw` forces it; `exact` pins
+        # exact cosine at any size. Small repos (the common case, and every
+        # test) stay on exact, so results are unchanged there.
+        if backend in ("hnsw", "auto") and vector_count >= threshold:
             try:
                 import hnswlib  # type: ignore[import-not-found]
                 import numpy as np  # type: ignore[import-not-found]
@@ -5626,8 +5667,12 @@ class Retriever:
     def find_relevant_context(self, task: str, budget_tokens: int = 6000,
                               expand_depth: int = 1,
                               max_body_tokens: int = 1600,
-                              session: str = "") -> ContextPack:
+                              session: str = "",
+                              sweep_body_share: float = SWEEP_BODY_SHARE) -> ContextPack:
         pack = ContextPack(task=task, budget=budget_tokens)
+        # Per-tier knob: fraction of the completion-sweep's leftover budget
+        # spent on full bodies vs. breadth. Clamp so a caller can't invert it.
+        sweep_body_share = min(1.0, max(0.0, sweep_body_share))
         # SD-1/SD-2: what this conversation can still be assumed to hold.
         # Anything unchanged since we sent it is referenced by name instead of
         # re-serialised. The ledger self-expires (see Store.sent_map) so we
@@ -5822,7 +5867,8 @@ class Retriever:
         #    the failure this exists to fix.
         before = len(pack.pieces)
         self._complete_from_files(pack, task, budget_tokens, file_scores,
-                                  ranked_files, already)
+                                  ranked_files, already,
+                                  sweep_body_share=sweep_body_share)
         # The sweep tracks line spans to avoid re-showing code, which catches
         # structural overlap but not textual duplication (two near-identical
         # small methods). Re-run DD-1 over the result so the no-redundant-piece
@@ -5849,7 +5895,8 @@ class Retriever:
 
     def _complete_from_files(self, pack: "ContextPack", task: str,
                              budget_tokens: int, file_scores: dict[str, float],
-                             ranked_files: list[str], already: dict) -> None:
+                             ranked_files: list[str], already: dict,
+                             sweep_body_share: float = SWEEP_BODY_SHARE) -> None:
         """Finish the files the pack already believes in, with the budget left.
 
         Seeds and graph neighbours are both *pointwise*: they answer "which
@@ -5975,7 +6022,7 @@ class Retriever:
         # signatures-first leaves nothing to promote (every literal fact is
         # lost). Splitting the remainder is what keeps both — measured as the
         # difference between 0.63 and 0.72 answerable at equal recall.
-        body_ceiling = spent + int(SWEEP_BODY_SHARE * (budget_tokens - spent))
+        body_ceiling = spent + int(sweep_body_share * (budget_tokens - spent))
 
         # Pass 1 — bodies for the best-scoring candidates, up to that ceiling.
         # Behaviour and literal values live here: no signature will ever show
@@ -7437,7 +7484,8 @@ def track_gain(root: Path, counts: dict, no_track: bool = False) -> None:
     import time
     safe = {k: counts[k] for k in counts
             if isinstance(counts[k], (int, float)) and k in
-            {"final_tokens", "baseline_tokens", "saved", "reduction_pct", "files"}}
+            {"final_tokens", "baseline_tokens", "saved", "reduction_pct",
+             "files", "build_ms"}}
     p = root / ".context" / "gain.ndjson"
     p.parent.mkdir(parents=True, exist_ok=True)
     with _GAIN_LOCK:
@@ -7460,12 +7508,15 @@ def track_usage(root: Path, metrics: dict, no_track: bool = False) -> None:
 
 def record_pack_savings(root: Path, op: str, *, final_tokens: int,
                         baseline_tokens: int, files: int,
-                        no_track: bool = False) -> None:
+                        no_track: bool = False,
+                        build_ms: float | None = None) -> None:
     """Append one retrieval op's pack-vs-whole-file delta to the ledger (TB-6).
 
     Wired into the everyday retrieval paths (context / ask / measure / the MCP
     context tool) so the savings ledger accumulates from normal use, not just
-    `generate`. Best-effort: tracking must never break the host command.
+    `generate`. When the caller times the pack build, `build_ms` records how
+    long assembly took, so the ledger carries a latency series alongside the
+    token series. Best-effort: tracking must never break the host command.
     """
     try:
         saved = baseline_tokens - final_tokens
@@ -7475,9 +7526,12 @@ def record_pack_savings(root: Path, op: str, *, final_tokens: int,
             # ledger's totals and run counts on the dashboard.
             return
         red = round(saved / baseline_tokens * 100.0, 1) if baseline_tokens else 0.0
-        track_gain(root, {"op": op, "final_tokens": final_tokens,
-                          "baseline_tokens": baseline_tokens, "saved": saved,
-                          "reduction_pct": red, "files": files}, no_track=no_track)
+        entry = {"op": op, "final_tokens": final_tokens,
+                 "baseline_tokens": baseline_tokens, "saved": saved,
+                 "reduction_pct": red, "files": files}
+        if build_ms is not None:
+            entry["build_ms"] = build_ms
+        track_gain(root, entry, no_track=no_track)
         track_usage(root, {"op": op, "final_tokens": final_tokens,
                            "reduction_pct": red}, no_track=no_track)
         if not _tracking_disabled(no_track):
@@ -7888,6 +7942,54 @@ def summarize_gain(root: Path, since: str | None = None,
         out["weekly"] = _gain_buckets(rows, "%Y-W%W")[-12:]
         out["monthly"] = _gain_buckets(rows, "%Y-%m")[-12:]
     return out
+
+
+def render_prometheus(summary: dict) -> str:
+    """Render a savings summary as Prometheus / OpenMetrics text (LX-1).
+
+    Lets an org scrape ContextIQ's realized savings into Prometheus / Grafana,
+    or any OpenTelemetry collector that ingests the Prometheus exposition
+    format. Counters carry the conventional ``_total`` suffix; the per-op
+    breakdown rides on an ``op`` label. Deterministic and local — just the
+    ledger totals, no network.
+    """
+    def _esc(v: object) -> str:
+        return str(v).replace("\\", "\\\\").replace('"', '\\"')
+
+    lines: list[str] = []
+
+    def metric(name: str, help_: str, typ: str, samples: list) -> None:
+        lines.append(f"# HELP {name} {help_}")
+        lines.append(f"# TYPE {name} {typ}")
+        for labels, value in samples:
+            lbl = ("{" + ",".join(f'{k}="{_esc(v)}"' for k, v in labels.items())
+                   + "}") if labels else ""
+            lines.append(f"{name}{lbl} {value}")
+
+    metric("contextiq_tokens_saved_total",
+           "Tokens saved vs. the baseline (realized ledger).", "counter",
+           [({}, summary.get("saved_tokens", 0))])
+    metric("contextiq_tokens_baseline_total",
+           "Baseline tokens a naive read would have cost.", "counter",
+           [({}, summary.get("baseline_tokens", 0))])
+    metric("contextiq_tokens_sent_total",
+           "Tokens actually sent (assembled pack size).", "counter",
+           [({}, summary.get("final_tokens", 0))])
+    metric("contextiq_runs_total", "Recorded retrieval operations.", "counter",
+           [({}, summary.get("runs", 0))])
+    metric("contextiq_reduction_ratio",
+           "Fraction of baseline tokens avoided (0-1).", "gauge",
+           [({}, round(summary.get("reduction_pct", 0.0) / 100.0, 4))])
+    metric("contextiq_cost_saved_usd",
+           f"Projected input cost avoided at {summary.get('model', '?')} list price.",
+           "gauge", [({}, summary.get("saved_usd", 0.0))])
+    by_op = summary.get("by_op", [])
+    if by_op:
+        metric("contextiq_op_tokens_saved_total", "Tokens saved, by operation.",
+               "counter", [({"op": r["op"]}, r["saved"]) for r in by_op])
+        metric("contextiq_op_runs_total", "Runs, by operation.", "counter",
+               [({"op": r["op"]}, r["runs"]) for r in by_op])
+    return "\n".join(lines) + "\n"
 
 
 def _gain_buckets(rows: list[dict], fmt: str) -> list[dict]:
@@ -10190,6 +10292,126 @@ def _top_reason(entries: list[dict]) -> str:
 
 
 # ==========================================================================
+# Machine-readable output contracts (SCH-1): JSON Schemas for the structured
+# commands, so a downstream harness can validate `ask` / `evidence` output
+# instead of trusting field names. Emit with `ask --schema` / `evidence
+# --schema`; a test asserts the real output conforms to these.
+# ==========================================================================
+ASK_OUTPUT_SCHEMA: dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "contextiq.ask/v1",
+    "title": "ContextIQ ask() output",
+    "type": "object",
+    "required": ["task", "intent", "coverage_pct", "risk", "pack_tokens",
+                 "baseline_tokens", "tokens_saved", "savings_pct",
+                 "suggested_tier", "top_files"],
+    "properties": {
+        "task": {"type": "string"},
+        "intent": {"type": "string"},
+        "coverage_pct": {"type": "number"},
+        "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "pack_tokens": {"type": "integer"},
+        "baseline_tokens": {"type": "integer"},
+        "tokens_saved": {"type": "integer"},
+        "savings_pct": {"type": "number"},
+        "suggested_tier": {"type": "string"},
+        "top_files": {"type": "array", "items": {"type": "string"}},
+        "dropped": {"type": "array", "items": {"type": "string"}},
+        "markdown": {"type": "string"},
+    },
+    "additionalProperties": True,
+}
+
+EVIDENCE_OUTPUT_SCHEMA: dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "contextiq.evidence/v2",
+    "title": "ContextIQ evidence() pack",
+    "type": "object",
+    "required": ["schema", "schema_version", "task", "intent", "token_budget",
+                 "pack_tokens", "files", "symbols", "dropped", "grounding"],
+    "properties": {
+        "schema": {"type": "string"},
+        "schema_version": {"type": "integer"},
+        "task": {"type": "string"},
+        "intent": {"type": "string"},
+        "token_budget": {"type": "integer"},
+        "pack_tokens": {"type": "integer"},
+        "files": {"type": "array", "items": {
+            "type": "object",
+            "required": ["path", "symbols", "reason", "confidence",
+                         "source_lines", "related_tests", "risk_label"],
+            "properties": {
+                "path": {"type": "string"},
+                "symbols": {"type": "array", "items": {"type": "string"}},
+                "reason": {"type": "string"},
+                "confidence": {"type": "number"},
+                "source_lines": {"type": ["array", "null"]},
+                "related_tests": {"type": "array", "items": {"type": "string"}},
+                "risk_label": {"type": "string",
+                               "enum": ["low", "medium", "high"]},
+            },
+            "additionalProperties": True,
+        }},
+        "symbols": {"type": "array"},
+        "dropped": {"type": "array", "items": {"type": "string"}},
+        "grounding": {
+            "type": "object",
+            "required": ["symbol_count", "anchored_symbols", "anchor_coverage",
+                         "context_hash", "deterministic"],
+            "properties": {
+                "symbol_count": {"type": "integer"},
+                "anchored_symbols": {"type": "integer"},
+                "anchor_coverage": {"type": "number"},
+                "context_hash": {"type": "string"},
+                "deterministic": {"type": "boolean"},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "additionalProperties": True,
+}
+
+_JSON_TYPES: dict = {
+    "object": dict, "array": list, "string": str, "boolean": bool,
+    "integer": int, "number": (int, float), "null": type(None),
+}
+
+
+def schema_errors(obj, schema: dict, path: str = "$") -> list[str]:
+    """Minimal JSON-Schema conformance check (no third-party dep).
+
+    Supports the subset the output contracts use: ``type`` (incl. unions and
+    ``integer``/``number`` — note bool is not accepted as a number), ``enum``,
+    ``required``, object ``properties`` and array ``items``. Returns a list of
+    human-readable errors ('' == conforms).
+    """
+    errs: list[str] = []
+    types = schema.get("type")
+    if types is not None:
+        allowed = types if isinstance(types, list) else [types]
+        py = tuple(_JSON_TYPES[t] for t in allowed if t in _JSON_TYPES)
+        # bool is a subclass of int — never let True satisfy integer/number.
+        ok = isinstance(obj, py) and not (isinstance(obj, bool)
+                                          and "boolean" not in allowed)
+        if not ok:
+            errs.append(f"{path}: expected {allowed}, got {type(obj).__name__}")
+            return errs
+    if "enum" in schema and obj not in schema["enum"]:
+        errs.append(f"{path}: {obj!r} not in enum {schema['enum']}")
+    if isinstance(obj, dict):
+        for req in schema.get("required", []):
+            if req not in obj:
+                errs.append(f"{path}: missing required key '{req}'")
+        for key, sub in schema.get("properties", {}).items():
+            if key in obj:
+                errs += schema_errors(obj[key], sub, f"{path}.{key}")
+    if isinstance(obj, list) and "items" in schema:
+        for i, item in enumerate(obj):
+            errs += schema_errors(item, schema["items"], f"{path}[{i}]")
+    return errs
+
+
+# ==========================================================================
 # grounding report (FR-GROUND): quantify the hallucination-guard's effect
 # ==========================================================================
 def grounding_report(retriever: "Retriever", sample: int = 100) -> dict:
@@ -10595,9 +10817,28 @@ def ide_setup(root: Path, editors: list[str] | None = None,
                          "command": stdio["command"],
                          "args": stdio["args"],
                          "env": {}}}}),
+        # Gemini CLI and Roo Code both read a project-level MCP config in the
+        # standard {"mcpServers": …} shape — Gemini from .gemini/settings.json,
+        # Roo from .roo/mcp.json.
+        "gemini":   (".gemini/settings.json",
+                     {"mcpServers": {"tokengraph": stdio_typed}}),
+        "roo":      (".roo/mcp.json",
+                     {"mcpServers": {"tokengraph": stdio_typed}}),
+        # OpenCode uses its own schema: an `mcp` map with a `type: "local"`
+        # server whose `command` is a single argv array (command + args).
+        "opencode": ("opencode.json",
+                     {"$schema": "https://opencode.ai/config.json",
+                      "mcp": {"tokengraph": {
+                          "type": "local",
+                          "command": [stdio["command"], *stdio["args"]],
+                          "enabled": True}}}),
         "continue": (".continue/config.yaml", None),   # YAML, written below
     }
-    chosen = editors or [e for e in targets if e != "continue"]
+    # These hosts are wired only when named explicitly (like continue): they
+    # are less common, so writing their configs into every project by default
+    # would scatter files a repo may never use.
+    _optin_only = {"continue", "gemini", "roo", "opencode"}
+    chosen = editors or [e for e in targets if e not in _optin_only]
     written: list[str] = []
     for workspace_root in roots:
         for ed in chosen:
@@ -11430,6 +11671,88 @@ hallucination_benchmark_fn = hallucination_benchmark
 # ==========================================================================
 # MCP server (FastMCP, lazy)
 # ==========================================================================
+# Tool profiles (TP-1). A 58-tool list overwhelms smaller local models and
+# eats their context before the first query. `TOKENGRAPH_TOOL_PROFILE=core`
+# (or `minimal`) serves only the orientation → retrieve → drill-in → impact
+# essentials; anything else serves the full set.
+CORE_MCP_TOOLS = frozenset({
+    "list_modules",              # orient
+    "find_relevant_context",     # retrieve (start here)
+    "search_semantic",           # retrieve by meaning
+    "get_symbol",                # drill in: one symbol
+    "get_lines",                 # drill in: exact range
+    "get_callers",               # call graph
+    "get_callees",               # call graph
+    "get_impact",                # blast radius before an edit
+    "file_skeleton",             # signatures of a file
+    "get_architecture_overview", # whole-repo shape
+})
+
+
+def _run_coro_sync(coro):
+    """Run a coroutine from sync code, even if an event loop is already active."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
+def _mcp_tool_names(mcp) -> list[str]:
+    """Registered tool names, across FastMCP versions."""
+    import inspect
+    lt = getattr(mcp, "list_tools", None)  # FastMCP v3: async -> [Tool(name=…)]
+    if callable(lt):
+        res = lt()
+        if inspect.iscoroutine(res):
+            res = _run_coro_sync(res)
+        return [n for n in (getattr(t, "name", None) for t in res) if n]
+    tm = getattr(mcp, "_tool_manager", None)  # FastMCP v2: dict registry
+    reg = getattr(tm, "_tools", None) if tm is not None else None
+    return list(reg) if isinstance(reg, dict) else []
+
+
+def _mcp_remove_tool(mcp, name: str) -> None:
+    import inspect
+    # FastMCP v3.4+ moved removal to the local provider; older versions expose
+    # it on the server itself. Prefer the current API so we don't trip the
+    # deprecation warning, then fall back for v2/early-v3.
+    lp = getattr(mcp, "local_provider", None)
+    rt = getattr(lp, "remove_tool", None) or getattr(mcp, "remove_tool", None)
+    if callable(rt):
+        res = rt(name)
+        if inspect.iscoroutine(res):
+            _run_coro_sync(res)
+        return
+    tm = getattr(mcp, "_tool_manager", None)
+    reg = getattr(tm, "_tools", None) if tm is not None else None
+    if isinstance(reg, dict):
+        reg.pop(name, None)
+
+
+def _apply_tool_profile(mcp, keep: "frozenset[str]") -> None:
+    """Restrict a built FastMCP server to a named subset of tools (TP-1).
+
+    Best-effort and version-tolerant (FastMCP v2 dict registry or v3 async
+    API): if the internals ever differ, it leaves the full set intact rather
+    than failing to start the server.
+    """
+    try:
+        names = _mcp_tool_names(mcp)
+        if not names:
+            return
+        hidden = [n for n in names if n not in keep]
+        for n in hidden:
+            _mcp_remove_tool(mcp, n)
+        print(f"tokengraph: TOOL_PROFILE=core — serving {len(names) - len(hidden)} "
+              f"core tool(s), hid {len(hidden)}", file=sys.stderr)
+    except Exception as e:  # never let the profile filter stop the server
+        print(f"tokengraph: tool-profile filter skipped ({e})", file=sys.stderr)
+
+
 def build_mcp_server(root: Path, db: Path):
     """Construct a FastMCP server exposing the graph tools. Imported lazily."""
     from fastmcp import FastMCP  # type: ignore[import-not-found]
@@ -12058,14 +12381,17 @@ def build_mcp_server(root: Path, db: Path):
         return estimate_cost(prompt, model, expected_output_tokens)
 
     @mcp.tool
-    def dedupe_context(blocks: list[str], threshold: float = 0.8) -> dict:
+    def dedupe_context(blocks: list[str], threshold: float = 0.8,
+                       semantic: bool = False) -> dict:
         """Remove near-duplicate text blocks from a set of context snippets.
 
         Feed retrieved snippets / tool outputs / pasted context; get back only
         the non-redundant ones plus the token saving. (Context packs are already
-        deduped automatically; this is for ad-hoc blocks.)
+        deduped automatically; this is for ad-hoc blocks.) Set `semantic=true`
+        to match by embedding cosine so heavy paraphrases collapse too — use a
+        `threshold` near 0.9 for that mode.
         """
-        res = dedupe_blocks(blocks, threshold=threshold)
+        res = dedupe_blocks(blocks, threshold=threshold, semantic=semantic)
         record_pack_savings(root, "mcp.dedupe",
                             final_tokens=res.get("tokens_after", 0),
                             baseline_tokens=res.get("tokens_before", 0), files=0)
@@ -12309,8 +12635,61 @@ def build_mcp_server(root: Path, db: Path):
         finally:
             r.close()
 
+    # ---- MCP resources & prompts (MR-1) --------------------------------
+    # Read-only orientation exposed as MCP *resources*, and the repo's task
+    # templates as MCP *prompts*, for hosts that surface those primitives
+    # alongside tools. Each block is guarded so a FastMCP lacking a primitive
+    # still starts the server with everything else intact.
+    import json as _json_mr
+    try:
+        @mcp.resource("contextiq://architecture", mime_type="application/json",
+                      description="Whole-repo architecture overview: modules, "
+                                  "hub files, import cycles, languages, routes.")
+        def _res_architecture() -> str:
+            r = _ret()
+            try:
+                return _json_mr.dumps(r.get_architecture_overview(), indent=2)
+            finally:
+                r.close()
+
+        @mcp.resource("contextiq://modules", mime_type="application/json",
+                      description="Token-count table of top-level modules.")
+        def _res_modules() -> str:
+            r = _ret()
+            try:
+                return _json_mr.dumps(r.list_modules(), indent=2)
+            finally:
+                r.close()
+    except Exception as e:  # pragma: no cover - depends on FastMCP version
+        print(f"tokengraph: MCP resources not registered ({e})", file=sys.stderr)
+
+    try:
+        @mcp.prompt(name="bug_fix",
+                    description="Minimal-context bug-fix workflow via ContextIQ.")
+        def _prompt_bug_fix(symptom: str) -> str:
+            return (f"Task: fix a bug.\n\nSymptom: {symptom}\n\n"
+                    "1. find_relevant_context(symptom) to locate the buggy code.\n"
+                    "2. get_method_impact(qname) before editing — who breaks, "
+                    "dependencies, and the tests that exercise it.\n"
+                    "3. Propose a minimal fix and run the narrowest relevant test.")
+
+        @mcp.prompt(name="feature",
+                    description="Feature-implementation workflow via ContextIQ.")
+        def _prompt_feature(feature: str,
+                            test_command: str = "the test suite") -> str:
+            return (f"Task: implement {feature}.\n\n"
+                    "1. find_relevant_context(feature) to find where it fits.\n"
+                    "2. conventions() then scaffold(name) for a house-style file.\n"
+                    "3. get_method_impact(qname) before editing shared code.\n"
+                    f"4. Implement, then verify with {test_command}.")
+    except Exception as e:  # pragma: no cover - depends on FastMCP version
+        print(f"tokengraph: MCP prompts not registered ({e})", file=sys.stderr)
+
     # Explicit shutdown for the connection pool (RP-1).
     mcp.close_pool = _close_pool
+    # TP-1: honor a reduced tool profile for small-context clients.
+    if os.environ.get("TOKENGRAPH_TOOL_PROFILE", "").strip().lower() in ("core", "minimal"):
+        _apply_tool_profile(mcp, CORE_MCP_TOOLS)
     return mcp
 
 
@@ -12334,18 +12713,23 @@ def cmd_index(args):
 
 
 def cmd_context(args):
+    import time
     root = Path(args.path).resolve()
     if not getattr(args, "no_refresh", False):
         index_repo(root, _db_path(root))
     r = Retriever(root, _db_path(root))
-    pack = r.find_relevant_context(args.task, budget_tokens=args.budget,
-                                   expand_depth=args.depth,
-                                   max_body_tokens=args.max_body)
+    _t0 = time.perf_counter()
+    pack = r.find_relevant_context(
+        args.task, budget_tokens=args.budget, expand_depth=args.depth,
+        max_body_tokens=args.max_body,
+        sweep_body_share=getattr(args, "sweep_body_share", SWEEP_BODY_SHARE))
+    build_ms = round((time.perf_counter() - _t0) * 1000.0, 1)
     out = pack.to_markdown()
     files = sorted({p.file for p in pack.pieces})
     record_pack_savings(root, "context", final_tokens=pack.rendered_tokens,
                         baseline_tokens=sum(r.store.token_est_for(f) for f in files),
-                        files=len(files), no_track=getattr(args, "no_track", False))
+                        files=len(files), no_track=getattr(args, "no_track", False),
+                        build_ms=build_ms)
     if args.out:
         Path(args.out).write_text(out, encoding="utf-8")
         print(f"wrote {args.out} (~{pack.rendered_tokens} tokens, {len(pack.pieces)} symbols)")
@@ -12659,6 +13043,9 @@ def cmd_suggest(args):
 
 
 def cmd_ask(args):
+    if getattr(args, "schema", False):
+        _emit(ASK_OUTPUT_SCHEMA, True)
+        return
     r = _open_retriever(args)
     try:
         a = r.ask(args.task, budget_tokens=args.budget, depth=args.depth)
@@ -12832,7 +13219,8 @@ def cmd_dedupe(args):
     raw = _read_text_arg(args)
     blocks = [b for b in raw.split(args.sep) if b.strip()] if args.sep \
         else [b for b in raw.split("\n\n") if b.strip()]
-    res = dedupe_blocks(blocks, threshold=args.threshold)
+    res = dedupe_blocks(blocks, threshold=args.threshold,
+                        semantic=getattr(args, "semantic", False))
     record_pack_savings(Path(args.path).resolve(), "dedupe",
                         final_tokens=res["tokens_after"],
                         baseline_tokens=res["tokens_before"], files=0,
@@ -13090,6 +13478,9 @@ def cmd_create(args):
 
 
 def cmd_evidence(args):
+    if getattr(args, "schema", False):
+        _emit(EVIDENCE_OUTPUT_SCHEMA, True)
+        return
     r = _open_retriever(args)
     try:
         ev = build_evidence_pack(r, args.task, budget_tokens=args.budget)
@@ -14272,6 +14663,14 @@ def run_retrieval_benchmark(r: Retriever, cases: list[dict],
                      "missing_symbols": quality["missing_symbols"],
                      "missing_facts": quality["missing_facts"]})
     count = len(cases) or 1
+
+    def _pct(vals: list[float], p: float) -> float:
+        if not vals:
+            return 0.0
+        s = sorted(vals)
+        i = min(len(s) - 1, max(0, int(round((p / 100.0) * (len(s) - 1)))))
+        return round(s[i], 2)
+
     return {
         "queries": len(cases),
         "recall_at_5": round(hits / count, 3),
@@ -14281,7 +14680,11 @@ def run_retrieval_benchmark(r: Retriever, cases: list[dict],
         "answerable_rate": round(answerable / count, 3),
         "irrelevant_token_ratio": round(
             irrelevant_tokens / pack_tokens, 3) if pack_tokens else 0.0,
+        # Latency of pack assembly (rank_files + find_relevant_context), so the
+        # "fewer tokens" claim carries a "how fast" number too (PB-3).
         "mean_latency_ms": round(sum(latencies_ms) / count, 2),
+        "p50_latency_ms": _pct(latencies_ms, 50),
+        "p95_latency_ms": _pct(latencies_ms, 95),
         "rows": rows,
     }
 
@@ -15050,6 +15453,7 @@ def run_benchmark_suite(corpus_paths: list[Path], budget_tokens: int = 4000,
     itself — a self-only benchmark says nothing about generalisation.
     """
     import json
+    import time
     suites, all_rows = [], []
     totals = {"queries": 0, "recall_hits": 0.0, "symbol_recall": 0.0,
               "answerable": 0.0, "irrelevant": 0.0, "pack": 0.0}
@@ -15068,12 +15472,15 @@ def run_benchmark_suite(corpus_paths: list[Path], budget_tokens: int = 4000,
         if not cases:
             continue
         db = _db_path(repo)
+        _idx0 = time.perf_counter()
         index_repo(repo, db)
+        index_ms = round((time.perf_counter() - _idx0) * 1000.0, 1)
         r = Retriever(repo, db)
         try:
             res = run_retrieval_benchmark(r, cases, budget_tokens=budget_tokens)
         finally:
             r.close()
+        res["index_time_ms"] = index_ms
         # Label by the repo it exercises — every fixture corpus is named
         # tasks.json, which made CI output unreadable.
         res["corpus"] = (cpath.parent.name if cpath.name == "tasks.json"
@@ -15092,6 +15499,10 @@ def run_benchmark_suite(corpus_paths: list[Path], budget_tokens: int = 4000,
         suites.append(res)
 
     q = totals["queries"] or 1
+    # Performance roll-up (PB-3): query-weighted mean pack latency, the worst
+    # per-corpus p95, and total index build time across the suite.
+    mean_latency = (round(sum(s.get("mean_latency_ms", 0.0) * s["queries"]
+                              for s in suites) / q, 2) if suites else 0.0)
     aggregate = {
         "queries": totals["queries"],
         "corpora": len(suites),
@@ -15099,6 +15510,11 @@ def run_benchmark_suite(corpus_paths: list[Path], budget_tokens: int = 4000,
         "symbol_recall": round(totals["symbol_recall"] / q, 3),
         "answerable_rate": round(totals["answerable"] / q, 3),
         "irrelevant_token_ratio": round(totals["irrelevant"] / q, 3),
+        "mean_latency_ms": mean_latency,
+        "p95_latency_ms": round(max((s.get("p95_latency_ms", 0.0)
+                                     for s in suites), default=0.0), 2),
+        "index_time_ms_total": round(sum(s.get("index_time_ms", 0.0)
+                                         for s in suites), 1),
     }
     return {"aggregate": aggregate, "suites": suites,
             "failures": [row for row in all_rows if not row["answerable"]]}
@@ -15151,6 +15567,10 @@ def cmd_benchmark(args):
                   f"symbols={agg['symbol_recall']:<6} "
                   f"answerable={agg['answerable_rate']:<6} "
                   f"waste={agg['irrelevant_token_ratio']}")
+            print(f"  {'PERFORMANCE':<28} "
+                  f"pack mean={agg.get('mean_latency_ms', 0)}ms "
+                  f"p95={agg.get('p95_latency_ms', 0)}ms  "
+                  f"index(total)={agg.get('index_time_ms_total', 0)}ms")
             if suite["failures"]:
                 print(f"\n  {len(suite['failures'])} unanswerable case(s):")
                 for row in suite["failures"][:10]:
@@ -15452,6 +15872,9 @@ def cmd_gain(args):
     s = summarize_gain(root, since=getattr(args, "since", None),
                        model=args.model, top=getattr(args, "top", None),
                        trends=getattr(args, "all", False))
+    if getattr(args, "prometheus", False):
+        print(render_prometheus(s), end="")
+        return
     if getattr(args, "html", None):
         payload = build_report_payload(root, model=args.model,
                                        generated_at=_report_timestamp())
@@ -15537,6 +15960,9 @@ def build_parser():
     c.add_argument("-d", "--depth", type=int, default=1)
     c.add_argument("--max-body", type=int, default=1600,
                    help="max tokens for one full symbol body before using signature+chunks")
+    c.add_argument("--sweep-body-share", type=float, default=SWEEP_BODY_SHARE,
+                   help="fraction (0-1) of leftover budget spent on full bodies "
+                        "vs. breadth in the completion sweep (default %(default)s)")
     c.add_argument("-o", "--out", default=None)
     c.add_argument("--no-refresh", action="store_true",
                    help="skip the freshen-on-query reindex (use the graph as-is)")
@@ -15701,10 +16127,12 @@ def build_parser():
     sg.set_defaults(func=cmd_suggest)
 
     ak = sub.add_parser("ask", help="focused retrieval with intent/coverage/risk/cost")
-    ak.add_argument("task")
+    ak.add_argument("task", nargs="?", default="")
     ak.add_argument("-b", "--budget", type=int, default=6000)
     ak.add_argument("-d", "--depth", type=int, default=1)
     ak.add_argument("--json", action="store_true")
+    ak.add_argument("--schema", action="store_true",
+                    help="print the JSON Schema of the --json output and exit")
     ak.add_argument("--no-refresh", action="store_true")
     ak.add_argument("--no-track", action="store_true")
     ak.set_defaults(func=cmd_ask)
@@ -15777,6 +16205,9 @@ def build_parser():
     dd.add_argument("--text-file", default=None)
     dd.add_argument("--sep", default=None, help="block separator (default: blank line)")
     dd.add_argument("--threshold", type=float, default=0.8)
+    dd.add_argument("--semantic", action="store_true",
+                    help="match by embedding cosine (collapses paraphrases); "
+                         "pair with a higher --threshold (~0.9)")
     dd.add_argument("--json", action="store_true")
     dd.set_defaults(func=cmd_dedupe)
 
@@ -15871,9 +16302,11 @@ def build_parser():
 
     ev = sub.add_parser("evidence",
                         help="deterministic, hash-grounded evidence pack JSON for a task (audit/CI)")
-    ev.add_argument("task")
+    ev.add_argument("task", nargs="?", default="")
     ev.add_argument("-b", "--budget", type=int, default=6000)
     ev.add_argument("-o", "--out", default=None)
+    ev.add_argument("--schema", action="store_true",
+                    help="print the JSON Schema of the evidence pack and exit")
     ev.add_argument("--no-refresh", action="store_true")
     ev.set_defaults(func=cmd_evidence)
 
@@ -16107,6 +16540,9 @@ def build_parser():
     gn.add_argument("--port", type=int, default=8787, help="port for --serve")
     gn.add_argument("--reset", action="store_true", help="clear the savings ledger")
     gn.add_argument("--json", action="store_true")
+    gn.add_argument("--prometheus", action="store_true",
+                    help="emit the ledger totals as Prometheus/OpenMetrics text "
+                         "for scraping into Grafana / an OTel collector")
     gn.set_defaults(func=cmd_gain)
 
     stt = sub.add_parser("status",
