@@ -1,10 +1,11 @@
 {
   "title": "ContextIQ: A Reproducible Benchmark for Token-Efficient, Verifiable AI Code Context",
   "upload_type": "dataset",
-  "description": "ContextIQ is a local code-graph server that gives AI coding agents token-efficient, verifiable context. This deposition archives its reproducible benchmark: retrieval quality (Recall@5=1.0 over 96 queries across 4 corpora), cross-language test-discovery (F1=0.9474), and a hallucination-guard measurement, plus a content-hashed dataset manifest for exact reproduction.",
+  "description": "ContextIQ is a local code-graph server that gives AI coding agents token-efficient, verifiable context. This deposition archives its reproducible benchmark: retrieval quality (Recall@5=0.989 over 96 queries across 4 corpora), cross-language test-discovery (F1=0.9474), and a hallucination-guard measurement, plus a content-hashed dataset manifest for exact reproduction.",
   "creators": [
     {
-      "name": "ContextIQ maintainers"
+      "name": "Bhardwaj, Vivek",
+      "orcid": "0009-0000-8590-0400"
     }
   ],
   "license": "MIT",
@@ -20,5 +21,5 @@
     "MCP"
   ],
   "version": "1.0.0",
-  "notes": "dataset_hash=0443130df021f6f2d1a36a65f07de28a260d9dc264d044996ef2319e31eedbb3"
+  "notes": "dataset_hash=654a8300befab41d4396c8fee5d318d233a2debc52212a17b22d8cceca1f08b0"
 }

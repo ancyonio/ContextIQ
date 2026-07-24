@@ -43,6 +43,8 @@ tokengraph zenodo-publish --production --publish
 
 The DOI Zenodo mints turns the benchmark from *reproducible* into *peer-archived*.
 
+> **Archived:** this benchmark is published at [10.5281/zenodo.21535773](https://doi.org/10.5281/zenodo.21535773). Cite it with the metadata in [CITATION.cff](../CITATION.cff).
+
 ## `zenodo-publish` safety model
 
 Every default is the safe one; each escalation is explicit:

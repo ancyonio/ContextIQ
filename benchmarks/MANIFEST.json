@@ -1,7 +1,22 @@
 {
-  "file_count": 56,
-  "dataset_hash": "0443130df021f6f2d1a36a65f07de28a260d9dc264d044996ef2319e31eedbb3",
+  "file_count": 63,
+  "dataset_hash": "654a8300befab41d4396c8fee5d318d233a2debc52212a17b22d8cceca1f08b0",
   "files": [
+    {
+      "path": "benchmarks/JUDGE.md",
+      "sha256": "89626f0d5c7342d5a3b15398cb026e24ceed18eeccc2d8156f1e58a4ec788efa",
+      "bytes": 1658
+    },
+    {
+      "path": "benchmarks/repos/gosvc/.context/gain.ndjson",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "benchmarks/repos/gosvc/.context/usage.ndjson",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
     {
       "path": "benchmarks/repos/gosvc/cmd/gosvc/main.go",
       "sha256": "6a412250af6672bdff29a0683fdcc31da6b61ff01e617839cb093e2a72c3e455",
@@ -58,6 +73,16 @@
       "bytes": 6547
     },
     {
+      "path": "benchmarks/repos/pyshop/.context/gain.ndjson",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "benchmarks/repos/pyshop/.context/usage.ndjson",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
       "path": "benchmarks/repos/pyshop/app/api/handlers.py",
       "sha256": "85d9634a27fda8c6d7bc7c0ad2b0c1c97b6fb1946d736a7820e8a802e5bc11d2",
       "bytes": 10083
@@ -111,6 +136,16 @@
       "path": "benchmarks/repos/pyshop/tasks.json",
       "sha256": "2717335a2c6845db68caa27cbc0805afbd6765abadc95770ec8b989852033acc",
       "bytes": 6950
+    },
+    {
+      "path": "benchmarks/repos/tsapi/.context/gain.ndjson",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "benchmarks/repos/tsapi/.context/usage.ndjson",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
     },
     {
       "path": "benchmarks/repos/tsapi/judge.json",

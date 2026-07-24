@@ -2,9 +2,13 @@ cff-version: 1.2.0
 message: "If you use ContextIQ or its benchmark, please cite it."
 title: "ContextIQ: Token-Efficient, Verifiable AI Code Context"
 version: "1.0.0"
+date-released: "2026-07-24"
+doi: 10.5281/zenodo.21535773
 license: MIT
 authors:
-  - name: "ContextIQ maintainers"
+  - family-names: "Bhardwaj"
+    given-names: "Vivek"
+    orcid: "https://orcid.org/0009-0000-8590-0400"
 keywords:
   - code retrieval
   - LLM context

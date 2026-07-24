@@ -2,6 +2,7 @@
 
 # ContextIQ
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21535772.svg)](https://doi.org/10.5281/zenodo.21535772)
 
 A local, single-file **AST code graph** that gives AI coding agents token-efficient context. Instead of letting the agent read whole files (and re-read them every session), ContextIQ indexes your repo into a local SQLite graph of symbols + call/inheritance edges, then serves a **token-budgeted "context pack"** of only the symbols relevant to a task.
 
