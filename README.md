@@ -32,6 +32,10 @@ The graph **auto-refreshes on every query**, so it never goes stale — even rig
 
 A context pack contains: relevant symbols (full body when small, signature when large), their callers/callees/base classes as signatures, matching indexed source chunks, and a list of anything dropped for budget so the agent can request it by name. Near-duplicate pieces (e.g. an indexed chunk that merely re-shows a symbol body already in the pack) are removed automatically and reported under `deduped`.
 
+<p align="center">
+  <img src="images/ContextIQ_Dashboard.png" width="800" alt="ContextIQ savings dashboard">
+</p>
+
 ---
 
 ## Model-agnostic — works with any LLM, including local models (no API key)
