@@ -82,6 +82,8 @@ the default and fallback.
 
 To ship binaries / publish, run `tokengraph dist` (CI release workflow, Dockerfile,
 Homebrew formula, `install.sh`) and `tokengraph freeze --build` for a local binary.
+Maintainers: the full release process (build → PyPI → tag → DOI) is in
+[CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainers).
 
 > **Recommended: use a virtualenv.** FastMCP pulls in `starlette`/`cryptography`, which can conflict with other globally-installed packages. Isolating ContextIQ avoids that:
 > ```bash
