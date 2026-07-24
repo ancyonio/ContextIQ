@@ -3930,6 +3930,91 @@ class RepomixInteropTests(unittest.TestCase):
         self.assertIn("def f()", blocks[0][1])
 
 
+class DocsDriftTests(unittest.TestCase):
+    """CI gate against README claims drifting from the code.
+
+    A manual audit once found the README asserting "131 tests" and "50 tools"
+    when the code had grown well past both. The README now uses soft floors
+    ("300+ tests", "50+ tools") on purpose; this test proves the real counts
+    stay at or above the documented floor, and that every CLI subcommand the
+    README shows is a real parser choice. It runs in the normal `pytest` CI job,
+    so a stale number or a removed/renamed command fails the build.
+    """
+
+    _ROOT = Path(tg.__file__).resolve().parent
+    _README = _ROOT / "README.md"
+    _SRC = _ROOT / "tokengraph_all.py"
+    _TESTS = Path(__file__).resolve()
+
+    def _readme(self) -> str:
+        return self._README.read_text(encoding="utf-8")
+
+    def test_documented_mcp_tool_count_floor_holds(self):
+        m = re.search(r"MCP server\*{0,2}\s*\((\d+)\+?\s*tools\)", self._readme())
+        self.assertIsNotNone(m, "README no longer states an MCP tool count")
+        claimed = int(m.group(1))
+        actual = len(re.findall(r"@mcp\.tool\b",
+                                self._SRC.read_text(encoding="utf-8")))
+        self.assertGreaterEqual(
+            actual, claimed,
+            f"README claims {claimed}+ MCP tools but only {actual} @mcp.tool "
+            f"registrations exist — update the README count.")
+
+    def test_documented_test_count_floor_holds(self):
+        m = re.search(r"\*\*(\d+)\+?\s*tests\b", self._readme())
+        self.assertIsNotNone(m, "README no longer states a test count")
+        claimed = int(m.group(1))
+        actual = len(re.findall(r"^\s{4}def test_\w+\(",
+                                self._TESTS.read_text(encoding="utf-8"), re.M))
+        self.assertGreaterEqual(
+            actual, claimed,
+            f"README claims {claimed}+ tests but only {actual} test methods "
+            f"exist — update the README count.")
+
+    @staticmethod
+    def _documented_subcommands(text: str) -> set[str]:
+        """Subcommands the README shows via `python … tokengraph_all.py <cmd>`.
+
+        Anchored on `python` + the script so prose mentions of the filename
+        (markdown links, "keep the script …") are never mistaken for commands.
+        `--path` (the one global flag) and its value are skipped, matching how
+        argparse consumes the line.
+        """
+        import shlex
+        cmds: set[str] = set()
+        for m in re.finditer(
+                r"python\b[^\n]*?tokengraph_all\.py[\"']?\s+([^\n]+)", text):
+            rest = m.group(1)
+            try:
+                toks = shlex.split(rest, posix=True)
+            except ValueError:
+                toks = rest.split()
+            i = 0
+            while i < len(toks):
+                if toks[i].startswith("-"):
+                    i += 2 if toks[i] in ("--path", "-p") else 1
+                    continue
+                cand = toks[i].strip("'\"`,.()[]{}")
+                if re.fullmatch(r"[a-z][a-z0-9-]+", cand):
+                    cmds.add(cand)
+                break
+        return cmds
+
+    def test_documented_subcommands_are_real_parser_choices(self):
+        import argparse
+        parser = tg.build_parser()
+        sub = next(a for a in parser._actions
+                   if isinstance(a, argparse._SubParsersAction))
+        valid = set(sub.choices)
+        documented = self._documented_subcommands(self._readme())
+        self.assertTrue(documented, "extractor found no documented subcommands")
+        unknown = documented - valid
+        self.assertFalse(
+            unknown,
+            f"README documents CLI subcommand(s) with no parser entry: "
+            f"{sorted(unknown)} — fix the docs or the parser.")
+
+
 if __name__ == "__main__":
     unittest.main()
 

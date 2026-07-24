@@ -10,7 +10,7 @@ A local, single-file **AST code graph** that gives AI coding agents token-effici
 The graph **auto-refreshes on every query**, so it never goes stale — even right after an edit.
 
 - **One file, zero required dependencies** to run the CLI ([tokengraph_all.py](tokengraph_all.py)).
-- Works as an **MCP server** (50 tools) for MCP-capable clients, with one-command wiring for VS Code / Cursor / Windsurf / Zed / Claude Code and locally generated plugin projects for VS Code / Neovim / JetBrains. Marketplace publication remains a separate release step.
+- Works as an **MCP server** (50+ tools) for MCP-capable clients, with one-command wiring for VS Code / Cursor / Windsurf / Zed / Claude Code and locally generated plugin projects for VS Code / Neovim / JetBrains. Marketplace publication remains a separate release step.
 - **Deep parsing with a full call / import / inheritance graph for 25+ languages** — **Python** (stdlib `ast`) and, via tree-sitter, **Java / Go / TypeScript / JavaScript / C / C++ / C# / Rust / PHP / Ruby / Kotlin / Swift / Scala / Lua / Bash / Solidity / Perl / Erlang / Julia / R / Haskell / OCaml / Nim / PowerShell / Dart**. Plus lightweight regex indexing for **30+ more languages** — SQL / Elixir / Clojure / F# / Groovy / Zig / Crystal / Haxe / Objective-C / Visual Basic / Tcl / Pascal / GDScript and markup/config (Vue, Svelte, HTML, CSS, YAML, TOML, XML, INI, GraphQL, Terraform, Protobuf, **Markdown**, Dockerfile, …). Every deep-parsed language falls back to regex when its grammar isn't installed. Run `python tokengraph_all.py langs` to list them all.
 - **Grounded creation & guardrails** — close the loop from *retrieval* to *safe code generation*: detect house **`conventions`** (and **`conventions --fix`** to auto-rename outliers to house style), **`scaffold`** convention-matched files, **`verify-plan`** / **`verify-output`** to flag fabricated files / symbols / local imports, **`review`** a diff for scope-drift, hub-edits, missing tests and breaking changes, and **`create`** to orchestrate them through a gated pipeline.
 - **Realized-savings ledger** — every `context` / `ask` / `measure` / `generate` call (and the MCP context tool) appends its pack-vs-whole-file delta to a privacy-safe, count-only ledger. **`gain`** rolls it up into a token + **dollar** report with `--since` windows, per-op breakdown, daily/weekly/monthly trends, and a self-contained **`--html`** dashboard. **`status`** gives a one-line repo snapshot (branch / dirty / index freshness / notes / cumulative savings).
@@ -455,13 +455,15 @@ Both clients launch `python tokengraph_all.py serve` over stdio and call the sam
     "tokengraph": {
       "type": "stdio",
       "command": "python",
-      "args": ["d:/05. TECHNICAL/ContextIQ/tokengraph_all.py", "serve"],
-      "env": { "TOKENGRAPH_ROOT": "." }
+      "args": ["tokengraph_all.py", "serve"],
+      "env": { "TOKENGRAPH_ROOT": ".", "TOKENGRAPH_EMBEDDINGS": "off" }
     }
   }
 }
 ```
-Claude Code auto-detects `.mcp.json` and prompts to trust the server.
+The relative `tokengraph_all.py` + `TOKENGRAPH_ROOT: "."` resolves against the
+project the client launches the server in, so the same config is portable across
+repos. Claude Code auto-detects `.mcp.json` and prompts to trust the server.
 
 ### GitHub Copilot (agent mode) — [.vscode/mcp.json](.vscode/mcp.json)
 ```json
@@ -470,16 +472,16 @@ Claude Code auto-detects `.mcp.json` and prompts to trust the server.
     "tokengraph": {
       "type": "stdio",
       "command": "python",
-      "args": ["d:/05. TECHNICAL/ContextIQ/tokengraph_all.py", "serve"],
-      "env": { "TOKENGRAPH_ROOT": "${workspaceFolder}" }
+      "args": ["tokengraph_all.py", "serve"],
+      "env": { "TOKENGRAPH_ROOT": "${workspaceFolder}", "TOKENGRAPH_EMBEDDINGS": "off" }
     }
   }
 }
 ```
 In VS Code 1.102+, open the file and click **Start** on the server (or reload the window).
 
-> Using a venv? Change `"command": "python"` to the venv interpreter, e.g.
-> `"d:/05. TECHNICAL/ContextIQ/.venv/Scripts/python.exe"`.
+> Using a venv? Change `"command": "python"` to the venv interpreter by absolute
+> path, e.g. `".venv/Scripts/python.exe"` (Windows) or `.venv/bin/python`.
 > `TOKENGRAPH_ROOT` sets the repo root the server indexes (honored by `--path`).
 
 ### Tools the server exposes
@@ -643,7 +645,7 @@ python -m pytest -q                              # or: python -m unittest tests.
 
 The suite lives in [tests/](tests/); `pyproject.toml` sets `pythonpath = ["."]` so the single-file `tokengraph_all` module stays importable from there.
 
-**131 tests.** The core suite uses only the standard library; optional integration
+**300+ tests.** The core suite uses only the standard library; optional integration
 tests exercise FastMCP when installed. Coverage includes incremental cross-file edge
 retention, hard serialized token budgets, offline/privacy behavior, targeted indexing,
 corpus benchmarking, multi-root editor wiring, real MCP client calls, dashboard ledger
@@ -676,15 +678,18 @@ Each case declares the symbols and literal facts an answer would need. A pack is
 
 | Metric | Measured | Floor (CI) | Meaning |
 |---|--:|--:|---|
-| `recall_at_5` | **0.958** | 0.90 | the right file is in the top 5 |
-| `symbol_recall` | **0.708** | 0.65 | required symbols made it into the pack |
-| `answerable_rate` | **0.469** | 0.45 | pack carried *every* required symbol **and** fact |
-| `irrelevant_token_ratio` | 0.743 | ≤0.85 | budget spent on neither a target file nor anything graph-connected to a target symbol |
+| `recall_at_5` | **1.0** | 0.90 | the right file is in the top 5 |
+| `symbol_recall` | **0.745** | 0.65 | required symbols made it into the pack |
+| `answerable_rate` | **0.584** | 0.45 | pack carried *every* required symbol **and** fact |
+| `irrelevant_token_ratio` | 0.672 | ≤0.85 | budget spent on neither a target file nor anything graph-connected to a target symbol |
 
-Measured at the default 6,000-token budget on the deterministic hash backend.
+Measured on the deterministic hash backend. These figures track the latest run in
+[benchmarks/REPORT.md](benchmarks/REPORT.md) (the content-hashed source of truth,
+regenerated by `publish-benchmark`); consult it — not this table — for the
+current per-corpus breakdown.
 
-**Read this honestly:** ContextIQ nearly always finds the right *file*, but at a
-6k budget it carries everything an answer needs under half the time. Raising
+**Read this honestly:** ContextIQ nearly always finds the right *file*, but it
+carries everything an answer needs a little over half the time. Raising
 `answerable_rate` is the main open quality work. Give it a larger budget, or call
 `get_symbol` for anything the pack lists as dropped.
 

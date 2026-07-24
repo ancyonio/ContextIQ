@@ -7159,6 +7159,12 @@ def _scan_todos(root: Path, files: list[str], cap: int = 10) -> list[str]:
                     encoding="utf-8", errors="replace").splitlines(), 1):
                 m = rx.search(line)
                 if m:
+                    prefix = line[:m.start()]
+                    # Skip a marker that sits inside a string literal (test
+                    # fixtures, log messages): an odd count of quotes before it
+                    # means the match is quoted content, not a source comment.
+                    if (prefix.count('"') + prefix.count("'")) % 2 == 1:
+                        continue
                     hits.append(f"{f}:{i} {m.group(1)} {m.group(2).strip()}")
                     if len(hits) >= cap:
                         return hits
@@ -7215,11 +7221,18 @@ def build_context_payload(r: "Retriever", root: Path, *, strategy: str,
     # now sits in front of the cache breakpoint.
     volatile: list[str] = []
     if enrich.get("changes", True):
-        recent = git_recent_files(root, hot_commits)[:10]
+        # git reports recently-touched paths from history; drop any that no
+        # longer exist on disk so a deleted file (e.g. docs/Comparison.md) is
+        # not surfaced as current context.
+        recent = [x for x in git_recent_files(root, hot_commits)
+                  if (root / x).exists()][:10]
         if recent:
             volatile += ["## Recently changed", ", ".join(f"`{x}`" for x in recent), ""]
     if enrich.get("todos", True):
-        todos = _scan_todos(root, files)
+        # Scan only code files: a markdown file's TODO/FIXME are prose (and a
+        # generated steering doc lists "TODO / FIXME" as a section heading, which
+        # would make the scan re-catch its own output every run).
+        todos = _scan_todos(root, [f for f in files if _skeleton_injectable(f)])
         if todos:
             volatile += ["## TODO / FIXME", *[f"- {t}" for t in todos], ""]
 
