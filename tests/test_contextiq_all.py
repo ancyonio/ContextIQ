@@ -15,6 +15,10 @@ import re
 import threading
 import time
 import unittest
+import unittest.mock  # noqa: F401 — several tests use unittest.mock.* without
+                      # importing it themselves; make it available regardless of
+                      # test execution order (pytest doesn't guarantee the test
+                      # that first imports it runs first).
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -1783,7 +1787,13 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         self.assertIn("uv", sh)
 
     def test_pyproject_langpack_extra_present(self):
-        import tomllib
+        try:
+            import tomllib  # stdlib on 3.11+
+        except ModuleNotFoundError:  # 3.10 and earlier
+            try:
+                import tomli as tomllib
+            except ModuleNotFoundError:
+                self.skipTest("no TOML parser (tomllib/tomli) on this Python")
         with open(_PYPROJECT, "rb") as f:
             pp = tomllib.load(f)
         extras = pp["project"]["optional-dependencies"]

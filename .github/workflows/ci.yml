@@ -27,6 +27,11 @@ env:
   # Keep CI on the deterministic hash backend: identical scores on every
   # runner, no model download, no network dependency in the gate.
   TOKENGRAPH_EMBEDDINGS: "off"
+  # Suppress the savings ledger / usage report for the CLI-invoking jobs so they
+  # don't scribble .context/ into the checked-out repo. Deliberately NOT set for
+  # the `test` job: the unit tests exercise the tracking + report code paths and
+  # would be silently no-op'd (empty ledger, missing report) if tracking were
+  # off. Tests that need it off set it themselves via os.environ.
   TOKENGRAPH_NO_TRACK: "1"
 
 jobs:
@@ -57,6 +62,12 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Unit tests
+        # Re-enable tracking here: the ledger/report tests assert that normal
+        # retrieval writes .context/gain.ndjson and .tokengraph/token-usage.html,
+        # which the workflow-level TOKENGRAPH_NO_TRACK=1 would otherwise disable.
+        # (All these tests use temp dirs, so nothing lands in the repo checkout.)
+        env:
+          TOKENGRAPH_NO_TRACK: ""
         run: python -m pytest tests/ -q
 
   quality-gate:
