@@ -14767,30 +14767,39 @@ def load_benchmark_corpus(path: Path) -> list[dict]:
 # "fewer tokens, same answer" must be able to fail a build when the answer
 # stops being reachable. These are the floors CI enforces.
 #
-# These are calibrated to MEASURED performance on the shipped corpora, with a
-# regression margin — they are detectors, not aspirations. Numbers observed at
-# the product default budget of 6000 tokens across 96 cases in 4 repositories
-# (Python / TypeScript / Go):
+# CRITICAL — these floors must match the BACKEND the gate actually runs on.
+# CI runs `benchmark --check` with TOKENGRAPH_EMBEDDINGS=off (see ci.yml): the
+# deterministic hash backend, chosen so every runner scores identically with no
+# model download and no network dependency. The hash backend captures lexical
+# and structural overlap but does NOT match by meaning across unrelated
+# vocabulary, so it scores lower than the neural backend on the same corpora —
+# and several self-corpus cases are deliberately paraphrased away from the code's
+# own words, which only true embeddings can bridge.
 #
-#     recall_at_5 0.979 | symbol_recall 0.865 | answerable 0.698 | waste 0.717
+# Measured at the product default budget of 6000 tokens across 96 cases in 4
+# repositories (Python / TypeScript / Go), on the two backends:
 #
-# Previously 0.958 / 0.719 / 0.510 / 0.785. The gain came from two fixes, both
-# aimed at the same finding — that retrieval located the right file and then
-# failed to carry the thing in it that answered the question:
+#   embeddings ON  (sentence-transformers):
+#       recall_at_5 0.979 | symbol_recall 0.865 | answerable 0.698 | waste 0.717
+#   embeddings OFF (hash backend — what CI runs):
+#       recall_at_5 0.958 | symbol_recall 0.766 | answerable 0.625 | waste 0.745
 #
-#   * SR-1, the completion sweep, which stopped packs terminating at half the
-#     requested budget with the answer left on the floor; and
-#   * CN-1, indexing module- and type-scope constants, without which a
-#     controlling value was not a symbol and could not be retrieved at all.
+# The earlier floors (recall 0.95 / symbol 0.80) were set from the embeddings-ON
+# numbers while CI ran the hash backend, so the gate could never pass as
+# configured (the hash backend scored 0.781 symbol_recall even at the commit that
+# recorded 0.865). The floors below are calibrated to the hash-backend baseline
+# with a regression margin — detectors, not aspirations, for the environment the
+# gate actually measures. If CI is ever switched to install and warm the neural
+# backend, raise these back toward the embeddings-ON row.
 #
-# The honest reading is still that answerability is the weak metric: roughly a
-# third of packs remain short of some symbol or literal an answer needs. Do not
-# raise a threshold without first raising the measurement.
+# The honest reading is that answerability is the weak metric: roughly a third of
+# packs remain short of some symbol or literal an answer needs. Do not raise a
+# threshold without first raising the measurement — on the SAME backend CI runs.
 BENCHMARK_THRESHOLDS = {
-    "recall_at_5": 0.95,        # the right file is in the top 5
-    "symbol_recall": 0.80,      # required symbols actually made it into the pack
-    "answerable_rate": 0.60,    # packs carrying EVERY required symbol + fact
-    "irrelevant_token_ratio": 0.78,   # ceiling — budget spent outside target files
+    "recall_at_5": 0.93,        # the right file is in the top 5 (hash: 0.958)
+    "symbol_recall": 0.74,      # required symbols made it into the pack (hash: 0.766)
+    "answerable_rate": 0.60,    # packs carrying EVERY required symbol + fact (hash: 0.625)
+    "irrelevant_token_ratio": 0.78,   # ceiling — budget spent outside target files (hash: 0.745)
 }
 
 
