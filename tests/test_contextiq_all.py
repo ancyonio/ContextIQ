@@ -953,8 +953,13 @@ class NewLanguageTests(unittest.TestCase):
         try:
             self.assertIsNotNone(store.symbol_by_qname("svc.greet"))
             self.assertIsNotNone(store.symbol_by_qname("app.run"))
-            # solidity is now deep-parsed: the function nests under its contract
-            self.assertIsNotNone(store.symbol_by_qname("token.Token.mint"))
+            if ".sol" in tg.build_profiles():
+                # deep-parsed: the function nests under its contract
+                self.assertIsNotNone(store.symbol_by_qname("token.Token.mint"))
+            else:
+                # regex fallback without the solidity grammar: flat symbols
+                self.assertIsNotNone(store.symbol_by_qname("token.Token"))
+                self.assertIsNotNone(store.symbol_by_qname("token.mint"))
             self.assertIsNotNone(store.symbol_by_qname("README.Setup"))
         finally:
             store.close()
