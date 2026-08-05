@@ -1684,17 +1684,30 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         self.assertIn("Not reported", md)
 
     # ---- IDE integration: one-command MCP wiring for every editor ----
-    def test_ide_setup_writes_editor_configs(self):
-        import json
+    def test_ide_setup_defaults_to_claude_and_vscode(self):
+        # The default set is deliberately narrow so a run does not scatter
+        # config folders for editors the repo may never open.
         res = tg.ide_setup(self.root)
-        # Windsurf is deliberately NOT here: it reads MCP config only from
-        # ~/.codeium/windsurf/mcp_config.json, so a project-local
-        # .windsurf/mcp.json is a file nothing ever reads. It is reported
-        # under global_pending instead and written only with --global.
+        self.assertEqual(set(res["written"]),
+                         {".mcp.json", ".vscode/mcp.json"})
+        self.assertEqual(set(res["editors"]), {"claude", "vscode"})
+        # No opt-in editor folders were created unprompted.
+        self.assertFalse((self.root / ".cursor").exists())
+        self.assertFalse((self.root / ".zed").exists())
+        self.assertFalse((self.root / ".idea").exists())
+        self.assertFalse((self.root / ".nvim").exists())
+        # Per-user hosts are not nagged about on a default run.
+        self.assertEqual(res["global_pending"], [])
+
+    def test_ide_setup_all_wires_every_editor(self):
+        import json
+        res = tg.ide_setup(self.root, all_editors=True)
         self.assertEqual(set(res["written"]),
                          {".mcp.json", ".vscode/mcp.json", ".cursor/mcp.json",
                           ".zed/settings.json", ".idea/mcp.xml",
-                          ".nvim/contextiq.lua"})
+                          ".nvim/contextiq.lua", ".gemini/settings.json",
+                          ".roo/mcp.json", "opencode.json",
+                          ".continue/config.yaml"})
         self.assertIn("windsurf", {g["host"] for g in res["global_pending"]})
         # each config is valid JSON wiring the tokengraph server
         vsc = json.loads((self.root / ".vscode" / "mcp.json").read_text("utf-8"))
@@ -1704,6 +1717,27 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         zed = json.loads((self.root / ".zed" / "settings.json").read_text("utf-8"))
         self.assertIn("tokengraph", zed["context_servers"])
         self.assertIn("mcphub", res["neovim_snippet"])
+
+    def test_ide_setup_auto_includes_detected_editor(self):
+        # A repo that already uses Cursor gets it wired without a flag.
+        (self.root / ".cursor").mkdir()
+        res = tg.ide_setup(self.root)
+        self.assertIn("cursor", res["editors"])
+        self.assertIn(".cursor/mcp.json", res["written"])
+
+    def test_ide_setup_config_pins_editor_set(self):
+        cfg = {"ide": {"editors": ["claude", "cursor"]}}
+        res = tg.ide_setup(self.root, config=tg._deep_merge(
+            tg.DEFAULTS_CONFIG, cfg))
+        self.assertEqual(set(res["editors"]), {"claude", "cursor"})
+        self.assertEqual(set(res["written"]),
+                         {".mcp.json", ".cursor/mcp.json"})
+
+    def test_ide_setup_plan_lists_files_without_writing(self):
+        plan = tg.ide_setup_plan(self.root, ["claude", "vscode"])
+        self.assertEqual(set(plan["mcp_files"]),
+                         {".mcp.json", ".vscode/mcp.json"})
+        self.assertFalse((self.root / ".mcp.json").exists())
 
     def test_ide_setup_is_non_destructive(self):
         import json
@@ -2906,7 +2940,7 @@ class IdeWiringTests(_RepoCase):
     """Table 2: config shapes each host actually parses."""
 
     def test_ide_setup_writes_correct_shapes(self):
-        res = tg.ide_setup(self.root)
+        res = tg.ide_setup(self.root, all_editors=True)
         cfg = json.loads((self.root / ".mcp.json").read_text(encoding="utf-8"))
         self.assertIn("tokengraph", cfg["mcpServers"])
         vs = json.loads((self.root / ".vscode" / "mcp.json").read_text(encoding="utf-8"))
@@ -2919,7 +2953,7 @@ class IdeWiringTests(_RepoCase):
         self.assertIn("written", res)
 
     def test_global_only_hosts_are_reported_not_silently_written(self):
-        res = tg.ide_setup(self.root)
+        res = tg.ide_setup(self.root, all_editors=True)
         hosts = {g["host"] for g in res["global_pending"]}
         self.assertIn("windsurf", hosts)
         self.assertIn("cline", hosts)
@@ -3420,13 +3454,13 @@ class JudgeHarnessTests(unittest.TestCase):
 
 class JetBrainsNvimTests(_RepoCase):
     def test_jetbrains_xml_is_written_and_idempotent(self):
-        tg.ide_setup(self.root)
+        tg.ide_setup(self.root, editors=["jetbrains"])
         p = self.root / ".idea" / "mcp.xml"
         self.assertTrue(p.exists())
         text = p.read_text(encoding="utf-8")
         self.assertIn('name="tokengraph"', text)
         self.assertIn("McpServerSettings", text)
-        tg.ide_setup(self.root)
+        tg.ide_setup(self.root, editors=["jetbrains"])
         self.assertEqual(
             p.read_text(encoding="utf-8").count('name="tokengraph"'), 1)
 
@@ -3438,13 +3472,13 @@ class JetBrainsNvimTests(_RepoCase):
                      '<servers><server name="other">'
                      '<option name="command" value="x" /></server></servers>'
                      '</component></project>\n', encoding="utf-8")
-        tg.ide_setup(self.root)
+        tg.ide_setup(self.root, editors=["jetbrains"])
         text = p.read_text(encoding="utf-8")
         self.assertIn('name="other"', text)
         self.assertIn('name="tokengraph"', text)
 
     def test_nvim_lua_is_written_and_parseable_shape(self):
-        tg.ide_setup(self.root)
+        tg.ide_setup(self.root, editors=["nvim"])
         p = self.root / ".nvim" / "contextiq.lua"
         self.assertTrue(p.exists())
         text = p.read_text(encoding="utf-8")
@@ -4458,6 +4492,452 @@ class SuggestionClosureTests(unittest.TestCase):
                            "--job", "ciq"])
         self.assertEqual(ns.push_gateway, "http://localhost:9091")
         self.assertEqual(ns.job, "ciq")
+
+
+class GraphExportTests(_RepoCase):
+    """GX-1: the SQLite graph must survive the trip into external tools.
+
+    Every format is checked with a real parser where the stdlib has one
+    (json, minidom for GraphML) and by structure otherwise, because a graph
+    export that only *looks* right is worthless — it is consumed by Neo4j and
+    Graphviz, not by a human.
+    """
+
+    REPO = {
+        "pkg/core.py": (
+            'def helper(x):\n'
+            '    """Double a number."""\n'
+            '    return x * 2\n\n\n'
+            'class Base:\n'
+            '    def run(self):\n'
+            '        return helper(1)\n'),
+        "pkg/app.py": (
+            'from pkg.core import Base, helper\n\n\n'
+            'class App(Base):\n'
+            '    def start(self):\n'
+            '        return helper(2) + helper(3)\n'),
+    }
+
+    def _snapshot(self, **kw):
+        for rel, text in self.REPO.items():
+            _write(self.root, rel, text)
+        tg.index_repo(self.root, self.db)
+        store = tg.Store(self.db)
+        self.addCleanup(store.close)
+        return tg.graph_snapshot(store, **kw)
+
+    def test_symbol_level_carries_nodes_edges_and_degrees(self):
+        snap = self._snapshot(level="symbol")
+        keys = {n["key"] for n in snap["nodes"]}
+        self.assertIn("pkg.core.helper", keys)
+        self.assertIn("pkg.app.App.start", keys)
+        by_key = {n["key"]: n for n in snap["nodes"]}
+        helper = by_key["pkg.core.helper"]
+        self.assertEqual(helper["kind"], "function")
+        self.assertEqual(helper["file"], "pkg/core.py")
+        self.assertEqual(helper["tier"], "ast")          # python -> stdlib ast
+        self.assertGreater(helper["fan_in"], 0)          # called from both files
+        self.assertIn(("pkg.app.App.start", "pkg.core.helper", "CALLS"),
+                      {(e["src"], e["dst"], e["type"]) for e in snap["edges"]})
+        self.assertEqual(snap["meta"]["nodes"], len(snap["nodes"]))
+        self.assertEqual(snap["meta"]["level"], "symbol")
+        self.assertEqual(snap["meta"]["node_label"], "Symbol")
+
+    def test_weight_is_one_per_symbol_edge_and_aggregates_above(self):
+        """`edges` is UNIQUE(src,dst,type), so weight only means something once
+        edges are collapsed onto a container."""
+        sym = self._snapshot(level="symbol", edge_types="CALLS")
+        self.assertEqual({e["weight"] for e in sym["edges"]}, {1})
+        files = self._snapshot(level="file", edge_types="CALLS")
+        edge = next(e for e in files["edges"]
+                    if e["src"] == "pkg/app.py" and e["dst"] == "pkg/core.py")
+        # App.start -> helper and App(inherited run) -> helper both cross here
+        self.assertGreaterEqual(edge["weight"], 1)
+        self.assertEqual(
+            edge["weight"],
+            sum(1 for e in sym["edges"]
+                if e["src"].startswith("pkg.app.") and e["dst"].startswith("pkg.core.")))
+
+    def test_file_level_collapses_edges_and_drops_self_loops(self):
+        snap = self._snapshot(level="file")
+        keys = {n["key"] for n in snap["nodes"]}
+        self.assertIn("pkg/core.py", keys)
+        self.assertIn("pkg/app.py", keys)
+        self.assertFalse([e for e in snap["edges"] if e["src"] == e["dst"]],
+                         "intra-file edges must collapse away, not self-loop")
+        cross = [e for e in snap["edges"]
+                 if e["src"] == "pkg/app.py" and e["dst"] == "pkg/core.py"]
+        self.assertTrue(cross)
+        node = next(n for n in snap["nodes"] if n["key"] == "pkg/core.py")
+        self.assertEqual(node["kind"], "file")
+        self.assertGreater(node["tokens"], 0)            # file nodes carry cost
+
+    def test_module_level_aggregates_to_top_directories(self):
+        snap = self._snapshot(level="module")
+        self.assertEqual({n["key"] for n in snap["nodes"]}, {"pkg"})
+        self.assertEqual(snap["meta"]["node_label"], "Module")
+        node = snap["nodes"][0]
+        self.assertEqual(node["files"], 2)
+        self.assertGreater(node["symbols"], 0)
+
+    def test_edge_type_filter_restricts_the_graph(self):
+        snap = self._snapshot(level="symbol", edge_types="INHERITS")
+        self.assertEqual(snap["meta"]["edge_types"], ["INHERITS"])
+        self.assertIn(("pkg.app.App", "pkg.core.Base"),
+                      {(e["src"], e["dst"]) for e in snap["edges"]})
+
+    def test_kind_filter_restricts_nodes(self):
+        snap = self._snapshot(level="symbol", kinds="class")
+        self.assertTrue(snap["nodes"])
+        self.assertEqual({n["kind"] for n in snap["nodes"]}, {"class"})
+
+    def test_max_nodes_keeps_top_degree_and_reports_the_cut(self):
+        full = self._snapshot(level="symbol")
+        snap = self._snapshot(level="symbol", max_nodes=2)
+        self.assertEqual(len(snap["nodes"]), 2)
+        t = snap["meta"]["truncated"]
+        self.assertEqual(t["limit"], 2)
+        self.assertEqual(t["nodes_dropped"], len(full["nodes"]) - 2)
+        self.assertEqual(t["kept_by"], "degree")
+        # every surviving edge still has both endpoints in the node set
+        keys = {n["key"] for n in snap["nodes"]}
+        for e in snap["edges"]:
+            self.assertIn(e["src"], keys)
+            self.assertIn(e["dst"], keys)
+
+    def test_export_is_deterministic(self):
+        """Two exports of one index must be byte-identical, so they diff."""
+        snap = self._snapshot(level="symbol")
+        store = tg.Store(self.db)
+        self.addCleanup(store.close)
+        again = tg.graph_snapshot(store, level="symbol")
+        for fmt in tg.GRAPH_EXPORT_FORMATS:
+            self.assertEqual(tg.render_graph_export(snap, fmt),
+                             tg.render_graph_export(again, fmt), fmt)
+
+    def test_json_format_round_trips(self):
+        snap = self._snapshot(level="file")
+        back = json.loads(tg.render_graph_export(snap, "json"))
+        self.assertEqual(back["meta"]["nodes"], len(back["nodes"]))
+        self.assertEqual(back["nodes"], snap["nodes"])
+
+    def test_dot_is_wellformed_and_escapes(self):
+        _write(self.root, "q.py", 'def q(x=\'a"b\\\\c\'):\n    return x\n')
+        snap = self._snapshot(level="symbol")
+        dot = tg.render_graph_export(snap, "dot")
+        self.assertTrue(dot.startswith("//"))
+        self.assertIn("digraph contextiq {", dot)
+        self.assertEqual(dot.count("{"), dot.count("}"))
+        self.assertIn("->", dot)
+        # Every attribute line must have balanced quoting once the escapes are
+        # removed — an unescaped " inside a value would leave an odd count and
+        # break the parser at exactly the symbol with a quote in its signature.
+        for line in dot.splitlines():
+            if "[" in line and "=" in line:
+                bare = line.replace("\\\\", "").replace('\\"', "")
+                self.assertEqual(bare.count('"') % 2, 0, line)
+        self.assertNotIn('a"b', dot)                   # the raw quote is escaped
+
+    def test_graphml_parses_and_declares_every_attribute(self):
+        import xml.dom.minidom
+        snap = self._snapshot(level="symbol")
+        doc = xml.dom.minidom.parseString(tg.render_graph_export(snap, "graphml"))
+        self.assertEqual(len(doc.getElementsByTagName("node")), len(snap["nodes"]))
+        self.assertEqual(len(doc.getElementsByTagName("edge")), len(snap["edges"]))
+        declared = {k.getAttribute("attr.name")
+                    for k in doc.getElementsByTagName("key")}
+        self.assertEqual(declared,
+                         {n for n, _t in tg._GRAPH_NODE_ATTRS} |
+                         {n for n, _t in tg._GRAPH_EDGE_ATTRS})
+
+    def test_graphml_escapes_markup_in_signatures(self):
+        import xml.dom.minidom
+        _write(self.root, "g.py", "def g(x: 'list<int> & more') -> str:\n    return ''\n")
+        snap = self._snapshot(level="symbol")
+        xml_text = tg.render_graph_export(snap, "graphml")
+        xml.dom.minidom.parseString(xml_text)     # would raise on raw < or &
+        self.assertNotIn("<int>", xml_text)
+
+    def test_cypher_is_rerunnable_and_escapes_quotes(self):
+        _write(self.root, "s.py", 'def s(msg="it\'s here"):\n    return msg\n')
+        snap = self._snapshot(level="symbol")
+        cy = tg.render_graph_export(snap, "cypher")
+        self.assertIn("CREATE CONSTRAINT", cy)
+        self.assertIn("REQUIRE n.key IS UNIQUE", cy)
+        self.assertIn("MERGE (n:Symbol {key: row.key})", cy)
+        self.assertIn("MERGE (a)-[r:CALLS]->(b)", cy)
+        self.assertNotIn("CREATE (n:", cy)        # MERGE only: safe to re-run
+        self.assertIn("\\'", cy)                  # the apostrophe was escaped
+        # every map literal is balanced, and no statement is left unterminated
+        self.assertEqual(cy.count("UNWIND ["), cy.count("] AS row"))
+
+    def test_cypher_relationship_type_is_a_safe_identifier(self):
+        self.assertEqual(tg._cypher_rel_type("CALLS"), "CALLS")
+        self.assertEqual(tg._cypher_rel_type("has-ref"), "HAS_REF")
+        self.assertEqual(tg._cypher_rel_type("1st"), "R_1ST")
+        self.assertEqual(tg._cypher_rel_type(""), "RELATED")
+
+    def test_signatures_are_secret_scanned(self):
+        _write(self.root, "leak.py",
+               "def connect(token='ghp_abcdefghijklmnopqrstuvwxyz0123'):\n"
+               "    return token\n")
+        snap = self._snapshot(level="symbol")
+        sig = next(n["signature"] for n in snap["nodes"]
+                   if n["key"] == "leak.connect")
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123", sig)
+        self.assertIn("[REDACTED]", sig)
+
+    def test_unknown_level_and_format_are_refused(self):
+        store = tg.Store(self.db)
+        self.addCleanup(store.close)
+        with self.assertRaises(ValueError):
+            tg.graph_snapshot(store, level="galaxy")
+        with self.assertRaises(ValueError):
+            tg.render_graph_export({"meta": {}, "nodes": [], "edges": []}, "svg")
+
+    def test_cli_writes_a_file_and_reports_counts(self):
+        for rel, text in self.REPO.items():
+            _write(self.root, rel, text)
+        out = self.root / "out" / "graph.dot"
+        parser = tg.build_parser()
+        args = parser.parse_args(["--path", str(self.root), "export",
+                                  "--format", "dot", "--level", "file",
+                                  "-o", str(out)])
+        args.func(args)
+        self.assertTrue(out.exists())
+        self.assertIn("digraph contextiq {", out.read_text(encoding="utf-8"))
+
+    def test_export_graph_helper_returns_text_and_meta(self):
+        for rel, text in self.REPO.items():
+            _write(self.root, rel, text)
+        tg.index_repo(self.root, self.db)
+        text, meta = tg.export_graph(self.root, fmt="json", level="module")
+        self.assertEqual(json.loads(text)["meta"], meta)
+        self.assertEqual(meta["level"], "module")
+
+
+class GraphLayoutTests(unittest.TestCase):
+    """GX-2 layout: the failure modes here are visual, so they are asserted."""
+
+    W, H = 920, 520
+
+    @staticmethod
+    def _nodes(*keys):
+        return [{"key": k, "label": k, "kind": "file", "language": "python",
+                 "tier": "ast", "tokens": 100, "files": 1, "symbols": 3,
+                 "fan_in": 0, "fan_out": 0} for k in keys]
+
+    @staticmethod
+    def _edges(*pairs):
+        return [{"src": s, "dst": d, "type": "CALLS", "weight": 1}
+                for s, d in pairs]
+
+    def test_components_are_found_and_ordered_largest_first(self):
+        comps = tg._graph_components(6, [(0, 1), (1, 2), (3, 4)])
+        self.assertEqual([len(c) for c in comps], [3, 2, 1])
+        self.assertEqual(comps[0], [0, 1, 2])
+
+    def test_every_node_lands_inside_the_canvas(self):
+        nodes = self._nodes(*[f"n{i}" for i in range(24)])
+        edges = self._edges(*[(f"n{i}", f"n{i + 1}") for i in range(11)])
+        tg._graph_layout(nodes, edges, width=self.W, height=self.H)
+        for n in nodes:
+            self.assertGreaterEqual(n["x"], 0, n["key"])
+            self.assertGreaterEqual(n["y"], 0, n["key"])
+            self.assertLessEqual(n["x"], self.W, n["key"])
+            self.assertLessEqual(n["y"], self.H, n["key"])
+
+    def test_a_wide_component_cannot_overflow_the_canvas(self):
+        """A long chain solves to a very wide box; packing must scale it down."""
+        keys = [f"c{i}" for i in range(20)]
+        nodes = self._nodes(*keys)
+        edges = self._edges(*[(keys[i], keys[i + 1]) for i in range(19)])
+        tg._graph_layout(nodes, edges, width=self.W, height=self.H)
+        self.assertLessEqual(max(n["x"] for n in nodes), self.W)
+
+    def test_layout_is_deterministic(self):
+        keys = [f"n{i}" for i in range(15)]
+        edges = self._edges(("n0", "n1"), ("n1", "n2"), ("n2", "n0"),
+                            ("n3", "n4"))
+        a, b = self._nodes(*keys), self._nodes(*keys)
+        tg._graph_layout(a, edges)
+        tg._graph_layout(b, edges)
+        self.assertEqual([(n["x"], n["y"]) for n in a],
+                         [(n["x"], n["y"]) for n in b])
+
+    def test_orphans_are_parked_below_the_connected_core(self):
+        """The bug this guards: orphans left in the force field fly out and
+        crush the connected part to a speck when the layout is scaled to fit."""
+        keys = ["a", "b", "c", "d"] + [f"orphan{i}" for i in range(12)]
+        nodes = self._nodes(*keys)
+        edges = self._edges(("a", "b"), ("b", "c"), ("c", "d"), ("d", "a"))
+        tg._graph_layout(nodes, edges, width=self.W, height=self.H)
+        core = [n for n in nodes if not n["key"].startswith("orphan")]
+        orphans = [n for n in nodes if n["key"].startswith("orphan")]
+        self.assertLess(max(n["y"] for n in core), min(n["y"] for n in orphans))
+        # and the core still occupies a real share of the canvas
+        spread = max(n["x"] for n in core) - min(n["x"] for n in core)
+        self.assertGreater(spread, self.W * 0.2)
+
+    def test_connected_nodes_do_not_pile_up(self):
+        keys = [f"n{i}" for i in range(30)]
+        nodes = self._nodes(*keys)
+        edges = self._edges(*[(keys[0], keys[i]) for i in range(1, 30)])
+        tg._graph_layout(nodes, edges, width=self.W, height=self.H)
+        closest = min(
+            ((nodes[i]["x"] - nodes[j]["x"]) ** 2 +
+             (nodes[i]["y"] - nodes[j]["y"]) ** 2) ** 0.5
+            for i in range(len(nodes)) for j in range(i + 1, len(nodes)))
+        self.assertGreater(closest, 8.0)
+
+    def test_degenerate_inputs_do_not_raise(self):
+        empty = []
+        tg._graph_layout(empty, [])
+        one = self._nodes("solo")
+        tg._graph_layout(one, [])
+        self.assertEqual((one[0]["x"], one[0]["y"]), (460.0, 260.0))
+        pair = self._nodes("x", "y")            # no edges at all
+        tg._graph_layout(pair, [])
+        self.assertNotEqual(pair[0]["x"], pair[1]["x"])
+
+
+class GraphPanelTests(_RepoCase):
+    """GX-2 payload: opt-in, read-only, cached, and off unless asked for."""
+
+    REPO = {
+        "pkg/core.py": "def helper(x):\n    return x * 2\n",
+        "pkg/app.py": ("from pkg.core import helper\n\n\n"
+                       "def start():\n    return helper(2)\n"),
+        "notes.md": "# just a doc\n",
+    }
+
+    def _index(self):
+        for rel, text in self.REPO.items():
+            _write(self.root, rel, text)
+        tg.index_repo(self.root, self.db)
+
+    def test_off_by_default(self):
+        self._index()
+        self.assertEqual(tg._graph_panel(self.root), {})
+        self.assertEqual(tg.build_report_payload(self.root)["graph"], {})
+
+    def test_enabled_by_flag_or_environment(self):
+        self.assertFalse(tg._graph_panel_enabled())
+        self.assertTrue(tg._graph_panel_enabled(True))
+        for value, want in (("1", True), ("true", True), ("on", True),
+                            ("0", False), ("", False)):
+            with unittest.mock.patch.dict(
+                    os.environ, {"TOKENGRAPH_REPORT_GRAPH": value}):
+                self.assertIs(tg._graph_panel_enabled(), want, value)
+
+    def test_panel_carries_both_levels_with_coordinates(self):
+        self._index()
+        panel = tg._graph_panel(self.root, True)
+        self.assertTrue(panel["enabled"])
+        self.assertEqual(set(panel["levels"]), set(tg.GRAPH_PANEL_LEVELS))
+        for level, data in panel["levels"].items():
+            self.assertTrue(data["nodes"], level)
+            for n in data["nodes"]:
+                self.assertIn("x", n)
+                self.assertIn("y", n)
+                for field in tg.GRAPH_PANEL_FIELDS:
+                    self.assertIn(field, n)
+            # edges reference nodes by index, not by key, to keep the payload small
+            for e in data["edges"]:
+                self.assertIsInstance(e[0], int)
+                self.assertLess(e[0], len(data["nodes"]))
+                self.assertLess(e[1], len(data["nodes"]))
+
+    def test_file_level_links_the_two_python_files(self):
+        self._index()
+        lv = tg._graph_panel(self.root, True)["levels"]["file"]
+        keys = [n["key"] for n in lv["nodes"]]
+        pairs = {(keys[e[0]], keys[e[1]]) for e in lv["edges"]}
+        self.assertIn(("pkg/app.py", "pkg/core.py"), pairs)
+
+    def test_panel_is_cached_against_graph_version(self):
+        self._index()
+        first = tg._graph_panel(self.root, True)
+        cache = tg._graph_panel_cache_path(self.root)
+        self.assertTrue(cache.exists())
+        self.assertEqual(tg._graph_panel(self.root, True), first)
+        # a reindex that changes the graph must invalidate it
+        blob = json.loads(cache.read_text(encoding="utf-8"))
+        blob["graph_version"] = blob["graph_version"] + 99
+        cache.write_text(json.dumps(blob), encoding="utf-8")
+        self.assertIsNone(tg._graph_panel_cached(self.root,
+                                                 first["graph_version"]))
+
+    def test_panel_never_raises_and_never_creates_a_database(self):
+        """Runs on the savings hot path — degrade, never fail, never write."""
+        self.assertEqual(tg._graph_panel(self.root, True), {})   # no graph yet
+        self.assertFalse(self.db.exists())
+
+    def test_module_tier_is_the_best_tier_it_contains(self):
+        """A module of one .py plus three .md is not a regex-only module: the
+        tier answers 'can an absence of edges be trusted here?'."""
+        _write(self.root, "mixed/a.py", "def f():\n    return 1\n")
+        for i in range(3):
+            _write(self.root, f"mixed/doc{i}.md", "# doc\n")
+        tg.index_repo(self.root, self.db)
+        store = tg.Store(self.db)
+        self.addCleanup(store.close)
+        snap = tg.graph_snapshot(store, level="module")
+        node = next(n for n in snap["nodes"] if n["key"] == "mixed")
+        self.assertEqual(node["tier"], "ast")
+        self.assertEqual(node["language"], "python")   # weighted by tokens
+
+
+class GraphReportPanelTests(_RepoCase):
+    """GX-2 page: the section renders, and the privacy claim tracks the payload."""
+
+    def _html(self, graph: bool):
+        _write(self.root, "pkg/core.py", "def helper(x):\n    return x * 2\n")
+        _write(self.root, "pkg/app.py",
+               "from pkg.core import helper\n\n\ndef start():\n    return helper(2)\n")
+        tg.index_repo(self.root, self.db)
+        tg.record_pack_savings(self.root, "context", final_tokens=100,
+                               baseline_tokens=9000, files=2)
+        return tg.render_report_html(
+            tg.build_report_payload(self.root, graph=graph))
+
+    @staticmethod
+    def _payload(html: str) -> dict:
+        m = re.search(r'<script type="application/json" id="ciq-data">(.*?)</script>',
+                      html, re.S)
+        return json.loads(m.group(1).replace("<\\/", "</"))
+
+    def test_section_and_controls_exist(self):
+        html = self._html(True)
+        for anchor in ('id="s-graph"', 'id="c-graph"', 'id="sel-glevel"',
+                       'id="graph-legend"', 'id="c-graphtable"',
+                       'href="#s-graph"'):
+            self.assertIn(anchor, html)
+
+    def test_page_stays_self_contained(self):
+        html = self._html(True)
+        self.assertIsNone(re.search(r"https?://(?!127\.)", html))
+        self.assertNotIn("cdn", html.lower())
+
+    def test_privacy_line_tracks_whether_the_graph_shipped(self):
+        """The footer states what this file contains; the graph is the one
+        thing that changes the answer, so both strings must exist in the JS."""
+        html = self._html(True)
+        self.assertIn("counts only, never file paths or queries", html)
+        self.assertIn("module and file names", html)
+
+    def test_names_are_absent_unless_the_graph_was_requested(self):
+        payload = self._payload(self._html(False))
+        self.assertEqual(payload["graph"], {})
+        self.assertNotIn("pkg/core.py", json.dumps(payload))
+
+    def test_names_are_present_when_requested(self):
+        payload = self._payload(self._html(True))
+        self.assertIn("pkg/core.py", json.dumps(payload["graph"]))
+
+    def test_payload_schema_version_is_current(self):
+        self.assertEqual(self._payload(self._html(True))["version"],
+                         tg.REPORT_SCHEMA_VERSION)
 
 
 class DocsDriftTests(unittest.TestCase):

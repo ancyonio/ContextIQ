@@ -4814,6 +4814,410 @@ def import_scip_json(root: Path, db_path: Path, index_file: Path) -> dict:
 
 
 # ==========================================================================
+# graph export (GX-1) — hand the indexed graph to external analysis tools
+# ==========================================================================
+"""Serialize the SQLite code graph into the formats other tools already speak.
+
+`symbols` are nodes and `edges` are typed relationships, so the graph is already
+a property graph — the only thing between it and Neo4j / Gephi / Graphviz is a
+serializer. Everything below is a pure function of one snapshot dict, so each
+format is testable without a database and no format can invent data the graph
+does not hold.
+
+`level` trades detail for legibility. `symbol` is the raw graph; `file` and
+`module` collapse it by aggregating the symbol edges onto their container and
+carrying the count as a `weight`, which is what makes a large repo renderable
+at all. `weight` is therefore always 1 at symbol level — `edges` is
+UNIQUE(src, dst, type), so two calls to the same function are one edge — and
+only becomes a real coupling measure once edges are collapsed.
+
+Output carries no timestamp on purpose: two exports of the same index are
+byte-identical, so they diff cleanly and can be committed.
+"""
+
+GRAPH_EXPORT_FORMATS = ("json", "dot", "graphml", "cypher")
+GRAPH_LEVELS = ("symbol", "file", "module")
+GRAPH_NODE_LABEL = {"symbol": "Symbol", "file": "File", "module": "Module"}
+
+# Declared once so every format agrees on the property set; GraphML needs the
+# types up front, and JSON/Cypher stay consistent with it for free.
+_GRAPH_NODE_ATTRS = (
+    ("key", "string"), ("label", "string"), ("kind", "string"),
+    ("file", "string"), ("language", "string"), ("tier", "string"),
+    ("signature", "string"), ("lineno", "int"), ("loc", "int"),
+    ("tokens", "int"), ("files", "int"), ("symbols", "int"),
+    ("fan_in", "int"), ("fan_out", "int"),
+)
+_GRAPH_EDGE_ATTRS = (("type", "string"), ("weight", "int"))
+
+# Edge colors mirror the report's categorical ramp so a DOT render and the
+# dashboard read as the same system.
+_DOT_EDGE_STYLE = {
+    "CALLS": ("#2f6fed", "solid"),
+    "DEFINES": ("#9aa4b2", "dotted"),
+    "IMPORTS": ("#12a594", "dashed"),
+    "INHERITS": ("#8b5cf6", "solid"),
+    "REFERENCES": ("#e5a50a", "dashed"),
+}
+_DOT_NODE_SHAPE = {
+    "module": "folder", "file": "note", "class": "box", "interface": "box",
+    "struct": "box", "enum": "box", "trait": "box",
+    "function": "ellipse", "method": "ellipse", "constant": "diamond",
+}
+_GRAPH_MAX_SIGNATURE = 200
+
+
+def _graph_module_of(path: str) -> str:
+    """Top-level directory a file belongs to ('.' for repo-root files)."""
+    p = (path or "").replace("\\", "/").strip("/")
+    return p.split("/", 1)[0] if "/" in p else "."
+
+
+def _graph_signature(sig: str) -> str:
+    """One-line, secret-scanned, bounded signature for a node label."""
+    text, _ = redact_secrets(" ".join((sig or "").split()))
+    return text[:_GRAPH_MAX_SIGNATURE]
+
+
+def _graph_csv_set(value) -> set[str] | None:
+    """Parse a comma-separated CLI filter into a set, or None for 'no filter'."""
+    if value is None:
+        return None
+    items = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    out = {str(i).strip() for i in items if str(i).strip()}
+    return out or None
+
+
+def graph_snapshot(store: "Store", level: str = "symbol",
+                   edge_types=None, kinds=None, max_nodes: int = 0) -> dict:
+    """Read the graph into a normalized {meta, nodes, edges} dict.
+
+    Read-only and deterministic: nodes and edges come back sorted by key, so
+    repeated exports of an unchanged index are identical. When `max_nodes`
+    trims the graph it keeps the highest-degree nodes (the ones a reader
+    actually wants) and records exactly what was dropped in `meta.truncated` —
+    a silent cap would read as "this is the whole graph" when it is not.
+    """
+    level = (level or "symbol").lower()
+    if level not in GRAPH_LEVELS:
+        raise ValueError(f"unknown level {level!r} — expected one of "
+                         f"{', '.join(GRAPH_LEVELS)}")
+    want_edges = {t.upper() for t in _graph_csv_set(edge_types) or ()} or None
+    want_kinds = {k.lower() for k in _graph_csv_set(kinds) or ()} or None
+
+    sym_rows = store.conn.execute(
+        "SELECT s.id, s.qname, s.name, s.kind, s.file, s.lineno, s.end_lineno, "
+        "s.signature, COALESCE(f.language, '') AS language "
+        "FROM symbols s LEFT JOIN files f ON f.path = s.file").fetchall()
+    symbols = {r["id"]: r for r in sym_rows
+               if not want_kinds or (r["kind"] or "").lower() in want_kinds}
+
+    # Symbol -> the node key it contributes to at this level.
+    if level == "symbol":
+        container = {sid: r["qname"] for sid, r in symbols.items()}
+    elif level == "file":
+        container = {sid: (r["file"] or "") for sid, r in symbols.items()}
+    else:
+        container = {sid: _graph_module_of(r["file"] or "")
+                     for sid, r in symbols.items()}
+
+    # Edges first: degrees are computed from the surviving set, so a filtered
+    # export reports the fan-in/out of the graph it actually shows.
+    weights: dict[tuple[str, str, str], int] = {}
+    for e in store.conn.execute("SELECT src_id, dst_id, type FROM edges"):
+        etype = (e["type"] or "").upper()
+        if want_edges and etype not in want_edges:
+            continue
+        src, dst = container.get(e["src_id"]), container.get(e["dst_id"])
+        if not src or not dst or (src == dst and level != "symbol"):
+            continue          # unknown endpoint, or a collapsed self-loop
+        weights[(src, dst, etype)] = weights.get((src, dst, etype), 0) + 1
+
+    fan_in: dict[str, int] = {}
+    fan_out: dict[str, int] = {}
+    for (src, dst, _t), w in weights.items():
+        fan_out[src] = fan_out.get(src, 0) + w
+        fan_in[dst] = fan_in.get(dst, 0) + w
+
+    def node(key: str, **kw) -> dict:
+        base = {name: (0 if kind == "int" else "")
+                for name, kind in _GRAPH_NODE_ATTRS}
+        base.update(key=key, label=kw.pop("label", key),
+                    fan_in=fan_in.get(key, 0), fan_out=fan_out.get(key, 0))
+        base.update(kw)
+        return base
+
+    nodes: dict[str, dict] = {}
+    if level == "symbol":
+        for r in symbols.values():
+            line = int(r["lineno"] or 0)
+            end = int(r["end_lineno"] or 0) or line
+            nodes[r["qname"]] = node(
+                r["qname"], label=r["name"] or r["qname"], kind=r["kind"] or "",
+                file=r["file"] or "", language=r["language"] or "",
+                tier=language_tier(r["language"] or ""),
+                signature=_graph_signature(r["signature"] or ""),
+                lineno=line, loc=max(1, end - line + 1))
+    else:
+        # Containers come from the `files` table so an indexed file with no
+        # edges still appears (an isolated node is a finding, not noise). With
+        # a --kinds filter the set narrows to files that kept a symbol.
+        keep = None if want_kinds is None else {c for c in container.values() if c}
+        buckets: dict[str, dict] = {}
+        for f in store.files_with_tokens():
+            path = f["path"]
+            key = path if level == "file" else _graph_module_of(path)
+            if keep is not None and key not in keep:
+                continue
+            b = buckets.setdefault(key, {"tokens": 0, "files": 0, "symbols": 0,
+                                         "langs": {}})
+            b["tokens"] += int(f["token_est"] or 0)
+            b["files"] += 1
+            b["symbols"] += int(f["symbols_count"] or 0)
+            lang = f["language"] or ""
+            if lang:
+                b["langs"][lang] = b["langs"].get(lang, 0) + int(f["token_est"] or 0)
+        for key, b in buckets.items():
+            # Weight the reported language by tokens, not by file count: a
+            # module holding one large source file and three READMEs is not a
+            # markdown module.
+            lang = max(b["langs"].items(), key=lambda kv: (kv[1], kv[0]))[0] \
+                if b["langs"] else ""
+            # A container's tier is the BEST tier it contains, because the
+            # question the tier answers is "can an absence of edges here be
+            # trusted?" — and one parsed file is enough for edges to exist.
+            tier = max((language_tier(x) for x in b["langs"]),
+                       key=lambda t: EXTRACTION_TIERS[t]["rank"],
+                       default=language_tier(lang))
+            nodes[key] = node(
+                key, label=key.rsplit("/", 1)[-1] if level == "file" else key,
+                kind=level, file=key if level == "file" else "",
+                language=lang, tier=tier, tokens=b["tokens"],
+                files=b["files"], symbols=b["symbols"])
+
+    edges = [{"src": s, "dst": d, "type": t, "weight": w}
+             for (s, d, t), w in weights.items() if s in nodes and d in nodes]
+
+    truncated = {}
+    if max_nodes and len(nodes) > max_nodes:
+        ranked = sorted(nodes.values(),
+                        key=lambda n: (-(n["fan_in"] + n["fan_out"]), n["key"]))
+        kept = {n["key"] for n in ranked[:max_nodes]}
+        dropped_edges = sum(1 for e in edges
+                            if e["src"] not in kept or e["dst"] not in kept)
+        truncated = {"reason": "max_nodes", "limit": max_nodes,
+                     "nodes_dropped": len(nodes) - len(kept),
+                     "edges_dropped": dropped_edges,
+                     "kept_by": "degree"}
+        nodes = {k: v for k, v in nodes.items() if k in kept}
+        edges = [e for e in edges if e["src"] in kept and e["dst"] in kept]
+
+    edges.sort(key=lambda e: (e["src"], e["dst"], e["type"]))
+    return {
+        "meta": {
+            "source": "contextiq", "level": level,
+            "node_label": GRAPH_NODE_LABEL[level],
+            "edge_types": sorted({e["type"] for e in edges}),
+            "nodes": len(nodes), "edges": len(edges),
+            "truncated": truncated,
+        },
+        "nodes": [nodes[k] for k in sorted(nodes)],
+        "edges": edges,
+    }
+
+
+def _graph_ids(snapshot: dict) -> dict:
+    """Stable short ids (n0, n1, …) for formats that want compact node ids."""
+    return {n["key"]: f"n{i}" for i, n in enumerate(snapshot["nodes"])}
+
+
+def _dot_quote(text) -> str:
+    s = str(text).replace("\\", "\\\\").replace('"', '\\"')
+    return s.replace("\r", "").replace("\n", "\\n")
+
+
+def graph_to_dot(snapshot: dict) -> str:
+    """Graphviz DOT — `dot -Tsvg graph.dot -o graph.svg`."""
+    meta = snapshot["meta"]
+    ids = _graph_ids(snapshot)
+    out = [f"// ContextIQ graph export — level={meta['level']}, "
+           f"{meta['nodes']} nodes, {meta['edges']} edges"]
+    if meta["truncated"]:
+        t = meta["truncated"]
+        out.append(f"// TRUNCATED: {t['nodes_dropped']} node(s) and "
+                   f"{t['edges_dropped']} edge(s) omitted "
+                   f"(--max-nodes {t['limit']}, kept highest degree)")
+    out += ["digraph contextiq {",
+            '  graph [rankdir=LR, splines=true, overlap=false, '
+            'fontname="Helvetica", bgcolor="transparent"];',
+            '  node [style="rounded,filled", fillcolor="#f4f6fb", '
+            'color="#c7d0e0", fontname="Helvetica", fontsize=10];',
+            '  edge [fontname="Helvetica", fontsize=8, arrowsize=0.7];']
+    for n in snapshot["nodes"]:
+        shape = _DOT_NODE_SHAPE.get((n["kind"] or "").lower(), "box")
+        where = f"{n['file']}:{n['lineno']}" if n["lineno"] else n["file"]
+        tip = n["signature"] or where or n["key"]
+        out.append(f'  {ids[n["key"]]} [label="{_dot_quote(n["label"])}", '
+                   f'shape={shape}, tooltip="{_dot_quote(tip)}"];')
+    for e in snapshot["edges"]:
+        color, style = _DOT_EDGE_STYLE.get(e["type"], ("#8b95a5", "solid"))
+        label = f', label="{e["weight"]}"' if e["weight"] > 1 else ""
+        out.append(f'  {ids[e["src"]]} -> {ids[e["dst"]]} '
+                   f'[color="{color}", style={style}, '
+                   f'tooltip="{_dot_quote(e["type"])}"{label}];')
+    out.append("}")
+    return "\n".join(out) + "\n"
+
+
+def graph_to_graphml(snapshot: dict) -> str:
+    """GraphML — opens in Gephi, yEd, Cytoscape Desktop, igraph, networkx."""
+    from xml.sax.saxutils import escape, quoteattr
+    meta = snapshot["meta"]
+    ids = _graph_ids(snapshot)
+    nkey = {name: f"d{i}" for i, (name, _t) in enumerate(_GRAPH_NODE_ATTRS)}
+    ekey = {name: f"e{i}" for i, (name, _t) in enumerate(_GRAPH_EDGE_ATTRS)}
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+           f'  <!-- ContextIQ graph export — level={meta["level"]}, '
+           f'{meta["nodes"]} nodes, {meta["edges"]} edges -->']
+    for name, typ in _GRAPH_NODE_ATTRS:
+        out.append(f'  <key id="{nkey[name]}" for="node" attr.name="{name}" '
+                   f'attr.type="{typ}"/>')
+    for name, typ in _GRAPH_EDGE_ATTRS:
+        out.append(f'  <key id="{ekey[name]}" for="edge" attr.name="{name}" '
+                   f'attr.type="{typ}"/>')
+    out.append('  <graph id="contextiq" edgedefault="directed">')
+    for n in snapshot["nodes"]:
+        out.append(f'    <node id={quoteattr(ids[n["key"]])}>')
+        for name, _typ in _GRAPH_NODE_ATTRS:
+            out.append(f'      <data key="{nkey[name]}">'
+                       f'{escape(str(n[name]))}</data>')
+        out.append("    </node>")
+    for i, e in enumerate(snapshot["edges"]):
+        out.append(f'    <edge id="e{i}" source={quoteattr(ids[e["src"]])} '
+                   f'target={quoteattr(ids[e["dst"]])}>')
+        for name, _typ in _GRAPH_EDGE_ATTRS:
+            out.append(f'      <data key="{ekey[name]}">'
+                       f'{escape(str(e[name]))}</data>')
+        out.append("    </edge>")
+    out += ["  </graph>", "</graphml>"]
+    return "\n".join(out) + "\n"
+
+
+def _cypher_str(text) -> str:
+    s = str(text).replace("\\", "\\\\").replace("'", "\\'")
+    return s.replace("\r", " ").replace("\n", " ")
+
+
+def _cypher_rel_type(etype: str) -> str:
+    """A safe relationship type — Cypher cannot parameterize this position."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(etype)).upper() or "RELATED"
+    return safe if safe[0].isalpha() else "R_" + safe
+
+
+def _cypher_map(row: dict, keep: tuple = ()) -> str:
+    """A Cypher map literal, dropping properties that carry no information.
+
+    A File node has no `lineno` and a symbol has no `files` count; writing them
+    as 0 would put meaningless properties on every node in Neo4j and inflate the
+    script. JSON and GraphML keep the full uniform schema — this is an import
+    script, and empty properties are not worth importing.
+    """
+    parts = []
+    for k, v in row.items():
+        if k not in keep and (v == 0 or v == ""):
+            continue
+        parts.append(f"{k}: {v}" if isinstance(v, (int, float))
+                     else f"{k}: '{_cypher_str(v)}'")
+    return "{" + ", ".join(parts) + "}"
+
+
+def graph_to_cypher(snapshot: dict, batch: int = 500) -> str:
+    """Neo4j import script — `cypher-shell -f graph.cypher`, or paste it in.
+
+    MERGE-based and batched, so it is safe to re-run after a reindex: nodes and
+    relationships converge on the same graph rather than duplicating.
+    """
+    meta = snapshot["meta"]
+    label = meta["node_label"]
+    out = [f"// ContextIQ graph export — level={meta['level']}, "
+           f"{meta['nodes']} nodes, {meta['edges']} relationships",
+           "// Import:  cypher-shell -f contextiq.cypher",
+           "// Re-runnable: every write is a MERGE keyed on `key`."]
+    if meta["truncated"]:
+        t = meta["truncated"]
+        out.append(f"// TRUNCATED: {t['nodes_dropped']} node(s), "
+                   f"{t['edges_dropped']} relationship(s) omitted "
+                   f"(--max-nodes {t['limit']}).")
+    out += ["",
+            f"CREATE CONSTRAINT contextiq_{label.lower()}_key IF NOT EXISTS",
+            f"FOR (n:{label}) REQUIRE n.key IS UNIQUE;", ""]
+    nodes = snapshot["nodes"]
+    for i in range(0, len(nodes), batch):
+        rows = ",\n  ".join(_cypher_map(n, keep=("key", "label"))
+                            for n in nodes[i:i + batch])
+        out += [f"UNWIND [\n  {rows}\n] AS row",
+                f"MERGE (n:{label} {{key: row.key}})",
+                "SET n += row;", ""]
+    by_type: dict[str, list] = {}
+    for e in snapshot["edges"]:
+        by_type.setdefault(e["type"], []).append(e)
+    for etype in sorted(by_type):
+        rel = _cypher_rel_type(etype)
+        rows_all = by_type[etype]
+        for i in range(0, len(rows_all), batch):
+            rows = ",\n  ".join(
+                _cypher_map({"src": e["src"], "dst": e["dst"],
+                             "weight": e["weight"]},
+                            keep=("src", "dst", "weight"))
+                for e in rows_all[i:i + batch])
+            out += [f"UNWIND [\n  {rows}\n] AS row",
+                    f"MATCH (a:{label} {{key: row.src}})",
+                    f"MATCH (b:{label} {{key: row.dst}})",
+                    f"MERGE (a)-[r:{rel}]->(b)",
+                    "SET r.weight = row.weight;", ""]
+    return "\n".join(out)
+
+
+def render_graph_export(snapshot: dict, fmt: str = "json") -> str:
+    """Serialize a snapshot into one of GRAPH_EXPORT_FORMATS."""
+    import json
+    fmt = (fmt or "json").lower()
+    if fmt == "json":
+        return json.dumps(snapshot, indent=2) + "\n"
+    if fmt == "dot":
+        return graph_to_dot(snapshot)
+    if fmt == "graphml":
+        return graph_to_graphml(snapshot)
+    if fmt == "cypher":
+        return graph_to_cypher(snapshot)
+    raise ValueError(f"unknown format {fmt!r} — expected one of "
+                     f"{', '.join(GRAPH_EXPORT_FORMATS)}")
+
+
+GRAPH_EXPORT_HINTS = {
+    "dot": "render:  dot -Tsvg {out} -o graph.svg",
+    "graphml": "open in Gephi / yEd / Cytoscape Desktop, or "
+               "networkx.read_graphml('{out}')",
+    "cypher": "import:  cypher-shell -f {out}",
+    "json": "feed to d3/cytoscape.js, or jq '.meta' {out}",
+}
+
+
+def export_graph(root: Path, fmt: str = "json", level: str = "symbol",
+                 edge_types=None, kinds=None, max_nodes: int = 0) -> tuple[str, dict]:
+    """Read the workspace graph and serialize it. Returns (text, meta)."""
+    store = Store(_db_path(Path(root)))
+    try:
+        snap = graph_snapshot(store, level=level, edge_types=edge_types,
+                              kinds=kinds, max_nodes=max_nodes)
+    finally:
+        store.close()
+    return render_graph_export(snap, fmt), snap["meta"]
+
+
+# ==========================================================================
 # retriever (token optimization core)
 # ==========================================================================
 """Retriever: the token-optimization core.
@@ -7006,6 +7410,7 @@ DEFAULTS_CONFIG: dict = {
     "format": "md",                          # md | cache (PC-1)
     "retrieval": {"topK": 10, "recencyBoost": 1.5, "preset": "balanced"},  # CFG-3
     "enrich": {"todos": True, "changes": True, "coverage": False},          # CFG-4
+    "ide": {"editors": None},   # pin `ide-setup`'s default editor set for a team
 }
 
 _RETRIEVAL_PRESETS = {
@@ -8084,7 +8489,9 @@ def _sparkline(values: list[int]) -> str:
 # The page is *progressively enhanced*: it always ships an inline snapshot so
 # it works from file:// with zero dependencies, and if it detects it is being
 # served (see serve_report) it polls /data.json and redraws live instead.
-REPORT_SCHEMA_VERSION = 1
+# v2 adds the opt-in `graph` panel (GX-2). The page treats it as optional, so a
+# v1 payload still renders — the graph card just shows its opt-in empty state.
+REPORT_SCHEMA_VERSION = 2
 
 
 def _report_daily(rows: list[dict], cap: int = 180) -> list[dict]:
@@ -8176,9 +8583,385 @@ def _workspace_stats(root: Path) -> dict:
         return {}
 
 
+# --- code-graph panel (GX-2) ------------------------------------------------
+# The rest of the report is counts-only by design; this panel is the one part
+# that names things, so it is opt-in and says so on the page.
+
+GRAPH_PANEL_LEVELS = ("module", "file")
+# O(n²) layout, run on the savings-logging path — these caps are what keep the
+# worst case bounded. Both levels report anything they dropped.
+GRAPH_PANEL_MAX_NODES = {"module": 40, "file": 80}
+GRAPH_PANEL_CACHE = "graph-panel.json"
+GRAPH_PANEL_FIELDS = ("key", "label", "kind", "language", "tier",
+                      "tokens", "files", "symbols", "fan_in", "fan_out")
+
+
+def _graph_panel_enabled(flag: bool = False) -> bool:
+    """Whether to embed the code graph in the report — opt-in, never default.
+
+    Every other panel is counts-only, and the footer promises exactly that. The
+    graph names modules and files, so it ships only when asked for by flag
+    (`gain --report --graph`) or environment (`TOKENGRAPH_REPORT_GRAPH=1`).
+    """
+    if flag:
+        return True
+    value = (os.environ.get("TOKENGRAPH_REPORT_GRAPH", "") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+class _RoGraphStore:
+    """Read-only stand-in for `Store`, for use on the report's hot path.
+
+    `graph_snapshot` needs only `.conn.execute` and `.files_with_tokens()`, so
+    the report reuses the export's snapshot builder without opening a writable
+    `Store` — which would create and migrate a database from a code path that
+    must never write.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def files_with_tokens(self):
+        return self.conn.execute(
+            "SELECT path, token_est, symbols_count, language FROM files "
+            "ORDER BY path").fetchall()
+
+
+def _graph_components(n: int, links: list) -> list:
+    """Connected components (ignoring direction), largest first.
+
+    Deterministic: components are ordered by size then by their lowest member,
+    and members keep their original order, so the packing below is stable.
+    """
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for s, d in links:
+        ra, rb = find(s), find(d)
+        if ra != rb:
+            parent[rb] = ra
+    groups: dict[int, list] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return sorted(groups.values(), key=lambda g: (-len(g), g[0]))
+
+
+def _graph_fr(m: int, pairs: list, iterations: int, aspect: float,
+              k: float) -> tuple:
+    """Fruchterman–Reingold for one connected component, in unit space.
+
+    Seeded on a golden-angle spiral rather than at random, so the result is a
+    pure function of the component: the same index always draws the same
+    picture and a screenshot stays reproducible. That determinism is why this
+    runs in Python at build time instead of as a client-side simulation — the
+    page keeps its "every chart is a pure function returning SVG" shape.
+    """
+    import math
+    px = [0.0] * m
+    py = [0.0] * m
+    if m == 1:
+        return px, py
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for i in range(m):
+        radius = math.sqrt((i + 0.5) / m)
+        angle = i * golden
+        px[i] = radius * math.cos(angle) * aspect
+        py[i] = radius * math.sin(angle) / aspect
+    temp = 0.22
+    cool = temp / (iterations + 1)
+    for _ in range(iterations):
+        dx = [0.0] * m
+        dy = [0.0] * m
+        for i in range(m):           # repulsion: k²/d along the unit vector
+            xi, yi = px[i], py[i]
+            for j in range(i + 1, m):
+                ddx = xi - px[j]
+                ddy = yi - py[j]
+                d2 = ddx * ddx + ddy * ddy
+                if d2 < 1e-9:        # coincident: nudge apart deterministically
+                    ddx, ddy, d2 = (i - j) * 1e-4, (j - i) * 1e-4, 1e-8
+                f = (k * k) / d2
+                dx[i] += ddx * f
+                dy[i] += ddy * f
+                dx[j] -= ddx * f
+                dy[j] -= ddy * f
+        for s, d in pairs:           # attraction: d²/k along the unit vector
+            ddx = px[s] - px[d]
+            ddy = py[s] - py[d]
+            dist = math.sqrt(ddx * ddx + ddy * ddy) or 1e-6
+            f = dist / k
+            dx[s] -= ddx * f
+            dy[s] -= ddy * f
+            dx[d] += ddx * f
+            dy[d] += ddy * f
+        for i in range(m):
+            # Light centre gravity so a pendant node cannot sail off; kept far
+            # weaker than attraction so it never compresses the component.
+            dx[i] -= px[i] * 0.05 / (aspect * aspect)
+            dy[i] -= py[i] * 0.05 * (aspect * aspect)
+            disp = math.sqrt(dx[i] * dx[i] + dy[i] * dy[i]) or 1e-9
+            move = min(disp, temp) / disp
+            px[i] += dx[i] * move
+            py[i] += dy[i] * move
+        temp -= cool
+    return px, py
+
+
+def _graph_shelf(cells: list, scale: float, box_w: float, gap: float) -> tuple:
+    """Row-pack unit-sized cells at `scale`.
+
+    Returns (placements, total height, widest right edge). The right edge is
+    reported because a single cell can be wider than the box — it is placed
+    anyway, since dropping it would silently lose a component — and the caller
+    needs to see that overflow to reject the scale.
+    """
+    x = y = row_h = right = 0.0
+    out = []
+    for cw, ch in cells:
+        w, h = cw * scale + gap, ch * scale + gap
+        if x > 0 and x + w > box_w:
+            x, y, row_h = 0.0, y + row_h, 0.0
+        out.append((x, y, w - gap, h - gap))
+        x += w
+        right = max(right, x - gap)
+        row_h = max(row_h, h)
+    return out, y + row_h, right
+
+
+def _graph_layout(nodes: list, edges: list, iterations: int = 120,
+                  width: int = 920, height: int = 520, pad: int = 36) -> None:
+    """Lay the graph out for the report panel; writes x/y onto each node.
+
+    Components are solved separately and then packed, which is the whole trick.
+    Simulated together, a disconnected node settles wherever repulsion alone
+    pushes it — far outside everything else — and then dominates the
+    scale-to-fit, rendering the part of the graph that actually has structure as
+    an unreadable speck. Real repositories are full of such nodes (config, docs,
+    every regex-indexed file), so this is the common case, not the edge case.
+    """
+    import math
+    n = len(nodes)
+    if not n:
+        return
+    if n == 1:
+        nodes[0]["x"], nodes[0]["y"] = width / 2.0, height / 2.0
+        return
+    index = {nd["key"]: i for i, nd in enumerate(nodes)}
+    links = []
+    for e in edges:
+        s, d = index.get(e["src"]), index.get(e["dst"])
+        if s is not None and d is not None and s != d:
+            links.append((s, d))
+
+    comps = _graph_components(n, links)
+    multi = [c for c in comps if len(c) > 1]
+    orphans = [c[0] for c in comps if len(c) == 1]
+
+    strip = 0
+    if orphans:
+        per_row = max(1, int((width - 2 * pad) // 62))
+        rows = (len(orphans) + per_row - 1) // per_row
+        strip = min(150, rows * 30 + 14)
+    core_h = height - strip
+    if not multi:
+        _graph_place_rows(nodes, orphans, pad, width - pad, pad, height - pad)
+        return
+
+    box_w, box_h = width - 2 * pad, max(1.0, core_h - 2 * pad)
+    aspect = math.sqrt(box_w / box_h)
+    # FR's equilibrium sits at d≈k, so k is derived from the area the layout
+    # occupies (≈2×2 here); deriving it from 1.0 collapses the graph into a dot.
+    # One k for every component, from the total node count: a per-component k
+    # would give a 2-node component a natural edge four times longer than the
+    # main cluster's, and edge length must mean the same thing across the whole
+    # picture.
+    k = math.sqrt(4.0 / max(2, sum(len(c) for c in multi)))
+    solved = []
+    cells = []
+    for comp in multi:
+        local = {g: i for i, g in enumerate(comp)}
+        pairs = [(local[s], local[d]) for s, d in links
+                 if s in local and d in local]
+        px, py = _graph_fr(len(comp), pairs, iterations, aspect, k)
+        span_x = (max(px) - min(px)) or 1e-6
+        span_y = (max(py) - min(py)) or 1e-6
+        solved.append((comp, px, py, span_x, span_y))
+        # Cell area tracks node count, so density is comparable across
+        # components: a 2-node component does not get the same room as a 40.
+        # The aspect is clamped because a small component solves to a straight
+        # line (span_y ≈ 0 → ratio in the thousands); left unclamped its cell is
+        # wider than the canvas and squeezes every other component to nothing.
+        ar = min(2.5, max(0.4, span_x / span_y))
+        cell_h = math.sqrt(len(comp) / ar)
+        cells.append((ar * cell_h, cell_h))
+
+    # Largest scale whose shelf packing fits the core box in BOTH axes. Height
+    # alone is not enough: one wide component is placed on its own shelf and
+    # would run off the right edge while the height check still passed.
+    lo, hi = 0.0, max(box_w, box_h)
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        _, used, right = _graph_shelf(cells, mid, box_w, max(14.0, mid * 0.12))
+        if used <= box_h and right <= box_w:
+            lo = mid
+        else:
+            hi = mid
+    gap = max(14.0, lo * 0.12)
+    places, used, _right = _graph_shelf(cells, lo, box_w, gap)
+    off_y = pad + max(0.0, (box_h - used) / 2.0)
+    # Centre each shelf row: packing runs left-to-right from x=0, which leaves a
+    # graph with one wide row and one narrow one visibly pinned to the left.
+    rows: dict[float, float] = {}
+    for bx, by, bw, _bh in places:
+        rows[by] = max(rows.get(by, 0.0), bx + bw)
+    places = [(bx + (box_w - rows[by]) / 2.0, by, bw, bh)
+              for bx, by, bw, bh in places]
+
+    # One scale for both axes: an independent fit would stretch the layout and
+    # misrepresent the distances the simulation just solved for.
+    scales = [min(min(bw, box_w) / span_x, min(bh, box_h) / span_y)
+              for (_c, _px, _py, span_x, span_y), (_bx, _by, bw, bh)
+              in zip(solved, places)]
+    # Edge length has to mean the same thing everywhere. A 2-node component
+    # fitted to its own cell draws one 300px edge beside a dense cluster whose
+    # edges are 50px, which reads as a much looser coupling than it is — so no
+    # component is drawn at a larger scale than the biggest one.
+    cap = scales[0] if scales else 1.0
+    for (comp, px, py, span_x, span_y), (bx, by, bw, bh), scale in zip(
+            solved, places, scales):
+        scale = min(scale, cap)
+        bw, bh = min(bw, box_w), min(bh, box_h)
+        cx = pad + bx + (bw - span_x * scale) / 2.0 - min(px) * scale
+        cy = off_y + by + (bh - span_y * scale) / 2.0 - min(py) * scale
+        for slot, i in enumerate(comp):
+            nodes[i]["x"] = round(px[slot] * scale + cx, 1)
+            nodes[i]["y"] = round(py[slot] * scale + cy, 1)
+
+    if orphans:
+        _graph_place_rows(nodes, orphans, pad, width - pad,
+                          core_h + 4, height - 10)
+
+
+def _graph_place_rows(nodes: list, which: list, x0: float, x1: float,
+                      y0: float, y1: float) -> None:
+    """Lay unconnected nodes out in tidy rows along a reserved strip.
+
+    Their position carries no structural meaning — that is the point. They are
+    the nodes nothing links to, and the caption says so, so a neat row reads as
+    "these are unattached" rather than as a discovered arrangement.
+    """
+    if not which:
+        return
+    per_row = max(1, int((x1 - x0) // 62))
+    rows = (len(which) + per_row - 1) // per_row
+    step_y = (y1 - y0) / rows if rows else 0
+    for pos, i in enumerate(which):
+        r, c = divmod(pos, per_row)
+        in_row = min(per_row, len(which) - r * per_row)
+        gap = (x1 - x0) / (in_row + 1)
+        nodes[i]["x"] = round(x0 + gap * (c + 1), 1)
+        nodes[i]["y"] = round(y0 + step_y * (r + 0.5), 1)
+
+
+def _graph_panel_build(conn) -> dict:
+    """Both zoom levels, laid out and compacted for the inlined payload."""
+    store = _RoGraphStore(conn)
+    levels: dict[str, dict] = {}
+    for level in GRAPH_PANEL_LEVELS:
+        snap = graph_snapshot(store, level=level,
+                              max_nodes=GRAPH_PANEL_MAX_NODES[level])
+        nodes = [{f: nd[f] for f in GRAPH_PANEL_FIELDS} for nd in snap["nodes"]]
+        _graph_layout(nodes, snap["edges"])
+        index = {nd["key"]: i for i, nd in enumerate(nodes)}
+        # Edges reference nodes by position: at 80 nodes the key strings would
+        # otherwise dominate the payload.
+        levels[level] = {
+            "nodes": nodes,
+            "edges": [[index[e["src"]], index[e["dst"]], e["type"], e["weight"]]
+                      for e in snap["edges"]],
+            "edge_types": snap["meta"]["edge_types"],
+            "truncated": snap["meta"]["truncated"],
+        }
+    return {"enabled": True, "levels": levels, "default_level": "module"}
+
+
+def _graph_panel_cache_path(root: Path) -> Path:
+    return Path(root) / ".tokengraph" / GRAPH_PANEL_CACHE
+
+
+def _graph_panel_cached(root: Path, version: int) -> dict | None:
+    """The panel computed for this exact graph version, or None."""
+    try:
+        import json
+        blob = json.loads(_graph_panel_cache_path(root).read_text(encoding="utf-8"))
+        panel = blob.get("panel")
+        if isinstance(panel, dict) and int(blob.get("graph_version", -1)) == version:
+            return panel
+    except Exception:
+        pass
+    return None
+
+
+def _graph_panel_store(root: Path, version: int, panel: dict) -> None:
+    try:
+        import json
+        path = _graph_panel_cache_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"graph_version": version, "panel": panel}),
+                        encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _graph_panel(root: Path, enabled: bool = False) -> dict:
+    """The code-graph panel payload, or `{}` when off or unavailable.
+
+    Same contract as `_workspace_stats`: opens the existing DB `mode=ro` with a
+    short timeout so it can never create or block one, and returns `{}` on any
+    problem rather than raising — this runs on the savings-logging path. The
+    laid-out result is cached against `graph_version`, so the O(n²) layout is
+    paid once per reindex instead of on every recorded run.
+    """
+    if not _graph_panel_enabled(enabled):
+        return {}
+    try:
+        root = Path(root).resolve()
+        db = _db_path(root)
+        if not db.exists():
+            return {}
+        import sqlite3
+        conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.25)
+        conn.row_factory = sqlite3.Row
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key='graph_version'").fetchone()
+                version = int(row[0]) if row else 0
+            except Exception:
+                version = 0
+            cached = _graph_panel_cached(root, version)
+            if cached is not None:
+                return cached
+            panel = _graph_panel_build(conn)
+            panel["graph_version"] = version
+        finally:
+            conn.close()
+        if not panel["levels"].get("file", {}).get("nodes"):
+            return {}                      # nothing indexed yet — say nothing
+        _graph_panel_store(root, version, panel)
+        return panel
+    except Exception:
+        return {}
+
+
 def build_report_payload(root: Path, model: str = DEFAULT_GAIN_MODEL,
                          generated_at: str | None = None,
-                         max_rows: int = 200) -> dict:
+                         max_rows: int = 200, graph: bool = False) -> dict:
     """Everything the HTML report needs, as one versioned JSON-safe dict.
 
     Deliberately aggregated: daily/weekly/monthly buckets plus a bounded tail
@@ -8209,6 +8992,7 @@ def build_report_payload(root: Path, model: str = DEFAULT_GAIN_MODEL,
         "monthly": s.get("monthly", []),
         "ledger": _ledger_span(rows),
         "workspace_stats": _workspace_stats(root),
+        "graph": _graph_panel(root, graph),
         "rows": rows[-max_rows:],
         "rows_capped": len(rows) > max_rows,
     }
@@ -8535,6 +9319,7 @@ _REPORT_JS = """
    set()/put(), which no-op when a container is absent. */
 (function(){
   var RANGES=['all','7','30','90'];
+  var GLEVELS=['module','file'];
   var C_SENT='var(--s-sent)', C_SAVED='var(--s-saved)', C_BASE='var(--s-base)';
   var CAT=[C_SENT,C_SAVED,'var(--s-c3)','var(--s-c4)','var(--s-c5)',C_BASE];
   var SEQ=['var(--seq-0)','var(--seq-1)','var(--seq-2)','var(--seq-3)',
@@ -8543,7 +9328,7 @@ _REPORT_JS = """
   var THEMES=['auto','light','dark'];
   var MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   var state={data:null,model:null,range:'all',theme:'auto',live:false,auto:true,
-             sig:null,left:0,err:false};
+             sig:null,left:0,err:false,glevel:'module'};
   var tick=null;
 
   /* ---------- dom + formatting ------------------------------------------ */
@@ -8604,7 +9389,8 @@ _REPORT_JS = """
   function writeHash(){
     var h='#model='+encodeURIComponent(state.model)+
           '&range='+encodeURIComponent(state.range)+'&auto='+(state.auto?'1':'0')+
-          '&theme='+encodeURIComponent(state.theme);
+          '&theme='+encodeURIComponent(state.theme)+
+          '&glevel='+encodeURIComponent(state.glevel);
     try{history.replaceState(null,'',h);}catch(e){location.hash=h;}
   }
   // Cheap change-detector so a poll that returns identical data doesn't redraw.
@@ -9083,6 +9869,185 @@ _REPORT_JS = """
     return svg(w,h,'Indexed files by language',o);
   }
 
+  /* ---------- code graph ---------------------------------------------------- */
+  // The layout arrives pre-solved in the payload (deterministic, computed once
+  // per reindex), so this stays a pure renderer like every other chart on the
+  // page — no simulation loop, no canvas, no RNG, and the same index always
+  // draws the same picture.
+  var GTIER={'ast':'var(--s-saved)','tree-sitter':'var(--s-sent)',
+             'regex':'var(--s-base)'};
+  var GTIER_NOTE={'ast':'exact call graph','tree-sitter':'call graph by name',
+                  'regex':'symbols only — no call edges were extracted'};
+  var GEDGE={'CALLS':'var(--s-sent)','IMPORTS':'var(--s-c5)',
+             'INHERITS':'var(--s-c3)','DEFINES':'var(--s-base)',
+             'REFERENCES':'var(--s-c4)'};
+  var GW=920, GH=520;
+
+  function graphOn(){
+    var g=state.data.graph;
+    return !!(g&&g.enabled&&g.levels);
+  }
+  function glevel(){
+    var g=state.data.graph||{};
+    if(g.levels&&g.levels[state.glevel])return state.glevel;
+    return g.default_level||'module';
+  }
+  function gdata(){
+    var g=state.data.graph||{};
+    return (g.levels&&g.levels[glevel()])||null;
+  }
+  function degree(n){return (n.fan_in||0)+(n.fan_out||0);}
+
+  function graphChart(){
+    if(!graphOn())return empty('Code graph not included',
+      'This is the one panel that names things, so it is opt-in. Rebuild with '+
+      '`gain --report --graph` (or set TOKENGRAPH_REPORT_GRAPH=1) and the '+
+      'module and file graph appears here.');
+    var lv=gdata();
+    if(!lv||!lv.nodes.length)return empty('Nothing indexed yet',
+      'Run an index or any context call, then rebuild the report.');
+    var nodes=lv.nodes, edges=lv.edges, i, maxSize=1, maxW=1;
+    for(i=0;i<nodes.length;i++)
+      maxSize=Math.max(maxSize,nodes[i].tokens||nodes[i].symbols||1);
+    for(i=0;i<edges.length;i++)maxW=Math.max(maxW,edges[i][3]||1);
+    function rad(n){
+      return 5+13*Math.sqrt((n.tokens||n.symbols||1)/maxSize);
+    }
+    // One arrowhead marker per edge type present: direction is the whole point
+    // of a dependency graph, so the arrows are not decoration.
+    var types=[], seen={}, mark={};
+    edges.forEach(function(e){if(!seen[e[2]]){seen[e[2]]=1;types.push(e[2]);}});
+    var out='<defs>';
+    types.forEach(function(t,ti){
+      mark[t]=ti;
+      out+='<marker id="ciq-ga'+ti+'" viewBox="0 0 8 8" refX="7.5" refY="4" '+
+        'markerWidth="4.5" markerHeight="4.5" orient="auto">'+
+        '<path d="M0,0 L8,4 L0,8 z" fill="'+(GEDGE[t]||MUT)+'"/></marker>';
+    });
+    out+='</defs>';
+    edges.forEach(function(e){
+      var a=nodes[e[0]], b=nodes[e[1]];
+      if(!a||!b)return;
+      var dx=b.x-a.x, dy=b.y-a.y, d=Math.sqrt(dx*dx+dy*dy)||1, w=e[3]||1;
+      // trimmed to the circle edges so the arrowhead is never hidden under a node
+      var x1=a.x+dx/d*(rad(a)+1), y1=a.y+dy/d*(rad(a)+1);
+      var x2=b.x-dx/d*(rad(b)+5.5), y2=b.y-dy/d*(rad(b)+5.5);
+      out+='<line x1="'+x1.toFixed(1)+'" y1="'+y1.toFixed(1)+'" x2="'+
+        x2.toFixed(1)+'" y2="'+y2.toFixed(1)+'" stroke="'+(GEDGE[e[2]]||MUT)+
+        '" stroke-width="'+(1+Math.min(2.6,Math.log(1+w))).toFixed(2)+
+        '" opacity="'+(0.22+0.5*Math.min(1,w/maxW)).toFixed(2)+
+        '" marker-end="url(#ciq-ga'+mark[e[2]]+')">'+
+        tip(a.key+' → '+b.key+'  ('+String(e[2]).toLowerCase()+
+          (w>1?', '+full(w)+' edges':'')+')')+'</line>';
+    });
+    // Label the hubs only, and drop any label that would collide with one
+    // already placed: at 80 nodes labelling everything produces a smear of
+    // overlapping text, and an unreadable label is worse than none. The table
+    // below carries every node either way.
+    var order=nodes.slice().sort(function(p,q){
+      return (degree(q)-degree(p))||(p.key<q.key?-1:1);});
+    var labelled={}, boxes=[], want=nodes.length<=24?nodes.length:18;
+    for(i=0;i<order.length&&boxes.length<want;i++){
+      var nd=order[i], txt=String(nd.label).slice(0,26);
+      var lw=txt.length*5.9, lx=nd.x-lw/2, ly=nd.y-rad(nd)-16;
+      if(lx<0||lx+lw>GW||ly<0)continue;
+      var hit=false;
+      for(var b=0;b<boxes.length;b++){
+        var o=boxes[b];
+        if(lx<o[0]+o[2]+3&&lx+lw+3>o[0]&&ly<o[1]+13&&ly+13>o[1]){hit=true;break;}
+      }
+      if(hit)continue;
+      boxes.push([lx,ly,lw]);
+      labelled[nd.key]=1;
+    }
+    nodes.forEach(function(n){
+      var r=rad(n);
+      out+='<circle cx="'+n.x+'" cy="'+n.y+'" r="'+r.toFixed(1)+'" fill="'+
+        (GTIER[n.tier]||MUT)+'" fill-opacity=".82" stroke="'+SURF+
+        '" stroke-width="1.5">'+
+        tip(n.key+'\\n'+(n.kind||'')+' · '+(n.language||'unknown')+' · '+
+          (GTIER_NOTE[n.tier]||n.tier||'')+'\\n'+fmt(n.tokens)+' tokens · '+
+          full(n.symbols)+' symbols'+(n.files>1?' · '+full(n.files)+' files':'')+
+          '\\nfan-in '+full(n.fan_in)+' · fan-out '+full(n.fan_out))+'</circle>';
+      if(labelled[n.key])
+        out+='<text x="'+n.x+'" y="'+(n.y-r-5).toFixed(1)+
+          '" text-anchor="middle" font-size="10.5" font-weight="560" '+
+          'fill="currentColor" paint-order="stroke" stroke="'+SURF+
+          '" stroke-width="3" stroke-linejoin="round">'+
+          esc(String(n.label).slice(0,26))+'</text>';
+    });
+    return svg(GW,GH,'Code graph at '+glevel()+' level: '+nodes.length+
+      ' nodes and '+edges.length+' edges',out);
+  }
+
+  function graphLegend(){
+    var lv=graphOn()&&gdata();
+    if(!lv)return '';
+    var o='';
+    ['ast','tree-sitter','regex'].forEach(function(t){
+      var hit=false;
+      lv.nodes.forEach(function(n){if(n.tier===t)hit=true;});
+      if(!hit)return;
+      o+='<span class="item"><i class="key" style="width:10px;height:10px;'+
+        'border-radius:50%;background:'+GTIER[t]+'"></i>'+esc(t)+'</span>';
+    });
+    (lv.edge_types||[]).forEach(function(t){
+      o+='<span class="item"><i class="key" style="background:'+
+        (GEDGE[t]||MUT)+'"></i>'+esc(String(t).toLowerCase())+'</span>';
+    });
+    return o;
+  }
+
+  function graphSub(){
+    if(!graphOn())return 'Opt-in — this report was built without it';
+    var lv=gdata();
+    if(!lv)return '';
+    var s='Size = tokens indexed · colour = extraction tier · arrows point from '+
+      'dependent to dependency';
+    var t=lv.truncated||{};
+    if(t.limit)s+=' · drawing the '+t.limit+' highest-degree nodes, '+
+      full(t.nodes_dropped)+' not shown';
+    return s;
+  }
+
+  function graphNote(){
+    var lv=graphOn()&&gdata();
+    if(!lv)return '';
+    var regex=0, loose=0, deg={};
+    lv.nodes.forEach(function(n,i){if(n.tier==='regex')regex++;deg[i]=0;});
+    (lv.edges||[]).forEach(function(e){deg[e[0]]++;deg[e[1]]++;});
+    lv.nodes.forEach(function(n,i){if(!deg[i])loose++;});
+    var parts=[];
+    if(regex)parts.push(regex+' of '+lv.nodes.length+' node(s) are regex-indexed '+
+      '(grey): no call edges were ever extracted for them, so an absence of '+
+      'arrows there means "not parsed", not "not used"');
+    if(loose)parts.push(loose+' node(s) have no edges at all and are parked in '+
+      'the bottom row — their position there is arbitrary, not structural');
+    return parts.length?parts.join('. ')+'.':'';
+  }
+
+  function graphTable(){
+    var lv=graphOn()&&gdata();
+    if(!lv||!lv.nodes.length)return '';
+    var rows=lv.nodes.slice().sort(function(p,q){
+      return (degree(q)-degree(p))||(p.key<q.key?-1:1);}).slice(0,25);
+    var o='<div class="table-wrap" tabindex="0" role="region" '+
+      'aria-label="Code graph nodes"><table><caption class="sr">'+
+      'Graph nodes, highest degree first</caption><thead><tr>'+
+      '<th scope="col">Node</th><th scope="col">Language</th>'+
+      '<th scope="col">Extraction</th><th scope="col" class="n">Tokens</th>'+
+      '<th scope="col" class="n">Symbols</th>'+
+      '<th scope="col" class="n">Fan-in</th>'+
+      '<th scope="col" class="n">Fan-out</th></tr></thead><tbody>';
+    rows.forEach(function(n){
+      o+='<tr><td>'+esc(n.key)+'</td><td>'+esc(n.language||'—')+'</td><td>'+
+        esc(n.tier||'—')+'</td><td class="n">'+full(n.tokens)+
+        '</td><td class="n">'+full(n.symbols)+'</td><td class="n">'+
+        full(n.fan_in)+'</td><td class="n">'+full(n.fan_out)+'</td></tr>';
+    });
+    return o+'</tbody></table></div>';
+  }
+
   function rowsTable(rows){
     if(!rows.length)return empty('No records in this window',
       'Savings are appended to the ledger as you use the graph.');
@@ -9146,6 +10111,11 @@ _REPORT_JS = """
     put('c-modeltable',modelTable(t));
     put('c-ws',wsCards(ws,d));
     put('c-langs',langBars(ws));
+    put('c-graph',graphChart());
+    put('graph-legend',graphLegend());
+    set('graph-sub',graphSub());
+    set('graph-note',graphNote());
+    put('c-graphtable',graphTable());
     put('c-rows',rowsTable(windowRows()));
 
     set('range-note',state.range==='all'
@@ -9165,6 +10135,11 @@ _REPORT_JS = """
       'ContextIQ appends one line to <code>.context/gain.ndjson</code> every '+
       'time it builds a context pack — run a context, ask or measure call (or '+
       'use the MCP tools), then refresh.</div></div>');
+    // The privacy line is not boilerplate — it states what this specific file
+    // contains, and the graph panel is the one thing that changes the answer.
+    set('foot-privacy',graphOn()
+      ? 'counts, plus this workspace\\'s module and file names (graph panel)'
+      : 'counts only, never file paths or queries');
     set('foot-gen',d.generated_at||'not stamped');
     set('foot-ver','schema v'+(d.version||1));
   }
@@ -9202,6 +10177,13 @@ _REPORT_JS = """
       ck.checked=state.auto;
       ck.addEventListener('change',function(){
         state.auto=ck.checked; writeHash(); startTimer();});
+    }
+    var gs=el('sel-glevel');
+    if(gs){
+      gs.value=glevel();
+      gs.disabled=!graphOn();
+      gs.addEventListener('change',function(){
+        state.glevel=gs.value; writeHash(); draw();});
     }
     on('btn-theme','click',function(){
       state.theme=THEMES[(THEMES.indexOf(state.theme)+1)%THEMES.length];
@@ -9258,6 +10240,7 @@ _REPORT_JS = """
     state.range=(RANGES.indexOf(h.range)>=0)?h.range:'all';
     state.auto=(h.auto!=='0');
     state.theme=(THEMES.indexOf(h.theme)>=0)?h.theme:'auto';
+    state.glevel=(GLEVELS.indexOf(h.glevel)>=0)?h.glevel:'module';
     state.sig=sig(state.data);
     applyTheme();
     controls();
@@ -9289,7 +10272,8 @@ _REPORT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"
     <nav class="appnav" aria-label="Dashboard sections">
       <a href="#s-overview">Overview</a><a href="#s-savings">Savings</a>
       <a href="#s-ops">Operations</a><a href="#s-cost">Cost by model</a>
-      <a href="#s-workspace">Workspace</a><a href="#s-log">Activity log</a>
+      <a href="#s-workspace">Workspace</a><a href="#s-graph">Code graph</a>
+      <a href="#s-log">Activity log</a>
     </nav>
     <div class="bar-end">
       <span class="chip" title="Workspace this report covers">
@@ -9458,6 +10442,30 @@ _REPORT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"
     </div>
   </section>
 
+  <section id="s-graph" aria-labelledby="h-graph">
+    <div class="sec-head"><h2 id="h-graph">Code graph</h2>
+      <span class="hint">How this workspace is wired together</span></div>
+    <div class="card">
+      <div class="card-head">
+        <div><h3>Dependency graph</h3>
+          <div class="sub" id="graph-sub"></div></div>
+        <span class="field no-print"><label for="sel-glevel">Level</label>
+          <select id="sel-glevel">
+            <option value="module">Modules</option>
+            <option value="file">Files</option>
+          </select></span>
+      </div>
+      <div class="legend" id="graph-legend" aria-hidden="true"></div>
+      <div class="chart center" id="c-graph">
+        <div class="skel chart" style="height:240px"></div></div>
+      <p class="muted" id="graph-note" style="font-size:12px;margin-top:12px"></p>
+      <details style="margin-top:12px">
+        <summary>Nodes as a table</summary>
+        <div class="body" id="c-graphtable"></div>
+      </details>
+    </div>
+  </section>
+
   <section id="s-log" aria-labelledby="h-log">
     <div class="sec-head"><h2 id="h-log">Activity log</h2>
       <span class="hint">Raw ledger records, newest first</span></div>
@@ -9468,8 +10476,8 @@ _REPORT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"
   </section>
 
   <footer>
-    <div>Source <code>.context/gain.ndjson</code> · counts only, never file
-      paths or queries · stays on this machine.</div>
+    <div>Source <code>.context/gain.ndjson</code> · <span id="foot-privacy">counts
+      only, never file paths or queries</span> · stays on this machine.</div>
     <div class="num">Generated <span id="foot-gen">—</span> · <span id="foot-ver"></span></div>
   </footer>
 </main>
@@ -9500,7 +10508,8 @@ def _report_timestamp() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def make_report_handler(root: Path, model: str = DEFAULT_GAIN_MODEL):
+def make_report_handler(root: Path, model: str = DEFAULT_GAIN_MODEL,
+                        graph: bool = False):
     """Build the request handler for the live report (no Streamlit, no deps).
 
     Serves the page at `/` and the freshly-read ledger at `/data.json`, which
@@ -9522,11 +10531,11 @@ def make_report_handler(root: Path, model: str = DEFAULT_GAIN_MODEL):
         def do_GET(self):  # noqa: N802 (stdlib callback name)
             path = self.path.split("?", 1)[0]
             if path == "/data.json":
-                payload = build_report_payload(root, model=model,
+                payload = build_report_payload(root, model=model, graph=graph,
                                                generated_at=_report_timestamp())
                 self._send(json.dumps(payload).encode("utf-8"), "application/json")
             elif path in ("/", "/index.html"):
-                payload = build_report_payload(root, model=model,
+                payload = build_report_payload(root, model=model, graph=graph,
                                                generated_at=_report_timestamp())
                 self._send(render_report_html(payload).encode("utf-8"),
                            "text/html; charset=utf-8")
@@ -9539,10 +10548,12 @@ def make_report_handler(root: Path, model: str = DEFAULT_GAIN_MODEL):
     return _Handler
 
 
-def serve_report(root: Path, port: int = 8787, model: str = DEFAULT_GAIN_MODEL) -> None:
+def serve_report(root: Path, port: int = 8787, model: str = DEFAULT_GAIN_MODEL,
+                 graph: bool = False) -> None:
     """Run the live report on 127.0.0.1:<port> until interrupted."""
     from http.server import ThreadingHTTPServer
-    srv = ThreadingHTTPServer(("127.0.0.1", port), make_report_handler(root, model))
+    srv = ThreadingHTTPServer(("127.0.0.1", port),
+                              make_report_handler(root, model, graph))
     url = f"http://127.0.0.1:{srv.server_port}/"
     print(f"ContextIQ live report on {url}  (Ctrl-C to stop)")
     try:
@@ -9559,7 +10570,8 @@ def usage_report_path(root: Path) -> Path:
 
 
 def write_usage_report(root: Path, model: str = DEFAULT_GAIN_MODEL,
-                       generated_at: str | None = None) -> Path | None:
+                       generated_at: str | None = None,
+                       graph: bool = False) -> Path | None:
     """Render this workspace's token report to .tokengraph/token-usage.html.
 
     Self-contained (no deps, no server) so any client can just open the file.
@@ -9569,7 +10581,8 @@ def write_usage_report(root: Path, model: str = DEFAULT_GAIN_MODEL,
     """
     try:
         stamp = generated_at or _report_timestamp()
-        payload = build_report_payload(root, model=model, generated_at=stamp)
+        payload = build_report_payload(root, model=model, generated_at=stamp,
+                                       graph=graph)
         html = render_report_html(payload)
         out = usage_report_path(root)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -10843,20 +11856,120 @@ def mcp_wiring_status(root: Path) -> list[dict]:
     return out
 
 
+# The set `ide-setup` writes when no editor is named and `--all` is not passed.
+# Kept deliberately small: Claude Code and VS Code/Copilot are the two hosts
+# nearly every repo actually uses, so wiring only these avoids scattering config
+# folders for editors a project may never open. Everything else is opt-in via
+# `--editor`, `--all`, the `ide.editors` config key, or on-disk detection.
+_DEFAULT_IDE_EDITORS = ("claude", "vscode")
+
+# Every host `ide-setup` knows how to wire, project-local and per-user. `--all`
+# selects exactly this set.
+_ALL_IDE_EDITORS = ("claude", "vscode", "cursor", "zed", "jetbrains", "nvim",
+                    "continue", "gemini", "roo", "opencode", "windsurf", "cline")
+
+# Project-relative MCP config path per host, for --dry-run planning (the write
+# paths themselves live in `ide_setup`'s `targets`; these must stay in sync).
+_IDE_MCP_PATHS = {
+    "claude": ".mcp.json",
+    "vscode": ".vscode/mcp.json",
+    "cursor": ".cursor/mcp.json",
+    "zed": ".zed/settings.json",
+    "continue": ".continue/config.yaml",
+    "gemini": ".gemini/settings.json",
+    "roo": ".roo/mcp.json",
+    "opencode": "opencode.json",
+    "jetbrains": ".idea/mcp.xml",
+    "nvim": ".nvim/contextiq.lua",
+}
+
+# On-disk evidence that a repo already uses an editor outside the default set,
+# so `ide-setup` can auto-include it rather than make the user remember a flag.
+# A folder is never *created* for a host with no footprint here.
+_IDE_FOOTPRINTS = {
+    "cursor": (".cursor", ".cursorrules"),
+    "zed": (".zed", ".rules"),
+    "jetbrains": (".idea",),
+    "nvim": (".nvim",),
+    "continue": (".continue",),
+    "gemini": ("GEMINI.md", ".gemini"),
+    "roo": (".roo",),
+    "opencode": ("opencode.json",),
+    "windsurf": (".windsurf", ".windsurfrules"),
+    "cline": (".clinerules",),
+}
+
+
+def _detect_ide_editors(root: Path) -> list[str]:
+    """Editors with a config footprint already present in the repo."""
+    root = Path(root)
+    return [ed for ed, markers in _IDE_FOOTPRINTS.items()
+            if any((root / m).exists() for m in markers)]
+
+
+def resolve_ide_editors(root: Path, editors: list[str] | None = None,
+                        all_editors: bool = False,
+                        config: dict | None = None) -> list[str]:
+    """The single source of truth for which editors a setup run targets.
+
+    Both the MCP-config pass (`ide_setup`) and the steering-rules pass
+    (`write_ide_rules`) resolve through this, so they can never disagree — the
+    historical cause of config folders scattering for editors the user never
+    asked for. Precedence: explicit `--editor` > `--all` > `ide.editors` config
+    key > the {claude, vscode} default, always unioned with any editor detected
+    on disk.
+    """
+    if editors:
+        return list(dict.fromkeys(editors))
+    if all_editors:
+        return list(_ALL_IDE_EDITORS)
+    pinned = (config or {}).get("ide", {}).get("editors") if config else None
+    base = list(pinned) if pinned else list(_DEFAULT_IDE_EDITORS)
+    for ed in _detect_ide_editors(root):
+        if ed not in base:
+            base.append(ed)
+    return list(dict.fromkeys(base))
+
+
+def ide_setup_plan(root: Path, editors: list[str],
+                   with_rules: bool = True) -> dict:
+    """The exact file list `ide-setup` would create, without touching disk."""
+    root = Path(root).resolve()
+    globals_ = global_mcp_targets()
+    mcp_files = [_IDE_MCP_PATHS[e] for e in editors if e in _IDE_MCP_PATHS]
+    global_pending = [str(globals_[e][0]) for e in editors if e in globals_]
+    rule_files: list[str] = []
+    if with_rules:
+        for ed in editors:
+            rel = ADAPTERS.get(_EDITOR_ADAPTERS.get(ed, ""), {}).get("path")
+            if rel and rel not in rule_files:
+                rule_files.append(rel)
+    return {"editors": list(editors), "mcp_files": mcp_files,
+            "rule_files": rule_files, "global_pending": global_pending}
+
+
 def ide_setup(root: Path, editors: list[str] | None = None,
               workspace_roots: list[Path] | None = None,
-              write_global: bool = False) -> dict:
-    """Wire ContextIQ's MCP server into every (or selected) MCP-capable editor.
+              write_global: bool = False, all_editors: bool = False,
+              config: dict | None = None) -> dict:
+    """Wire ContextIQ's MCP server into the chosen MCP-capable editors.
 
     For an MCP-native tool this is the equivalent of shipping editor plugins:
     one command drops a correct server config into each editor's expected
     location. Non-destructive (merges into existing JSON).
+
+    Without `editors` or `all_editors` the set defaults to {claude, vscode}
+    (see `resolve_ide_editors`), unioned with any editor already detected in the
+    repo — so a default run wires the two ubiquitous hosts plus whatever the
+    project already uses, instead of scattering folders for every known editor.
 
     Hosts that only read a per-user config path (Windsurf, Cline) are written
     only when `write_global` is set, since those files live outside the repo;
     otherwise their exact path and payload are returned under `global_pending`.
     """
     root = Path(root).resolve()
+    if config is None:
+        config = load_config(root, None)
     roots = [Path(p).resolve() for p in workspace_roots] if workspace_roots else [root]
     stdio = mcp_launch_command()
     stdio_typed = {"type": "stdio", **stdio}
@@ -10896,11 +12009,9 @@ def ide_setup(root: Path, editors: list[str] | None = None,
                           "enabled": True}}}),
         "continue": (".continue/config.yaml", None),   # YAML, written below
     }
-    # These hosts are wired only when named explicitly (like continue): they
-    # are less common, so writing their configs into every project by default
-    # would scatter files a repo may never use.
-    _optin_only = {"continue", "gemini", "roo", "opencode"}
-    chosen = editors or [e for e in targets if e not in _optin_only]
+    # The resolved editor set is computed once here and drives every pass, so
+    # the MCP configs and the steering rules can never target different editors.
+    chosen = resolve_ide_editors(root, editors, all_editors, config)
     written: list[str] = []
     for workspace_root in roots:
         for ed in chosen:
@@ -10914,11 +12025,12 @@ def ide_setup(root: Path, editors: list[str] | None = None,
                 _merge_json_file(p, payload)
             written.append(rel if len(roots) == 1 else str(p))
 
-    # Per-user configs (outside the repo).
+    # Per-user configs (outside the repo). Only for hosts in the resolved set,
+    # so the default run does not nag about editors it was not asked to wire.
     global_written: list[str] = []
     global_pending: list[dict] = []
     for name, (gpath, gpayload) in global_mcp_targets().items():
-        if editors and name not in editors:
+        if name not in chosen:
             continue
         if write_global:
             _merge_json_file(gpath, gpayload)
@@ -10931,17 +12043,15 @@ def ide_setup(root: Path, editors: list[str] | None = None,
             })
 
     # JetBrains and Neovim previously got a printed string and nothing else.
-    # Both do read real config files, so write them.
+    # Both do read real config files, so write them when in the resolved set.
     for workspace_root in roots:
-        if not editors or "jetbrains" in editors:
+        if "jetbrains" in chosen:
             # JetBrains AI Assistant / Junie read project-level MCP config from
-            # .idea/mcp.xml. Written unconditionally: a project without .idea
-            # gets one the first time the IDE opens it, and an unused file is
-            # inert.
+            # .idea/mcp.xml.
             _write_jetbrains_mcp(workspace_root / ".idea" / "mcp.xml", stdio)
             written.append(".idea/mcp.xml" if len(roots) == 1
                            else str(workspace_root / ".idea" / "mcp.xml"))
-        if not editors or "nvim" in editors:
+        if "nvim" in chosen:
             path = workspace_root / ".nvim" / "contextiq.lua"
             _write_nvim_config(path, stdio)
             written.append(".nvim/contextiq.lua" if len(roots) == 1
@@ -13775,6 +14885,7 @@ def cmd_hallucination(args):
 def cmd_ide_setup(args):
     root = Path(args.path).resolve()
     editors = args.editor or None
+    all_editors = getattr(args, "all_editors", False)
 
     # --verify: report per-editor completeness (MCP + rules) and exit non-zero
     # if a requested editor is not ready. Turns "we wrote configs" into a check.
@@ -13795,20 +14906,65 @@ def cmd_ide_setup(args):
             sys.exit(1)
         return
 
+    # Resolve the editor set once so the MCP pass and the rules pass agree.
+    cfg = load_config(root, None)
+    resolved = resolve_ide_editors(root, editors, all_editors, cfg)
+    with_rules = getattr(args, "with_rules", True)
+
+    # --dry-run: print exactly what would be created, touch nothing.
+    if getattr(args, "dry_run", False):
+        plan = ide_setup_plan(root, resolved, with_rules=with_rules)
+        if getattr(args, "json", False):
+            _emit(plan, True)
+        else:
+            print(f"ide-setup --dry-run: would wire {', '.join(resolved)}")
+            for f in plan["mcp_files"]:
+                print(f"  + {f}")
+            for f in plan["rule_files"]:
+                print(f"  + {f}  (rules)")
+            for g in plan["global_pending"]:
+                print(f"  ~ {g}  (per-user; needs --global)")
+            if not plan["mcp_files"] and not plan["rule_files"]:
+                print("  (nothing to write)")
+        return
+
+    # One-time notice when the (new) default set is in effect, so users who
+    # relied on the old "wire every editor" behavior learn how to get it back.
+    pinned = bool((cfg.get("ide") or {}).get("editors"))
+    if (not editors and not all_editors and not pinned
+            and not getattr(args, "json", False)):
+        notice = root / ".tokengraph" / "ide-default-notice"
+        if not notice.exists():
+            print("note: ide-setup now defaults to claude+vscode "
+                  "(plus any editor detected in the repo); "
+                  "use --all for every editor, or set ide.editors in the config.")
+            try:
+                notice.parent.mkdir(parents=True, exist_ok=True)
+                notice.write_text("shown\n", encoding="utf-8")
+            except OSError:
+                pass
+
     workspace_roots = [Path(p) for p in args.workspace_root] if args.workspace_root else None
-    res = ide_setup(root, editors=editors, workspace_roots=workspace_roots,
-                    write_global=getattr(args, "write_global", False))
+    res = ide_setup(root, editors=resolved, workspace_roots=workspace_roots,
+                    write_global=getattr(args, "write_global", False),
+                    config=cfg)
     # By default, also drop the steering-rules block so one command fully
     # provisions each IDE (MCP config + rules). --no-rules keeps it MCP-only.
-    if getattr(args, "with_rules", True):
+    if with_rules:
         try:
-            res["rules_written"] = write_ide_rules(root, editors=editors)
+            res["rules_written"] = write_ide_rules(root, editors=resolved)
         except Exception as e:                       # never fail wiring over rules
             res["rules_written"] = []
             res["rules_error"] = str(e)
     if getattr(args, "plugins", False):
         res["plugins"] = emit_ide_plugins(root)
+    # Note editors auto-included from an on-disk footprint (not from a flag).
+    extras = [e for e in _detect_ide_editors(root)
+              if e not in _DEFAULT_IDE_EDITORS and not editors
+              and not all_editors and not pinned]
     if getattr(args, "json", False):
+        if extras:
+            res["detected"] = extras
         _emit(res, True)
     else:
         print(res["note"])
@@ -13822,6 +14978,9 @@ def cmd_ide_setup(args):
             print(f"  SKIPPED {g['host']}: {g['why']}")
             print(f"          write it with: tokengraph ide-setup "
                   f"--editor {g['host']} --global")
+        if extras:
+            print(f"  detected {', '.join(extras)} in the repo — wired too "
+                  f"(use --editor to control)")
         print(f"  Neovim (mcphub): {res['neovim_snippet']}")
         print(f"  {res['jetbrains_note']}")
         if res.get("rules_error"):
@@ -13996,6 +15155,41 @@ def cmd_import_scip(args):
         index_file = root / index_file
     result = import_scip_json(root, db, index_file)
     _emit(result, getattr(args, "json", False))
+
+
+def cmd_export(args):
+    """Write the code graph out for Neo4j / Gephi / Graphviz / a JS renderer.
+
+    The graph is the product here, so the export is streamed to stdout by
+    default and only written to a file on `--out`; what was dropped by a filter
+    or `--max-nodes` is always reported on stderr, never silently.
+    """
+    root = Path(args.path).resolve()
+    if not getattr(args, "no_refresh", False):
+        index_repo(root, _db_path(root))
+    text, meta = export_graph(
+        root, fmt=args.format, level=args.level, edge_types=args.edges,
+        kinds=args.kinds, max_nodes=args.max_nodes)
+    note = (f"level={meta['level']} nodes={meta['nodes']} "
+            f"edges={meta['edges']} types={','.join(meta['edge_types']) or '-'}")
+    if args.out:
+        out = Path(args.out)
+        if not out.is_absolute():
+            out = root / out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"wrote {out}  ({note})", file=sys.stderr)
+        hint = GRAPH_EXPORT_HINTS.get(args.format, "")
+        if hint:
+            print("  " + hint.format(out=out), file=sys.stderr)
+    else:
+        print(text)
+        print(note, file=sys.stderr)
+    if meta["truncated"]:
+        t = meta["truncated"]
+        print(f"note: truncated to the {t['limit']} highest-degree nodes — "
+              f"{t['nodes_dropped']} node(s) and {t['edges_dropped']} edge(s) "
+              f"omitted", file=sys.stderr)
 
 
 def cmd_freeze(args):
@@ -16241,12 +17435,17 @@ def cmd_gain(args):
             p.unlink()
         print("savings ledger cleared")
         return
+    want_graph = bool(getattr(args, "graph", False))
     if getattr(args, "serve", False):
-        serve_report(root, port=getattr(args, "port", 8787), model=args.model)
+        serve_report(root, port=getattr(args, "port", 8787), model=args.model,
+                     graph=want_graph)
         return
     if getattr(args, "report", False):
-        out = write_usage_report(root, model=args.model)
+        out = write_usage_report(root, model=args.model, graph=want_graph)
         print(f"wrote {out}" if out else "could not write usage report")
+        if out and want_graph:
+            print("  includes the code-graph panel (module and file names are "
+                  "embedded in the page)")
         return
     s = summarize_gain(root, since=getattr(args, "since", None),
                        model=args.model, top=getattr(args, "top", None),
@@ -16768,15 +17967,21 @@ def build_parser():
     hb.set_defaults(func=cmd_hallucination)
 
     ide = sub.add_parser("ide-setup",
-                         help="wire the MCP server into every major editor (VS Code/Cursor/Windsurf/Zed/Claude)")
+                         help="wire the MCP server into your editors (default: Claude Code + VS Code/Copilot)")
     ide.add_argument("--editor", action="append",
                      choices=["claude", "vscode", "cursor", "zed", "continue",
-                              "jetbrains", "nvim", "windsurf", "cline"],
-                     help="limit to specific editor(s); default = all project-local "
-                          "ones. windsurf/cline are per-user configs and need --global")
+                              "jetbrains", "nvim", "gemini", "roo", "opencode",
+                              "windsurf", "cline"],
+                     help="limit to specific editor(s). Default = claude + vscode "
+                          "plus any editor detected in the repo. windsurf/cline "
+                          "are per-user configs and need --global")
+    ide.add_argument("--all", dest="all_editors", action="store_true",
+                     help="wire every supported editor (the old default behavior)")
     ide.add_argument("--global", dest="write_global", action="store_true",
                      help="also write per-user configs outside the repo "
                           "(Windsurf ~/.codeium, Cline globalStorage)")
+    ide.add_argument("--dry-run", dest="dry_run", action="store_true",
+                     help="print the exact file list that would be created; write nothing")
     ide.add_argument("--verify", action="store_true",
                      help="report per-editor completeness (MCP + rules); "
                           "exit 1 if a requested editor is not wired")
@@ -16808,6 +18013,28 @@ def build_parser():
     scip.add_argument("index", help="output from `scip print --json index.scip`")
     scip.add_argument("--json", action="store_true")
     scip.set_defaults(func=cmd_import_scip)
+
+    ex = sub.add_parser("export",
+                        help="export the code graph for Neo4j / Gephi / Graphviz / JS")
+    ex.add_argument("--format", "-f", default="json",
+                    choices=list(GRAPH_EXPORT_FORMATS),
+                    help="output format (default: json)")
+    ex.add_argument("--level", "-l", default="symbol", choices=list(GRAPH_LEVELS),
+                    help="symbol = raw graph; file/module collapse edges onto "
+                         "containers with a weight (default: symbol)")
+    ex.add_argument("--edges", default=None,
+                    help="comma-separated edge types to keep, e.g. "
+                         "CALLS,IMPORTS (default: all)")
+    ex.add_argument("--kinds", default=None,
+                    help="comma-separated symbol kinds to keep, e.g. "
+                         "function,class (default: all)")
+    ex.add_argument("--max-nodes", type=int, default=0,
+                    help="keep only the N highest-degree nodes; what was "
+                         "dropped is reported, never silent (default: no cap)")
+    ex.add_argument("-o", "--out", default=None,
+                    help="write to this file instead of stdout")
+    ex.add_argument("--no-refresh", action="store_true")
+    ex.set_defaults(func=cmd_export)
 
     fz = sub.add_parser("freeze",
                         help="emit a PyInstaller spec (or --build it) for a standalone binary")
@@ -16972,6 +18199,10 @@ def build_parser():
     gn.add_argument("--html", default=None, help="write a self-contained HTML dashboard")
     gn.add_argument("--report", action="store_true",
                     help="write the per-workspace report to .tokengraph/token-usage.html")
+    gn.add_argument("--graph", action="store_true",
+                    help="include the code-graph panel in --report / --serve "
+                         "(opt-in: it embeds module and file names, which the "
+                         "rest of the counts-only report never does)")
     gn.add_argument("--serve", action="store_true",
                     help="serve the live report on 127.0.0.1 (polls the ledger; no Streamlit)")
     gn.add_argument("--port", type=int, default=8787, help="port for --serve")

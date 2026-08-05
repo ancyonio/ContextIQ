@@ -78,7 +78,7 @@ point elsewhere with the global `--path PATH`.
 | --- | --- |
 | `index` / `reindex` | Build / rebuild the graph |
 | `serve` | Run the MCP server (stdio or HTTP) |
-| `ide-setup` | Wire the MCP server into every major editor |
+| `ide-setup` | Wire the MCP server + rules (default: Claude Code + VS Code/Copilot; `--all` for every editor) |
 | `ide-plugin` | Scaffold installable VS Code / Neovim / JetBrains plugins |
 | `langs` | List parseable languages by extraction tier |
 | `evidence` | Deterministic, hash-grounded evidence pack (audit/CI) |

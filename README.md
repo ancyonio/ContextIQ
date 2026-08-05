@@ -155,6 +155,12 @@ python tokengraph_all.py map routes                      # HTTP endpoints (Flask
 python tokengraph_all.py map hubs                        # fan-in/out ranking + import cycles
 python tokengraph_all.py import-scip index.scip.json     # add precise external REFERENCES edges
 
+# Export the graph to external analysis tools (see "Exporting the graph")
+python tokengraph_all.py export --level module --format dot -o graph.dot   # Graphviz
+python tokengraph_all.py export --format cypher -o graph.cypher            # Neo4j
+python tokengraph_all.py export --level file --format graphml -o graph.graphml  # Gephi / yEd
+python tokengraph_all.py export --level file --format json                 # stdout, for a JS renderer
+
 # Decision support, gating, and cost control
 python tokengraph_all.py ask "the task" --json          # focused pack + intent/coverage/risk/cost
 python tokengraph_all.py ask --schema                    # JSON Schema of the --json output (also: evidence --schema)
@@ -204,7 +210,9 @@ python tokengraph_all.py generate --monorepo --adapter copilot       # per-packa
 python tokengraph_all.py generate --each --adapter claude            # per immediate sub-directory (workspace of repos)
 python tokengraph_all.py repomix --out pack.xml          # export the signature map as a Repomix-compatible pack (interop)
 python tokengraph_all.py repomix --import repomix-output.xml  # squeeze an existing (huge) Repomix dump into a token-reduced digest
-python tokengraph_all.py ide-setup                       # one command: MCP server + steering rules for VS Code / Cursor / Zed / Continue / Claude (project-local)
+python tokengraph_all.py ide-setup                       # one command: MCP server + steering rules; defaults to Claude Code + VS Code/Copilot (plus any editor detected in the repo)
+python tokengraph_all.py ide-setup --all                 # wire every supported editor (Cursor / Zed / Continue / Gemini / Roo / OpenCode / JetBrains / Neovim …)
+python tokengraph_all.py ide-setup --dry-run             # print the exact file list that would be created; write nothing
 python tokengraph_all.py ide-setup --verify              # prove each editor is wired (MCP + rules); exit 1 if not ready
 python tokengraph_all.py ide-setup --no-rules            # wire the MCP server only (skip the steering-rules block)
 python tokengraph_all.py ide-setup --global              # also Windsurf + Cline, which only read per-user config paths
@@ -314,6 +322,7 @@ python tokengraph_all.py gain --all                 # add daily/weekly/monthly t
 python tokengraph_all.py gain --model claude-opus   # price the saved tokens against a specific model
 python tokengraph_all.py gain --top 5 --json        # machine-readable rollup for CI / spreadsheets
 python tokengraph_all.py gain --report              # write .tokengraph/token-usage.html for this workspace
+python tokengraph_all.py gain --report --graph      # ...including the code-graph panel (opt-in; embeds names)
 python tokengraph_all.py gain --serve               # live dashboard on 127.0.0.1 (no Streamlit, no deps)
 python tokengraph_all.py gain --html gain.html      # same report, written to a path you choose
 python tokengraph_all.py gain --reset               # clear the ledger
@@ -324,7 +333,7 @@ python tokengraph_all.py gain --reset               # clear the ledger
 Because `.tokengraph/` is created in **every** workspace you use ContextIQ in, each one carries its own dashboard next to its own graph. It is **regenerated automatically on every logged op**, so it is always current — just open it.
 
 - **Zero dependencies, fully self-contained.** All CSS/JS/charts are inlined; no CDN, no network, no server. Double-click the file and it works offline, in any client.
-- **Six sections, all from the local ledger + graph** — *Overview* (hero cost avoided, a reduction gauge, and scorecards for saved / **sent (consumed)** / cost of tokens sent / reduction / runs / baseline / avg per run / leverage / files covered), *Savings* (baseline → avoided → sent waterfall, a stacked avoided-&-sent trend, and a 26-week activity heatmap), *Operations* (tokens avoided by op, share of runs, and a per-op table), *Cost by model* (the same token counts priced against every model, input **and** output list prices), *Workspace* (files / symbols / edges / chunks / summaries / graph size and a language breakdown), and the raw *Activity log*.
+- **Seven sections, all from the local ledger + graph** — *Overview* (hero cost avoided, a reduction gauge, and scorecards for saved / **sent (consumed)** / cost of tokens sent / reduction / runs / baseline / avg per run / leverage / files covered), *Savings* (baseline → avoided → sent waterfall, a stacked avoided-&-sent trend, and a 26-week activity heatmap), *Operations* (tokens avoided by op, share of runs, and a per-op table), *Cost by model* (the same token counts priced against every model, input **and** output list prices), *Workspace* (files / symbols / edges / chunks / summaries / graph size and a language breakdown), *Code graph* (opt-in — see below), and the raw *Activity log*.
 - **Enterprise UI, built in** — design tokens for color/type/space, light **and** dark themes (OS setting plus a toggle that overrides it), WCAG-minded markup (skip link, labelled controls, `aria-live` status, `scope`d table headers, visible focus rings, reduced-motion support), skeleton loading and explicit empty states, and a responsive layout down to phone width. No numbers are shown that the ledger did not record.
 - **Interactive without a server** — the pricing-model and date-range selectors re-filter an inlined snapshot client-side, so switching to `claude-opus` or "last 7 days" works from `file://`.
 - **Live two ways.** Served (`gain --serve`) the page polls `/data.json` and redraws in place. Opened as a file it reloads periodically to pick up the rewritten snapshot — the page detects which mode it is in and shows a `live` or `snapshot` badge.
@@ -332,6 +341,25 @@ Because `.tokengraph/` is created in **every** workspace you use ContextIQ in, e
 ```bash
 python tokengraph_all.py gain --serve --port 8787   # http://127.0.0.1:8787 (loopback only)
 ```
+
+#### The code-graph panel (opt-in)
+
+Every other panel is counts-only, and the page's footer says exactly that. The
+*Code graph* panel is the one part that names things — modules and files — so it
+ships only when you ask for it:
+
+```bash
+python tokengraph_all.py gain --report --graph      # or: TOKENGRAPH_REPORT_GRAPH=1
+```
+
+It draws the same graph `export` emits, at two zoom levels (`Modules` / `Files`),
+with the footer's privacy line updating to match what the file actually contains.
+
+- **Size = tokens indexed, colour = extraction tier, arrows = dependency direction.** Grey (regex-tier) nodes had no call edges extracted at all, so a missing arrow there means "not parsed", not "not used" — the caption says so rather than letting the picture imply structure it does not have. A container's tier is the *best* tier it holds, because the question a tier answers is whether an absence of edges can be trusted.
+- **Laid out in Python, rendered as static SVG.** A Fruchterman–Reingold solve seeded on a golden-angle spiral (no RNG) runs at build time, so the layout is a pure function of the index: the same graph always draws the same picture and screenshots stay reproducible. Connected components are solved separately and packed — left in one force field, the many unconnected nodes a real repo has (config, docs, every regex-indexed file) drift outward and crush the connected part to a speck.
+- **Nodes with no edges are parked in a labelled bottom row.** Their position there is arbitrary and the caption says so, so a tidy row is not misread as discovered structure.
+- **Bounded and honest.** Capped at 40 module / 80 file nodes by degree, and the caption states how many were dropped. Labels are placed only where they do not collide; the full node list is in the table beneath.
+- **Cached against `graph_version`,** so the O(n²) layout is paid once per reindex rather than on every recorded run.
 
 > **`dashboard.py` (Streamlit) has been removed.** The report above replaces it and shows strictly more, with no `streamlit`/`plotly` install and no server process. The `dashboard` subcommand remains only as a signpost to `gain --report` / `gain --serve`.
 
@@ -410,7 +438,8 @@ python tokengraph_all.py hallucination -o HALLUCINATION.md      # reproducible m
 ## Editor integration & distribution
 
 ```bash
-python tokengraph_all.py ide-setup           # project-local MCP wiring: Claude Code / VS Code Copilot / Cursor / Zed
+python tokengraph_all.py ide-setup           # default MCP wiring: Claude Code + VS Code/Copilot (plus any editor detected in the repo)
+python tokengraph_all.py ide-setup --all     # wire every supported editor (Cursor / Zed / Continue / Gemini / Roo / OpenCode / JetBrains / Neovim)
 python tokengraph_all.py ide-setup --global  # also Windsurf + Cline (per-user config paths, outside the repo)
 python tokengraph_all.py ide-plugin    # scaffold installable plugins: packageable VS Code .vsix, lazy.nvim Lua, Gradle JetBrains
 python tokengraph_all.py freeze --build # build a standalone binary now (PyInstaller)
@@ -428,20 +457,25 @@ rather than one identical blob.
 |---|---|---|
 | Claude Code | `.mcp.json` | `CLAUDE.md` |
 | VS Code / Copilot | `.vscode/mcp.json` (`servers` key) | `.github/copilot-instructions.md` |
-| Cursor | `.cursor/mcp.json` | `.cursor/rules/contextiq.mdc` |
-| Zed | `.zed/settings.json` (`context_servers`, `source: custom`) | `.rules` |
+| Cursor | `.cursor/mcp.json` — **opt-in** (`--editor cursor` / `--all`) | `.cursor/rules/contextiq.mdc` |
+| Zed | `.zed/settings.json` (`context_servers`, `source: custom`) — **opt-in** | `.rules` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` — **`--global`** | `.windsurf/rules/contextiq.md` |
 | Cline | VS Code globalStorage — **`--global`** | `.clinerules/contextiq.md` |
-| Continue | `.continue/config.yaml` | `.continue/rules/contextiq.md` |
+| Continue | `.continue/config.yaml` — **opt-in** | `.continue/rules/contextiq.md` |
 | Codex / Aider / Jules | (AGENTS.md standard) | `AGENTS.md`, `CONVENTIONS.md` |
-| Gemini CLI | `.gemini/settings.json` — **opt-in** (`--editors gemini`) | `GEMINI.md` |
-| Roo Code | `.roo/mcp.json` — **opt-in** (`--editors roo`) | `.roo/rules/contextiq.md` |
-| OpenCode | `opencode.json` (`mcp`, `type: local`) — **opt-in** (`--editors opencode`) | `AGENTS.md` |
-| JetBrains / Neovim | printed snippet (manual) | — |
+| Gemini CLI | `.gemini/settings.json` — **opt-in** (`--editor gemini`) | `GEMINI.md` |
+| Roo Code | `.roo/mcp.json` — **opt-in** (`--editor roo`) | `.roo/rules/contextiq.md` |
+| OpenCode | `opencode.json` (`mcp`, `type: local`) — **opt-in** (`--editor opencode`) | `AGENTS.md` |
+| JetBrains / Neovim | `.idea/mcp.xml` / `.nvim/contextiq.lua` — **opt-in** | — |
 
-The three opt-in MCP configs (Gemini / Roo / OpenCode) are written only when
-named explicitly, so a project isn't littered with configs for tools it doesn't
-use. Beyond tools, the server also exposes MCP **resources**
+By default `ide-setup` wires only **Claude Code + VS Code/Copilot** — the two
+hosts nearly every repo uses — plus any editor it detects a footprint for (an
+existing `.cursor/`, `.zed/`, `GEMINI.md`, …), so a project isn't littered with
+configs for tools it doesn't use. Name others with `--editor`, take the whole
+set with `--all`, or pin a team's choice in the config
+(`{"ide": {"editors": [...]}}`). Both the MCP-config pass and the steering-rules
+pass resolve through the **same** editor set, so they can never disagree. Beyond
+tools, the server also exposes MCP **resources**
 (`contextiq://architecture`, `contextiq://modules`) and **prompts** (`bug_fix`,
 `feature`) for hosts that surface those primitives.
 
@@ -523,6 +557,14 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 > smaller local models whose context a long tool list would otherwise crowd.
 
 ### Tools the server exposes
+
+> **Path convention:** every `file` argument (`get_module_summary`, `file_skeleton`,
+> `explain_file`, `get_lines`, `set_module_summary`, `get_test_map`, …) takes the
+> **repo-relative path with forward slashes**, exactly as indexed — e.g.
+> `src/app/main.py`, never `D:\repo\src\app\main.py` or `src\app\main.py`.
+> "Repo-relative" means relative to the server's root: `--path` if given, else
+> `$TOKENGRAPH_ROOT`, else the directory the server was launched from. A path in
+> any other form matches nothing and returns an empty result rather than an error.
 
 | Tool | Purpose |
 |---|---|
@@ -672,6 +714,47 @@ source files ──parse──► symbols + edges + embeddings + summaries ─�
 - **Retrieve:** hybrid seed search (lexical + semantic, reciprocal-rank fused) → BFS over `CALLS`/`INHERITS` edges → tiered budget fill (full bodies → signatures → **module summaries** → indexed chunks → dropped-by-name).
 
 `.gitignore` is respected by default (a lightweight matcher; also skips `.git`, `node_modules`, `__pycache__`, `build`, `dist`, virtualenvs, etc.). To exclude paths from AI context **without** changing what git tracks, add any of the assistant-specific ignore files ContextIQ also honors — `.contextiqignore`, `.claudeignore`, `.cursorignore`, `.codeiumignore` (Windsurf/Cline), or `.aiexclude` (Gemini) — using the same glob syntax; their rules are unioned with `.gitignore`.
+
+---
+
+## Exporting the graph
+
+`symbols` are nodes and `edges` are typed relationships, so the index is already
+a property graph. `export` serializes it into the formats other tools speak —
+useful when you want a query language, a layout engine, or a picture rather than
+a context pack.
+
+```bash
+python tokengraph_all.py export --level module --format dot -o graph.dot
+dot -Tsvg graph.dot -o graph.svg            # architecture diagram, one command
+
+python tokengraph_all.py export --format cypher -o graph.cypher
+cypher-shell -f graph.cypher                # then query it in Neo4j
+```
+
+| Format | Consumed by | Notes |
+|---|---|---|
+| `dot` | Graphviz | node shape by kind, edge color by type, weight as the edge label |
+| `cypher` | Neo4j | batched `MERGE` + a uniqueness constraint, so re-running after a reindex converges instead of duplicating |
+| `graphml` | Gephi, yEd, Cytoscape Desktop, `networkx.read_graphml` | full typed attribute schema |
+| `json` | d3, cytoscape.js, your own tooling | `{meta, nodes, edges}` |
+
+**`--level` trades detail for legibility.** `symbol` is the raw graph;
+`file` and `module` collapse it by aggregating symbol edges onto their container
+and carrying the count as `weight` — which is what makes a large repo
+renderable. `weight` is always 1 at symbol level (`edges` is
+`UNIQUE(src, dst, type)`, so two calls to one function are one edge) and only
+becomes a coupling measure once collapsed.
+
+Narrow it with `--edges CALLS,IMPORTS`, `--kinds function,class`, and
+`--max-nodes N` (keeps the highest-degree nodes and reports exactly what it
+dropped — the cap is never silent). Output is timestamp-free, so two exports of
+an unchanged index are byte-identical and diff cleanly in git.
+
+One caveat the graph itself will not tell you: regex-tier languages produce
+**no** call edges (`langs --repo` shows the split), so an isolated node in a
+regex-indexed file means "not extracted", not "not called". Every node carries a
+`tier` property so you can filter those out before drawing conclusions.
 
 ---
 

@@ -103,7 +103,7 @@ Recommended files:
 
 This repo already uses `.github/copilot-instructions.md` and `CLAUDE.md` to tell agents to use ContextIQ first.
 
-One command wires both the MCP server and these steering files into every editor: `python tokengraph_all.py ide-setup` (add `--verify` to prove each editor is wired, `--global` for Windsurf/Cline). ContextIQ is **model-agnostic and offline** — it emits context packs and never calls an LLM, so the same setup serves cloud agents (Copilot, Claude Code, Cursor) and local models (Ollama, llama.cpp, vLLM) alike.
+One command wires both the MCP server and these steering files: `python tokengraph_all.py ide-setup` — by default into Claude Code + VS Code/Copilot (plus any editor detected in the repo); add `--all` for every editor, `--verify` to prove each is wired, `--global` for Windsurf/Cline. ContextIQ is **model-agnostic and offline** — it emits context packs and never calls an LLM, so the same setup serves cloud agents (Copilot, Claude Code, Cursor) and local models (Ollama, llama.cpp, vLLM) alike.
 
 ---
 
