@@ -4978,17 +4978,21 @@ def graph_snapshot(store: "Store", level: str = "symbol",
             if lang:
                 b["langs"][lang] = b["langs"].get(lang, 0) + int(f["token_est"] or 0)
         for key, b in buckets.items():
-            # Weight the reported language by tokens, not by file count: a
-            # module holding one large source file and three READMEs is not a
-            # markdown module.
-            lang = max(b["langs"].items(), key=lambda kv: (kv[1], kv[0]))[0] \
-                if b["langs"] else ""
             # A container's tier is the BEST tier it contains, because the
             # question the tier answers is "can an absence of edges here be
             # trusted?" — and one parsed file is enough for edges to exist.
             tier = max((language_tier(x) for x in b["langs"]),
                        key=lambda t: EXTRACTION_TIERS[t]["rank"],
-                       default=language_tier(lang))
+                       default="regex")
+            # Report the language from that same tier, token-weighted within
+            # it: a module of one source file and three READMEs is not a
+            # markdown module however large the docs, and the tier/language
+            # pair must not contradict itself (tier "ast", language
+            # "markdown"). Ties break alphabetically for determinism.
+            pool = {x: t for x, t in b["langs"].items()
+                    if language_tier(x) == tier}
+            lang = max(pool.items(), key=lambda kv: (kv[1], kv[0]))[0] \
+                if pool else ""
             nodes[key] = node(
                 key, label=key.rsplit("/", 1)[-1] if level == "file" else key,
                 kind=level, file=key if level == "file" else "",
