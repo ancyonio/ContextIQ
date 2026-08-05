@@ -39,5 +39,5 @@ the **shape** of the curves is the point.
 - Synthetic modules are uniform; a real repo's hub structure shifts absolute
   numbers but not the linear-index / vector-bound-pack behavior.
 - Retrieval also benefits from the neighbour relevance floor
-  (`TOKENGRAPH_NEIGHBOR_FLOOR`, default 0.06), which roughly halved pack
+  (`TOKENGRAPH_NEIGHBOR_FLOOR`, default 0.12), which roughly halved pack
   latency on the fixture corpus — see the benchmark section in the README.

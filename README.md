@@ -19,7 +19,7 @@ The graph **auto-refreshes on every query**, so it never goes stale — even rig
 - **Grounded creation & guardrails** — close the loop from *retrieval* to *safe code generation*: detect house **`conventions`** (and **`conventions --fix`** to auto-rename outliers to house style), **`scaffold`** convention-matched files, **`verify-plan`** / **`verify-output`** to flag fabricated files / symbols / local imports, **`review`** a diff for scope-drift, hub-edits, missing tests and breaking changes, and **`create`** to orchestrate them through a gated pipeline.
 - **Realized-savings ledger** — every `context` / `ask` / `measure` / `generate` call (and the MCP context tool) appends its pack-vs-whole-file delta to a privacy-safe, count-only ledger. **`gain`** rolls it up into a token + **dollar** report with `--since` windows, per-op breakdown, daily/weekly/monthly trends, and a self-contained **`--html`** dashboard. **`status`** gives a one-line repo snapshot (branch / dirty / index freshness / notes / cumulative savings).
 - **Monorepo-aware** — **`generate --monorepo`** discovers every nested package by manifest and writes per-package context; **`--each`** does the same per immediate sub-directory.
-- **Auditable & measurable** — deterministic, hash-grounded **`evidence`** packs for CI, and a reproducible multi-repo **`hallucination`** reduction benchmark.
+- **Auditable & measurable** — deterministic, hash-grounded **`evidence`** packs for CI, and a reproducible multi-repo **`hallucination`** benchmark (pass `--baseline` to model a reduction figure).
 - **Cost & context optimization** — **model-aware token counting** and pre-flight **`cost`** estimation (input+output USD across **GPT / Claude / Gemini / Llama**, `--compare` to pick the cheapest sufficient model), **`prompt-score`** to catch under-specified prompts before they burn a round-trip, automatic **context deduplication** in every pack (plus **`dedupe`** for ad-hoc blocks), and **`summarize-chat`** to compress a long session into a token-cheap brief. All deterministic and local.
 
 ---
@@ -197,7 +197,7 @@ python tokengraph_all.py create "add retry to http client" --answer-file out.py 
 # Auditable evidence + guard measurement
 python tokengraph_all.py evidence "the task" -o evidence.json  # deterministic, hash-grounded pack (context_hash + anchor_coverage)
 python tokengraph_all.py grounding                       # quantify the hallucination guard (fabrications caught vs real flagged)
-python tokengraph_all.py hallucination -o HALLUCINATION.md  # multi-repo, reproducible hallucination-reduction benchmark + report
+python tokengraph_all.py hallucination -o HALLUCINATION.md  # multi-repo, reproducible hallucination benchmark + report (--baseline adds the reduction figure)
 
 # Cross-session memory (local to the repo)
 python tokengraph_all.py memory --add "decided to use FTS5"  # append a note
@@ -278,7 +278,10 @@ python tokengraph_all.py embed-warm     # one-time download + verify, then re-em
 
 `embed-warm` is a separate step on purpose: a query must never stall for minutes
 on a model download, so nothing is fetched implicitly. Once the model is cached
-locally it is picked up automatically — no env var required.
+locally it is picked up automatically — no env var required. (One exception:
+the **stdio MCP server** defaults embeddings to `off` unless
+`TOKENGRAPH_EMBEDDINGS` says otherwise, so an editor query can never stall on
+model loading.)
 
 Which backend is live is never a guess:
 
@@ -373,7 +376,7 @@ savings (all time): 209,426 tokens saved across 2 run(s)  (96.1% reduction)
   measure             1      104,443      94.9%
 ```
 
-> The dollar figure is an **indicative projection** — saved tokens × the model's list input price (`claude-opus`/`claude-sonnet`/`claude-haiku`/`gpt-4o`/`gpt-4o-mini`/`gpt-4.1`/`gemini-1.5-pro`/`gemini-1.5-flash`). It estimates avoided input cost, not a billing reconciliation.
+> The dollar figure is an **indicative projection** — saved tokens × the model's list input price, for any model in the built-in price table (20 models across the Claude, GPT, Gemini and Llama families — see `pricing`). It estimates avoided input cost, not a billing reconciliation.
 
 `status` gives the at-a-glance version for any session:
 
@@ -428,10 +431,10 @@ python tokengraph_all.py create "add retry to http client" --apply       # orche
 
 ```bash
 python tokengraph_all.py evidence "the task" -o evidence.json   # byte-stable, hash-grounded pack for CI
-python tokengraph_all.py hallucination -o HALLUCINATION.md      # reproducible multi-repo reduction benchmark
+python tokengraph_all.py hallucination -o HALLUCINATION.md      # reproducible multi-repo benchmark
 ```
 
-`evidence` emits a deterministic JSON artifact (same index + task → identical `context_hash`) with per-file `reason` / `confidence` / `source_lines` / `related_tests` / `risk_label` and an `anchor_coverage` proving each cited symbol resolves to a real line span. `hallucination` partitions the repo and reports a modeled, reproducible codebase-fact hallucination-reduction figure with a per-repo spread.
+`evidence` emits a deterministic JSON artifact (same index + task → identical `context_hash`) with per-file `reason` / `confidence` / `source_lines` / `related_tests` / `risk_label` and an `anchor_coverage` proving each cited symbol resolves to a real line span. `hallucination` partitions the repo and reports reproducible codebase-fact measurements with a per-repo spread; supply `--baseline` (deliberately defaultless — the tool cannot observe your model's raw rate) to model a reduction figure.
 
 ---
 
@@ -451,7 +454,9 @@ python tokengraph_all.py dist          # CI release workflow + Dockerfile + Home
 Every path below is the one the host actually reads — verified, not assumed.
 Steering files are marker-scoped, so hand-written text around the generated
 block survives regeneration, and each host gets a budget sized to its window
-rather than one identical blob.
+rather than one identical blob. The marker block itself is **excluded from the
+index** (generated output is never source), so steering docs don't feed back
+into context packs or trip the fabrication guard.
 
 | Host | MCP config | Steering file |
 |---|---|---|
@@ -597,7 +602,7 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 | `estimate_call_cost(prompt, model="claude-sonnet", expected_output_tokens=500, compare=False)` | Price an API call **before** sending it — model-aware input+output USD; `compare=True` ranks GPT/Claude/Gemini/Llama cheapest-first |
 | `count_tokens_model(text, model="gpt-4o")` | Model-aware token count across the GPT / Claude / Gemini / Llama tokenizer families |
 | `score_prompt_quality(prompt)` | Score a **prompt** 0–100 on clarity / specificity / context / actionability, with concrete fix suggestions (distinct from `judge`, which scores an *answer*) |
-| `dedupe_context(blocks, threshold=0.8)` | Remove near-duplicate context snippets (packs are already deduped automatically; this is for ad-hoc blocks) |
+| `dedupe_context(blocks, threshold=0.8, semantic=False)` | Remove near-duplicate context snippets (packs are already deduped automatically; this is for ad-hoc blocks); `semantic=True` collapses paraphrases too |
 | `summarize_chat(transcript, max_tokens=400)` | Compress a chat transcript into a token-cheap brief — decisions, action items, open questions, code entities touched |
 | `reindex()` | Force a full rescan (auto-refresh already runs per call) |
 
@@ -612,7 +617,7 @@ In VS Code 1.102+, open the file and click **Start** on the server (or reload th
 | `review_diff(staged=False)` | Audit the working/staged diff for scope-drift, hub-edits, missing tests, and breaking changes (removed symbols with live callers) |
 | `create(task, kind="module", answer="", apply=False)` | Gated state machine: scaffold → verify-plan → verify-output → review; dry-run unless `apply=True` |
 | `evidence(task, budget_tokens=6000)` | Deterministic, hash-grounded evidence pack for audit/CI — per-file `reason`/`confidence`/`source_lines`/`related_tests`/`risk_label` + `context_hash` + `anchor_coverage` |
-| `hallucination_benchmark(sample_per_repo=40, baseline_per_100=99.8)` | Reproducible multi-repo codebase-fact hallucination-reduction benchmark (no LLM) |
+| `hallucination_benchmark(sample_per_repo=40, baseline_per_100=None)` | Reproducible multi-repo codebase-fact hallucination benchmark (no LLM); pass `baseline_per_100` to model a reduction figure |
 
 > **Privacy:** all output is secret-scanned (AWS/GitHub/JWT/DB-URL/SSH/GCP/Stripe/Twilio/Slack + generic password patterns redacted to `[REDACTED]`). Memory, checkpoints, and learning weights never leave the repo.
 

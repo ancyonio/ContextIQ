@@ -1603,6 +1603,37 @@ class ComprehensiveSolutionGapTests(unittest.TestCase):
         self.assertTrue(res["scaffold"]["written"])
         self.assertTrue((self.root / res["scaffold"]["proposed_path"]).exists())
 
+    # ---- generated steering output is never source (CFG-6) ----
+    def test_generated_block_blanked_at_index_time_lines_preserved(self):
+        _write(self.root, "NOTES.md",
+               "# Hand-written title\n"
+               f"{tg.CLAUDE_BEGIN}\n"
+               "## Generated heading\n"
+               f"{tg.CLAUDE_END}\n"
+               "## Real section\n")
+        store = self._store()
+        try:
+            self.assertIsNone(store.symbol_by_qname("NOTES.Generated heading"))
+            real = store.symbol_by_qname("NOTES.Real section")
+            self.assertIsNotNone(real)
+            # blanked, not removed: content after the block keeps its line
+            self.assertEqual(real["lineno"], 5)
+        finally:
+            store.close()
+
+    def test_create_pipeline_survives_its_own_generated_context(self):
+        """index -> generate -> create must pass: the steering doc ContextIQ
+        writes may not re-enter packs and trip verify-plan's fabrication guard
+        on the tool's own prose (`tokengraph`)."""
+        tg.write_adapter(self.root, "copilot",
+                         "Use the `tokengraph` MCP server: `list_modules()`.")
+        r = self._retriever()
+        try:
+            res = tg.create_pipeline(r, self.root, "add a subtract helper")
+        finally:
+            r.close()
+        self.assertTrue(res["ok"], res["stages"])
+
     def test_create_pipeline_fails_gate_on_bad_output(self):
         r = self._retriever()
         try:

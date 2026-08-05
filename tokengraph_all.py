@@ -637,10 +637,41 @@ def module_name(repo_root: Path, path: Path) -> str:
     return ".".join(parts) if parts else path.stem
 
 
+def strip_generated_blocks(text: str) -> str:
+    """Blank out ContextIQ-generated steering blocks (CLAUDE_BEGIN..CLAUDE_END).
+
+    Generated artefacts are never source (CFG-6). Indexing our own steering
+    output feeds it back into context packs, where the fabrication guard then
+    flags the tool's own prose (e.g. `tokengraph`) as hallucinated symbols.
+    Block lines are replaced with empty lines, not removed, so hand-written
+    content around the block keeps its true line numbers.
+    """
+    if CLAUDE_BEGIN not in text:
+        return text
+    out: list[str] = []
+    in_block = False
+    for line in text.splitlines(keepends=True):
+        if not in_block and CLAUDE_BEGIN in line:
+            in_block = True
+        if in_block:
+            out.append("\n" if line.endswith("\n") else "")
+            if CLAUDE_END in line:
+                in_block = False
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def read_source_text(path: Path) -> str:
+    """Read a file for indexing, with generated steering blocks blanked."""
+    return strip_generated_blocks(
+        path.read_text(encoding="utf-8", errors="replace"))
+
+
 def parse_file(repo_root: Path, path: Path) -> ParseResult:
     rel = path.relative_to(repo_root).as_posix()
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = read_source_text(path)
     except OSError as e:
         return ParseResult(rel, "", error=str(e))
 
@@ -1972,7 +2003,7 @@ def parse_treesitter(repo_root: Path, path: Path,
                      profile: LanguageProfile) -> ParseResult:
     rel = path.relative_to(repo_root).as_posix()
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = read_source_text(path)
     except OSError as e:
         return ParseResult(rel, "", error=str(e))
 
@@ -2317,7 +2348,7 @@ def _line_end_for_defs(defs: list[tuple[int, str, str]], total_lines: int, index
 def parse_generic(repo_root: Path, path: Path, language: str) -> ParseResult:
     rel = path.relative_to(repo_root).as_posix()
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = read_source_text(path)
     except OSError as e:
         return ParseResult(rel, "", error=str(e))
 
@@ -4117,6 +4148,7 @@ open close read write append super self this new return if else for while def
 class import from func var let const async await yield throw catch try except
 finally with as in is not and or none null true false void main get post put
 delete patch console log error warn info debug assert require module exports
+tokengraph contextiq
 """.split())
 
 
@@ -4666,7 +4698,7 @@ def index_repo(root: Path, db_path: Path, ignores: set[str] | None = None,
             continue
 
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = read_source_text(path)
         except OSError as ex:
             report.errors.append(f"{rel}: {ex}")
             continue
@@ -17797,6 +17829,8 @@ def build_parser():
                     choices=["auto", "stacktrace", "cilog", "json", "text"])
     sq.add_argument("--json", action="store_true")
     sq.add_argument("--no-refresh", action="store_true")
+    sq.add_argument("--no-track", action="store_true",
+                    help="don't record this run's delta in the savings ledger")
     sq.set_defaults(func=cmd_squeeze)
 
     co = sub.add_parser("cost", help="estimate the USD cost of an API call before sending it")
@@ -17823,6 +17857,8 @@ def build_parser():
     sc.add_argument("--text-file", default=None)
     sc.add_argument("--max-tokens", type=int, default=400)
     sc.add_argument("--json", action="store_true")
+    sc.add_argument("--no-track", action="store_true",
+                    help="don't record this run's delta in the savings ledger")
     sc.set_defaults(func=cmd_summarize_chat)
 
     dd = sub.add_parser("dedupe",
@@ -17835,6 +17871,8 @@ def build_parser():
                     help="match by embedding cosine (collapses paraphrases); "
                          "pair with a higher --threshold (~0.9)")
     dd.add_argument("--json", action="store_true")
+    dd.add_argument("--no-track", action="store_true",
+                    help="don't record this run's delta in the savings ledger")
     dd.set_defaults(func=cmd_dedupe)
 
     pt = sub.add_parser("prompt",
