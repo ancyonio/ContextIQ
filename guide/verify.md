@@ -34,7 +34,7 @@ Anything missing is flagged, with **did-you-mean** suggestions for near matches.
 
 ```bash
 # 1. Check the plan references real code and understand the blast radius
-tokengraph verify-plan --answer-file plan.md
+tokengraph verify-plan --plan-file plan.md
 
 # 2. After generation, audit the produced code
 tokengraph verify-output --answer-file patch.diff

@@ -43,7 +43,7 @@ A quick map from *what you're trying to do* to *the command that does it*.
 
 | You want to… | Use |
 | --- | --- |
-| Confirm context is sufficient first | `validate "task" --min-coverage 0.6` |
+| Confirm context is sufficient first | `validate "task" --min-coverage 60` |
 | Score if the answer is grounded | `judge --answer-file … --context-file …` |
 | Catch fabricated files / symbols | `verify --answer-file …` |
 

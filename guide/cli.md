@@ -32,7 +32,7 @@ point elsewhere with the global `--path PATH`.
 | `explain FILE` | Signatures + imports + external callers for a file |
 | `skeleton FILE` | Every signature in a file, no bodies |
 | `summary FILE` | Compact module summary |
-| `get_symbol` / `callers` / `callees QNAME` | Full source, or trace the call graph |
+| `callers` / `callees QNAME` | Trace the call graph (full symbol source: MCP `get_symbol`) |
 | `impact QNAME` | Blast radius: callers / subclasses / tests |
 | `method-impact QNAME` | Function-level: who breaks / deps / overrides / call sites |
 | `test-map [TARGET]` | Map implementations ↔ tests (+ coverage %) |
@@ -43,8 +43,8 @@ point elsewhere with the global `--path PATH`.
 
 | Command | Purpose |
 | --- | --- |
-| `validate "task" --min-coverage 0.6` | Coverage gate; exit 1 if insufficient |
-| `judge --answer-file A --context-file C` | Score if an answer is grounded (0–1) |
+| `validate "task" --min-coverage 60` | Coverage gate (percent, default 60); exit 1 if insufficient |
+| `judge --answer-file A --context-file C` | Score if an answer is grounded (0–100%) |
 | `verify --answer-file A` | Flag fabricated files / symbols; exit 1 if any |
 | `grounding` | Quantify the guard: fabrications caught vs real refs flagged |
 
@@ -76,7 +76,7 @@ point elsewhere with the global `--path PATH`.
 
 | Command | Purpose |
 | --- | --- |
-| `index` / `reindex` | Build / rebuild the graph |
+| `index` | Build / rebuild the graph (MCP tool: `reindex`) |
 | `serve` | Run the MCP server (stdio or HTTP) |
 | `ide-setup` | Wire the MCP server + rules (default: Claude Code + VS Code/Copilot; `--all` for every editor) |
 | `ide-plugin` | Scaffold installable VS Code / Neovim / JetBrains plugins |

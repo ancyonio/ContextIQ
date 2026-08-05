@@ -70,7 +70,7 @@ well the context *covers* it, and the *risk* of acting on it.
 ## 5. Validate the coverage (CI-friendly gate)
 
 ```bash
-tokengraph validate "auth login token" --min-coverage 0.6
+tokengraph validate "auth login token" --min-coverage 60
 ```
 
 Exits non-zero if coverage is below the threshold — wire it into a hook so an
@@ -84,7 +84,8 @@ Save your assistant's answer, then score it against the context you gave it:
 tokengraph judge --answer-file response.txt --context-file context.md
 ```
 
-Outputs a 0.0–1.0 grounding score with PASS/FAIL.
+Outputs a 0–100% grounding score with a `grounded=True/False` verdict
+(threshold 50%).
 
 ## 7. Verify — catch fabricated files & symbols
 

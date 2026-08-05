@@ -1,6 +1,6 @@
 ---
 title: Judge
-description: "Score whether an AI answer is actually grounded in the context you gave it — a 0.0–1.0 grounding score with PASS/FAIL."
+description: "Score whether an AI answer is actually grounded in the context you gave it — a 0–100% grounding score with a grounded verdict."
 head:
   - - meta
     - property: og:title
@@ -32,7 +32,8 @@ tokengraph judge --answer "the retry helper lives in http/client.py" \
 
 ## Output
 
-A grounding **score (0.0–1.0)** with a PASS/FAIL indication. A low score means
+A grounding **score (0–100%)** with a **`grounded=True/False`** verdict
+(threshold 50%). A low score means
 the answer asserts things the context doesn't back up — treat it as a prompt to
 retrieve more or push back on the model.
 

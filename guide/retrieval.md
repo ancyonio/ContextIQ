@@ -68,11 +68,12 @@ tokengraph federated "find the auth middleware" --root ../svc-a --root ../svc-b
 Merges a per-repo-sectioned pack from several roots — useful in a microservice
 or polyrepo setup.
 
-## Session reuse
+## Session reuse (MCP)
 
-Pass a stable `session` id so symbols already sent this session (and unchanged)
-are referenced by name instead of resent — repeated retrievals in one
-conversation cost far fewer tokens.
+Over MCP, pass a stable `session` id to `find_relevant_context(task,
+session="…")` so symbols already sent this session (and unchanged) are
+referenced by name instead of resent — repeated retrievals in one conversation
+cost far fewer tokens. (The CLI `context` command has no session flag.)
 
 ## Next steps
 

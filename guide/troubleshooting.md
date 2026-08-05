@@ -26,7 +26,7 @@ tokengraph status      # branch / index freshness / savings snapshot
 ## Indexing
 
 - **Stale or empty results** — the graph auto-refreshes, but you can force it:
-  `tokengraph reindex`. Confirm counts with `tokengraph stats`.
+  `tokengraph index` (MCP tool: `reindex`). Confirm counts with `tokengraph stats`.
 - **A file isn't parsed deeply** — its tree-sitter grammar may be missing; it
   falls back to regex. Check `tokengraph langs` and `tokengraph diagnose-extractors`.
 
@@ -46,7 +46,8 @@ tokengraph status      # branch / index freshness / savings snapshot
 
 - **`validate` always fails** — lower `--min-coverage`, raise `--budget`, or make
   the task string more specific.
-- **`verify` flags real symbols** — the graph may be behind; `reindex` and retry.
+- **`verify` flags real symbols** — the graph may be behind; run
+  `tokengraph index` and retry.
 
 ## Still stuck?
 

@@ -53,8 +53,8 @@ The default set is `claude` + `vscode` plus any editor detected in the repo;
 ## Running the server manually
 
 ```bash
-tokengraph serve                 # stdio (default for editors)
-tokengraph serve --http          # HTTP transport
+tokengraph serve                    # stdio (default for editors)
+tokengraph serve --transport http   # HTTP transport (default port 8756)
 ```
 
 ## Key MCP tools
@@ -83,7 +83,8 @@ This applies to `get_module_summary`, `file_skeleton`, `explain_file`,
 `get_lines`, `set_module_summary`, `get_test_map`, and friends.
 
 **2. "Repo-relative" means relative to the server's root**, resolved once at
-launch: `serve --path PATH` if given, else `$TOKENGRAPH_ROOT`, else the
+launch: `tokengraph --path PATH serve` if given (`--path` is a global flag and
+precedes the subcommand), else `$TOKENGRAPH_ROOT`, else the
 directory the server was launched from. To get the right root in every
 workspace:
 
