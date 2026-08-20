@@ -39,6 +39,14 @@ point elsewhere with the global `--path PATH`.
 | `lines FILE 40 80` | Surgical line range (secret-scanned, sandboxed) |
 | `map imports\|hierarchy\|routes\|hubs` | Project graph views |
 
+`map routes` covers Flask/FastAPI, Django URLconfs, Express, NestJS, Rails,
+Spring, Go and Next.js-style file-based endpoints, including declarations split
+across several lines. Each route carries the `handler` symbol it belongs to —
+taken from the decorated function, the handler named in the call, or the
+enclosing one — which is the link between an app's HTTP surface and its call
+graph. Where no handler can be identified honestly (a Django route declared
+inside `urlpatterns`), the field is simply absent rather than guessed.
+
 ## Trust gates
 
 | Command | Purpose |

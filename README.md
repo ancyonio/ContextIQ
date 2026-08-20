@@ -15,7 +15,7 @@ The graph **auto-refreshes on every query**, so it never goes stale — even rig
 
 - **One file, zero required dependencies** to run the CLI ([tokengraph_all.py](tokengraph_all.py)).
 - Works as an **MCP server** (50+ tools) for MCP-capable clients, with one-command wiring for VS Code / Cursor / Windsurf / Zed / Claude Code and locally generated plugin projects for VS Code / Neovim / JetBrains. Marketplace publication remains a separate release step.
-- **Deep parsing with a full call / import / inheritance graph for 25+ languages** — **Python** (stdlib `ast`) and, via tree-sitter, **Java / Go / TypeScript / JavaScript / C / C++ / C# / Rust / PHP / Ruby / Kotlin / Swift / Scala / Lua / Bash / Solidity / Perl / Erlang / Julia / R / Haskell / OCaml / Nim / PowerShell / Dart**. Plus lightweight regex indexing for **30+ more languages** — SQL / Elixir / Clojure / F# / Groovy / Zig / Crystal / Haxe / Objective-C / Visual Basic / Tcl / Pascal / GDScript and markup/config (Vue, Svelte, HTML, CSS, YAML, TOML, XML, INI, GraphQL, Terraform, Protobuf, **Markdown**, Dockerfile, …). Every deep-parsed language falls back to regex when its grammar isn't installed. Run `python tokengraph_all.py langs` to list them all.
+- **Deep parsing with a full call / import / inheritance graph for 25+ languages** — **Python** (stdlib `ast`) and, via tree-sitter, **Java / Go / TypeScript / JavaScript / C / C++ / C# / Rust / PHP / Ruby / Kotlin / Swift / Scala / Lua / Bash / Solidity / Perl / Erlang / Julia / R / Haskell / OCaml / Nim / PowerShell / Dart / SQL**. **SQL is parsed as schema, not text**: tables, columns, views and indexes become symbols, and foreign keys — inline, as a named constraint, or added by an `ALTER TABLE` migration — become `REFERENCES` edges, so `impact` on a table names the tables, views and migrations that depend on it. Plus lightweight regex indexing for **30+ more languages** — Elixir / Clojure / F# / Groovy / Zig / Crystal / Haxe / Objective-C / Visual Basic / Tcl / Pascal / GDScript and markup/config (Vue, Svelte, HTML, CSS, YAML, TOML, XML, INI, GraphQL, Terraform, Protobuf, **Markdown**, Dockerfile, …). Every deep-parsed language falls back to regex when its grammar isn't installed. Run `python tokengraph_all.py langs` to list them all.
 - **Grounded creation & guardrails** — close the loop from *retrieval* to *safe code generation*: detect house **`conventions`** (and **`conventions --fix`** to auto-rename outliers to house style), **`scaffold`** convention-matched files, **`verify-plan`** / **`verify-output`** to flag fabricated files / symbols / local imports, **`review`** a diff for scope-drift, hub-edits, missing tests and breaking changes, and **`create`** to orchestrate them through a gated pipeline.
 - **Realized-savings ledger** — every `context` / `ask` / `measure` / `generate` call (and the MCP context tool) appends its pack-vs-whole-file delta to a privacy-safe, count-only ledger. **`gain`** rolls it up into a token + **dollar** report with `--since` windows, per-op breakdown, daily/weekly/monthly trends, and a self-contained **`--html`** dashboard. **`status`** gives a one-line repo snapshot (branch / dirty / index freshness / notes / cumulative savings).
 - **Monorepo-aware** — **`generate --monorepo`** discovers every nested package by manifest and writes per-package context; **`--each`** does the same per immediate sub-directory.
@@ -85,6 +85,18 @@ Slimmer extras: `[mcp]`, `[tokens]`, `[langpack]`, `[treesitter]`, and `[ann]` (
 With zero extras the single file still runs the full CLI (regex parsing +
 heuristic token counts).
 
+**Install `[langpack]` at minimum if you can.** Without the grammars the
+deep-parse languages fall back to regex, which finds definitions but produces
+**no call edges** — so `get_callers` on a Rust function comes back empty for a
+structural reason, not because nothing calls it. That downgrade used to be
+visible only to someone who ran `langs --repo`; now `index` and `doctor` both
+name it and say what it costs:
+
+```
+grammars: 14 file(s) indexed at the regex tier — definitions only, no call
+graph (12 rust, 2 ruby). Install the grammars with: pip install 'contextiq[langpack]'
+```
+
 Set `TOKENGRAPH_OFFLINE=1` to disable remote configuration loading and optional
 neural-model loading. The deterministic hash embedding remains available. The
 vector backend is `auto` by default: it uses exact cosine at repo scale and
@@ -151,7 +163,7 @@ python tokengraph_all.py test-map --benchmark            # measured precision/re
 python tokengraph_all.py lines path/to/file.py 40 80    # exact line range (secret-scanned, sandboxed)
 python tokengraph_all.py arch                            # whole-repo overview: modules + hubs + cycles + languages + routes
 python tokengraph_all.py map imports                     # import graph (or: hierarchy | routes | hubs)
-python tokengraph_all.py map routes                      # HTTP endpoints (Flask/FastAPI/Express/Spring/Go)
+python tokengraph_all.py map routes                      # HTTP endpoints + the handler symbol each one serves
 python tokengraph_all.py map hubs                        # fan-in/out ranking + import cycles
 python tokengraph_all.py import-scip index.scip.json     # add precise external REFERENCES edges
 
@@ -278,10 +290,19 @@ python tokengraph_all.py embed-warm     # one-time download + verify, then re-em
 
 `embed-warm` is a separate step on purpose: a query must never stall for minutes
 on a model download, so nothing is fetched implicitly. Once the model is cached
-locally it is picked up automatically — no env var required. (One exception:
-the **stdio MCP server** defaults embeddings to `off` unless
-`TOKENGRAPH_EMBEDDINGS` says otherwise, so an editor query can never stall on
-model loading.)
+locally it is picked up automatically — no env var required.
+
+**The stdio MCP server follows the index.** It used to force the hash backend
+unconditionally, which quietly made `embed-warm` a no-op for the interface most
+people actually use — an editor got lexical matching no matter what had been
+downloaded. Now it reads the backend the graph was *built* with: a graph whose
+vectors are in a neural space was made by someone who ran `embed-warm`, so the
+model is cached and its vectors are meaningless in any other space. In that case
+the server loads the model **before** it starts serving, so no tool call ever
+stalls on it and the import can't write to the JSON-RPC stream. With no index,
+hash vectors, or `TOKENGRAPH_EMBEDDINGS` set explicitly, the instant hash
+backend still applies. `index` now prints which space it built in, so a wheel
+installed but never warmed no longer degrades silently.
 
 Which backend is live is never a guess:
 

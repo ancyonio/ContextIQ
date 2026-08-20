@@ -888,6 +888,315 @@ class ArchitectureMapTests(unittest.TestCase):
         self.assertTrue(any(set(c) == {"a", "b", "c"} for c in cycles))
 
 
+SCHEMA_SQL = """\
+-- Every person who can sign in.
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    org_id INTEGER REFERENCES orgs(id)
+);
+
+CREATE TABLE orgs (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id)
+);
+
+CREATE INDEX idx_orders_user ON orders (user_id);
+
+CREATE VIEW active_orders AS
+    SELECT o.id, u.email FROM orders o JOIN users u ON u.id = o.user_id;
+"""
+
+
+class SqlSchemaGraphTests(unittest.TestCase):
+    """DDL is code: tables/columns/views as symbols, foreign keys as edges.
+
+    Skipped without the grammar — the regex fallback recovers table names only,
+    which is exactly the gap this tier closes.
+    """
+
+    def setUp(self):
+        if ".sql" not in tg._profiles():          # cached: build_profiles() is expensive
+            self.skipTest("sql tree-sitter grammar not installed")
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+        _write(self.root, "schema.sql", SCHEMA_SQL)
+        _write(self.root, "migrate_002.sql",
+               "ALTER TABLE orgs ADD CONSTRAINT fk_owner "
+               "FOREIGN KEY (owner_id) REFERENCES users (id);\n")
+        tg.index_repo(self.root, self.db)
+        self.store = tg.Store(self.db)
+        self.addCleanup(self.store.close)
+
+    def _edges(self) -> set:
+        return {(r["src"], r["dst"]) for r in self.store.conn.execute(
+            "SELECT ss.qname src, sd.qname dst FROM edges e "
+            "JOIN symbols ss ON ss.id=e.src_id JOIN symbols sd ON sd.id=e.dst_id "
+            "WHERE e.type='REFERENCES'")}
+
+    def test_sql_is_deep_parsed_not_regex_scanned(self):
+        self.assertEqual(tg.tier_for_path(Path("x.sql")), "tree-sitter")
+        self.assertEqual(tg.language_tier("sql"), "tree-sitter")
+
+    def test_tables_columns_indexes_and_views_are_symbols(self):
+        for qname, kind in (("schema.users", "table"),
+                            ("schema.users.email", "column"),
+                            ("schema.orders.user_id", "column"),
+                            ("schema.idx_orders_user", "index"),
+                            ("schema.active_orders", "view")):
+            row = self.store.symbol_by_qname(qname)
+            self.assertIsNotNone(row, qname)
+            self.assertEqual(row["kind"], kind, qname)
+
+    def test_column_signature_keeps_the_declaration(self):
+        row = self.store.symbol_by_qname("schema.users.org_id")
+        self.assertIn("REFERENCES", row["signature"])
+
+    def test_foreign_keys_become_edges_in_both_spellings(self):
+        edges = self._edges()
+        # inline on the column ...
+        self.assertIn(("schema.users", "schema.orgs"), edges)
+        # ... and as a named table constraint
+        self.assertIn(("schema.orders", "schema.users"), edges)
+
+    def test_view_and_index_carry_lineage_to_their_tables(self):
+        edges = self._edges()
+        self.assertIn(("schema.active_orders", "schema.orders"), edges)
+        self.assertIn(("schema.active_orders", "schema.users"), edges)
+        self.assertIn(("schema.idx_orders_user", "schema.orders"), edges)
+
+    def test_alter_table_in_another_file_still_links_both_tables(self):
+        edges = self._edges()
+        self.assertIn(("migrate_002", "schema.orgs"), edges)
+        self.assertIn(("migrate_002", "schema.users"), edges)
+
+    def test_leading_comment_becomes_the_docstring(self):
+        row = self.store.symbol_by_qname("schema.users")
+        self.assertIn("sign in", row["docstring"])
+
+    def test_impact_of_a_table_names_what_depends_on_it(self):
+        r = tg.Retriever(self.root, self.db)
+        try:
+            direct = set(r.get_impact("schema.users")["direct_callers"])
+        finally:
+            r.close()
+        self.assertIn("schema.orders", direct)
+        self.assertIn("schema.active_orders", direct)
+
+
+class GrammarGapTests(unittest.TestCase):
+    """PF-1: a missing grammar is a silent downgrade, so it must be announced."""
+
+    ROWS = [{"path": "src/lib.rs", "language": "rust"},
+            {"path": "src/main.rs", "language": "rust"},
+            {"path": "app/models.rb", "language": "ruby"},
+            {"path": "README.md", "language": "markdown"},
+            {"path": "core.py", "language": "python"}]
+
+    def test_gap_lists_only_languages_a_grammar_would_upgrade(self):
+        with unittest.mock.patch.object(tg, "_profiles", return_value={}):
+            gap = tg.grammar_gap(self.ROWS)
+        self.assertEqual(gap, {"rust": 2, "ruby": 1})   # not markdown, not python
+
+    def test_no_gap_once_the_grammar_is_present(self):
+        with unittest.mock.patch.object(
+                tg, "_profiles", return_value={".rs": object(), ".rb": object()}):
+            self.assertEqual(tg.grammar_gap(self.ROWS), {})
+        self.assertEqual(tg.format_grammar_gap({}), "")
+
+    def test_hint_names_the_cost_and_the_command(self):
+        hint = tg.format_grammar_gap({"rust": 14})
+        self.assertIn("14 rust", hint)
+        self.assertIn("no call graph", hint)
+        self.assertIn("contextiq[langpack]", hint)
+
+    def test_pack_table_is_the_single_source_of_deep_parsable_extensions(self):
+        for ext in (".rs", ".rb", ".go", ".sql", ".ts"):
+            self.assertIn(ext, tg.DEEP_PARSABLE_EXTENSIONS, ext)
+        # Python is deep-parsed without any grammar, so it can never be a gap.
+        self.assertIn(".py", tg.DEEP_PARSABLE_EXTENSIONS)
+        self.assertNotIn(".md", tg.DEEP_PARSABLE_EXTENSIONS)
+
+
+class CodeVsProseMetricTests(unittest.TestCase):
+    """Coverage denominators must count code, not docs."""
+
+    def test_is_code_path_separates_source_from_prose_and_config(self):
+        for p in ("a.py", "src/x.ts", "pkg/main.go", "schema.sql", "Dockerfile",
+                  "Makefile", "app/x.vue"):
+            self.assertTrue(tg.is_code_path(p), p)
+        for p in ("README.md", ".prompts/bug-fix.md", ".github/workflows/ci.yml",
+                  "pyproject.toml", "data.json", "site.css", "page.html"):
+            self.assertFalse(tg.is_code_path(p), p)
+
+    def test_dotfiles_without_an_extension_are_code(self):
+        self.assertTrue(tg.is_code_path(".gitignore"))
+
+    def test_test_map_excludes_prose_from_the_denominator(self):
+        files = ["engine.py", "tests/test_engine.py", "README.md",
+                 ".prompts/feature.md", ".github/workflows/ci.yml",
+                 "pyproject.toml"]
+        m = tg.build_test_map(files)
+        self.assertEqual(m["impls"], ["engine.py"])
+        self.assertEqual(m["untested_impls"], [])          # not 4 markdown files
+        self.assertEqual(len(m["non_code_files"]), 4)
+
+    def test_is_code_language_mirrors_the_path_rule(self):
+        self.assertTrue(tg.is_code_language("python"))
+        self.assertTrue(tg.is_code_language("sql"))
+        self.assertFalse(tg.is_code_language("markdown"))
+        self.assertFalse(tg.is_code_language("yaml"))
+
+
+class SfcDeepParseTests(unittest.TestCase):
+    """Vue/Svelte `<script>` blocks are TS/JS, so they get a real call graph."""
+
+    VUE = ('<template>\n  <button @click="submit">go</button>\n</template>\n'
+           '\n'
+           '<script lang="ts">\n'
+           'import { postOrder } from "./api";\n'
+           '\n'
+           'export function submit(): void {\n'
+           '  postOrder("1");\n'
+           '}\n'
+           '</script>\n'
+           '\n<style>button { color: red; }</style>\n')
+    API = 'export function postOrder(id: string): void {}\n'
+
+    def setUp(self):
+        if ".vue" not in tg._profiles():          # cached: build_profiles() is expensive
+            self.skipTest("typescript grammar not installed")
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.db = self.root / ".tokengraph" / "graph.db"
+        _write(self.root, "Checkout.vue", self.VUE)
+        _write(self.root, "api.ts", self.API)
+        tg.index_repo(self.root, self.db)
+        self.store = tg.Store(self.db)
+        self.addCleanup(self.store.close)
+
+    def test_sfc_is_deep_parsed(self):
+        self.assertEqual(tg.tier_for_path(Path("a.vue")), "tree-sitter")
+        self.assertEqual(tg.language_for_path(Path("a.vue")), "vue")
+
+    def test_script_symbols_are_extracted(self):
+        self.assertIsNotNone(self.store.symbol_by_qname("Checkout.submit"))
+
+    def test_line_numbers_match_the_real_file(self):
+        row = self.store.symbol_by_qname("Checkout.submit")
+        line = (self.root / "Checkout.vue").read_text(
+            encoding="utf-8").splitlines()[row["lineno"] - 1]
+        self.assertIn("function submit", line)
+
+    def test_calls_cross_into_other_modules(self):
+        callees = [r["qname"] for r in self.store.neighbors(
+            self.store.id_for_qname("Checkout.submit"), ["CALLS"], "out")]
+        self.assertIn("api.postOrder", callees)
+
+    def test_markup_outside_the_script_block_is_not_parsed(self):
+        masked = tg.sfc_script_mask(self.VUE)
+        self.assertNotIn("<template>", masked)
+        self.assertNotIn("color: red", masked)
+        self.assertIn("postOrder", masked)
+        # Blanked, not removed: every script line keeps the index it has in the
+        # real file, which is what makes the recorded line spans usable.
+        original = self.VUE.splitlines()
+        for i, line in enumerate(masked.splitlines()):
+            if line:
+                self.assertEqual(line, original[i])
+
+
+class RouteExtractionTests(unittest.TestCase):
+    """Routes across frameworks, and the handler each one belongs to."""
+
+    FILES = {
+        "api/main.py": ('@app.get("/health")\n'
+                        'def health():\n    return {}\n\n'
+                        '@app.post(\n    "/orders",\n    status_code=201,\n)\n'
+                        'def create_order():\n    return {}\n'),
+        "web/urls.py": ('urlpatterns = [\n'
+                        '    path("orders/<int:pk>/", views.detail),\n]\n'),
+        "server/routes.js": ('function listUsers(req, res) {}\n'
+                             'router.get("/users", listUsers);\n'),
+        "src/users.controller.ts": ('export class UsersController {\n'
+                                    '  @Get(":id")\n'
+                                    '  findOne(id: string) { return id; }\n\n'
+                                    '  @Post()\n'
+                                    '  create() { return 1; }\n}\n'),
+        "config/routes.rb": ('  get "/reports", to: "reports#index"\n'
+                             '  resources :projects\n'),
+        "pages/api/users/[id].ts": 'export default function handler() {}\n',
+        "app/orders/route.ts": 'export function GET() { return 1; }\n',
+    }
+
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        db = self.root / ".tokengraph" / "graph.db"
+        for rel, text in self.FILES.items():
+            _write(self.root, rel, text)
+        tg.index_repo(self.root, db)
+        r = tg.Retriever(self.root, db)
+        self.addCleanup(r.close)
+        self.routes = r.get_map("routes")["routes"]
+        self.pairs = {(rt["method"], rt["path"]) for rt in self.routes}
+
+    def _handler(self, method, path):
+        for rt in self.routes:
+            if (rt["method"], rt["path"]) == (method, path):
+                return rt.get("handler")
+        return None
+
+    def test_decorator_split_across_lines_is_found(self):
+        self.assertIn(("POST", "/orders"), self.pairs)
+
+    def test_django_urlconf_routes(self):
+        self.assertIn(("ANY", "/orders/<int:pk>/"), self.pairs)
+
+    def test_nestjs_decorators_including_the_bare_form(self):
+        self.assertIn(("GET", "/:id"), self.pairs)
+        self.assertIn(("POST", "/"), self.pairs)   # @Post() — verb, not a path
+
+    def test_rails_verbs_and_resources(self):
+        self.assertIn(("GET", "/reports"), self.pairs)
+        self.assertIn(("ANY", "/projects"), self.pairs)
+
+    def test_file_based_routes(self):
+        self.assertIn(("ANY", "/users/:id"), self.pairs)   # pages/api/users/[id].ts
+        self.assertIn(("ANY", "/orders"), self.pairs)      # app/orders/route.ts
+
+    def test_handler_comes_from_the_named_argument(self):
+        self.assertEqual(self._handler("GET", "/users"), "server.routes.listUsers")
+
+    def test_handler_comes_from_the_decorated_function(self):
+        self.assertEqual(self._handler("GET", "/health"), "api.main.health")
+        self.assertEqual(self._handler("POST", "/orders"), "api.main.create_order")
+
+    def test_no_handler_beats_a_wrong_one(self):
+        # The Django route sits inside the `urlpatterns` list; naming a list
+        # constant as the handler would be worse than reporting none.
+        self.assertIsNone(self._handler("ANY", "/orders/<int:pk>/"))
+
+    def test_logical_lines_report_the_starting_line(self):
+        joined = tg._logical_lines(['f(', '  "x",', ')', 'g()'])
+        self.assertEqual(joined[0][0], 1)          # starts on line 1
+        self.assertEqual(joined[0][1], 2)          # spans two more lines
+        self.assertEqual(joined[-1][0], 4)
+
+    def test_fs_route_path_conventions(self):
+        self.assertEqual(tg._fs_route_path("pages/api/users/[id].ts"), "/users/:id")
+        self.assertEqual(tg._fs_route_path("pages/api/index.ts"), "/")
+        self.assertEqual(tg._fs_route_path("app/a/b/route.ts"), "/a/b")
+        self.assertIsNone(tg._fs_route_path("src/components/Button.tsx"))
+
+
 class NewLanguageTests(unittest.TestCase):
     """G14: broadened regex-fallback languages."""
 
@@ -2373,11 +2682,33 @@ class LedgerLoggingTests(unittest.TestCase):
                                baseline_tokens=100, files=0)   # saved = 0
         self.assertEqual(tg.read_gain_ledger(self.root), [])
 
+    # A traceback with vendor frames to elide — what `squeeze` exists for, and
+    # what makes the saving real rather than an artefact of the token counter.
+    # The previous fixture was a four-line app-only traceback with nothing to
+    # remove: it netted a single token from a stripped trailing newline under
+    # tiktoken and exactly zero under the char-heuristic fallback, so this test
+    # failed wherever tiktoken could not load its encoding.
+    VENDOR_TRACEBACK = (
+        'Traceback (most recent call last):\n'
+        '  File "app.py", line 5, in main\n'
+        '    go()\n'
+        '  File "/usr/lib/python3.11/site-packages/flask/app.py", line 2213, in wsgi_app\n'
+        '    response = self.full_dispatch_request()\n'
+        '  File "/usr/lib/python3.11/site-packages/flask/app.py", line 1799, in dispatch\n'
+        '    rv = self.handle_user_exception(e)\n'
+        '  File "/usr/lib/python3.11/site-packages/werkzeug/serving.py", line 335, in run\n'
+        '    execute(self.server.app)\n'
+        '  File "app.py", line 22, in handler\n'
+        '    return charge(order)\n'
+        'ValueError: nope\n'
+    )
+
     def test_squeeze_cli_logs(self):
-        self._run(tg.cmd_squeeze,
-                  text=('Traceback (most recent call last):\n'
-                        '  File "app.py", line 5, in main\n    go()\nValueError: nope\n'),
-                  kind="auto")
+        res = tg.squeeze_text(self.VENDOR_TRACEBACK, kind="auto")
+        self.assertEqual(res["kind"], "stacktrace")           # precondition
+        self.assertGreater(res["tokens_saved"], 0,            # precondition
+                           "fixture must be something squeeze can actually shrink")
+        self._run(tg.cmd_squeeze, text=self.VENDOR_TRACEBACK, kind="auto")
         rows = [r for r in tg.read_gain_ledger(self.root) if r["op"] == "squeeze"]
         self.assertEqual(len(rows), 1)
         self.assertGreater(rows[0]["saved"], 0)
@@ -2826,6 +3157,39 @@ class EmbeddingBackendTests(_RepoCase):
         self.assertTrue(info["status"])
         if not info["semantic"]:
             self.assertIn("does NOT match by meaning", info["note"])
+
+    def test_stdio_default_is_hash_until_the_index_says_otherwise(self):
+        """EM-3: `embed-warm` must actually reach the MCP server."""
+        _write(self.root, "a.py", "def alpha():\n    return 1\n")
+        tg.index_repo(self.root, self.db)
+        saved = os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+        self.addCleanup(lambda: os.environ.__setitem__(
+            "TOKENGRAPH_EMBEDDINGS", saved) if saved is not None else None)
+        try:
+            # No index at all -> the instant, robust default.
+            os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+            self.assertTrue(tg._stdio_embedding_default(self.root / "nope.db"))
+            self.assertEqual(os.environ["TOKENGRAPH_EMBEDDINGS"], "off")
+
+            # A graph built in a neural space -> follow it, do not force hash.
+            store = tg.Store(self.db)
+            try:
+                store.set_meta("embed_backend", "st:all-MiniLM-L6-v2")
+                store.commit()
+            finally:
+                store.close()
+            os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+            self.assertFalse(tg._stdio_embedding_default(self.db))
+            self.assertIsNone(os.environ.get("TOKENGRAPH_EMBEDDINGS"))
+
+            # An explicit choice always wins over both.
+            os.environ["TOKENGRAPH_EMBEDDINGS"] = "off"
+            self.assertFalse(tg._stdio_embedding_default(self.db))
+            self.assertEqual(os.environ["TOKENGRAPH_EMBEDDINGS"], "off")
+        finally:
+            os.environ.pop("TOKENGRAPH_EMBEDDINGS", None)
+            if saved is not None:
+                os.environ["TOKENGRAPH_EMBEDDINGS"] = saved
 
     def test_vectors_carry_backend_and_stale_ones_are_dropped(self):
         _write(self.root, "a.py", "def alpha():\n    return 1\n")
@@ -3697,6 +4061,56 @@ class TestDiscoveryTests(unittest.TestCase):
         for p in ("calc.py", "src/auth.ts", "pkg/cache/cache.go",
                   "java/Money.java"):
             self.assertFalse(tg.is_test_path(p), p)
+
+    def test_graph_links_pair_a_name_divergent_suite(self):
+        """The whole point: a suite named nothing like what it covers."""
+        files = ["engine.py", "tests/test_everything.py"]
+        m = tg.build_test_map(files)
+        self.assertIn("tests/test_everything.py", m["unmatched_tests"])
+        m = tg.build_test_map(
+            files, {"tests/test_everything.py": {"engine.py": 40}})
+        self.assertEqual(m["impl_to_tests"]["engine.py"],
+                         ["tests/test_everything.py"])
+        self.assertEqual(m["pairs"][0]["via"], "graph")
+
+    def test_graph_links_never_override_a_naming_match(self):
+        files = ["calc.py", "other.py", "tests/test_calc.py"]
+        m = tg.build_test_map(
+            files, {"tests/test_calc.py": {"other.py": 99}})
+        self.assertEqual(m["impl_to_tests"]["calc.py"], ["tests/test_calc.py"])
+        self.assertNotIn("other.py", m["impl_to_tests"])
+        self.assertEqual(m["pairs"][0]["via"], "naming")
+
+    def test_graph_links_reject_weak_and_minority_evidence(self):
+        """One name-resolved edge is a coincidence; a trickle is not coverage."""
+        files = ["core.py", "helper.py", "tests/test_suite.py"]
+        m = tg.build_test_map(files, {"tests/test_suite.py": {"helper.py": 1}})
+        self.assertIn("tests/test_suite.py", m["unmatched_tests"])
+        # helper.py is real but dwarfed by core.py -> below the share floor.
+        m = tg.build_test_map(
+            files, {"tests/test_suite.py": {"core.py": 400, "helper.py": 3}})
+        self.assertEqual(m["test_to_impl"]["tests/test_suite.py"], ["core.py"])
+
+    def test_get_test_map_uses_the_graph_for_the_repo_map(self):
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            db = root / ".tokengraph" / "graph.db"
+            _write(root, "engine.py",
+                   "def start():\n    return 1\n\n\ndef stop():\n    return 0\n")
+            # Name gives the mapper nothing; the calls are the only signal.
+            _write(root, "tests/test_smoke_all.py",
+                   "from engine import start, stop\n\n"
+                   "def test_start():\n    assert start() == 1\n\n"
+                   "def test_stop():\n    assert stop() == 0\n")
+            tg.index_repo(root, db)
+            r = tg.Retriever(root, db)
+            try:
+                tm = r.get_test_map()
+                self.assertEqual(tm["impl_to_tests"].get("engine.py"),
+                                 ["tests/test_smoke_all.py"])
+                self.assertNotIn("engine.py", tm["untested_impls"])
+            finally:
+                r.close()
 
     def test_build_test_map_cross_language(self):
         files = ["calc.py", "tests/test_calc.py", "orders.py", "orders_test.py",

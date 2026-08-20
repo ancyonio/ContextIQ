@@ -895,6 +895,10 @@ class LanguageProfile:
     # being reachable only by accident through a chunk. Locals are excluded:
     # the walker only consults this at definitional scope.
     BINDING_KINDS: dict[str, str] = {}
+    # Node types that relate symbols defined *elsewhere* instead of defining
+    # anything themselves (SQL `ALTER TABLE … ADD CONSTRAINT … REFERENCES`, in
+    # its own migration file). `relations_of` turns one into edge triples.
+    RELATION_TYPES: set[str] = set()
 
     def __init__(self, language):
         from tree_sitter import Parser  # type: ignore[import-not-found]
@@ -921,6 +925,25 @@ class LanguageProfile:
         return leading_doc_comment(node)
 
     def bases_of(self, node) -> list[str]:
+        return []
+
+    def refs_of(self, node) -> list[str]:
+        """Names this definition depends on without calling or inheriting them.
+
+        A SQL foreign key, or the tables a view selects from: a real dependency
+        that is neither a call nor a base type. Emitted as `REFERENCES` edges,
+        the same type SCIP ingestion produces, so blast radius and context
+        expansion pick them up with no special-casing.
+        """
+        return []
+
+    def relations_of(self, node) -> list[tuple[str, str, str]]:
+        """`(source leaf, target leaf, edge type)` for a RELATION_TYPES node.
+
+        An empty source leaf means the file itself — the right answer when the
+        statement relates symbols this file does not define, so there is no
+        local qname to hang the edge on.
+        """
         return []
 
     def callee_of(self, node) -> Optional[str]:
@@ -1508,6 +1531,167 @@ class SolidityProfile(_TsBase):
         return _text(s).strip("'\"").split("/")[-1].rsplit(".", 1)[0]
 
 
+class SfcProfile(TsJsProfile):
+    """A single-file component whose `<script>` block is TS/JS.
+
+    Marked so `parse_path` masks the markup before handing the file to the
+    TypeScript grammar. Everything else — definitions, calls, imports — is the
+    ordinary TS/JS behaviour, which is the point: an SFC frontend gets the same
+    call graph as any other TypeScript, at the cost of one regex.
+    """
+    sfc = True
+
+
+class VueProfile(SfcProfile):
+    name = "vue"
+
+
+class SvelteProfile(SfcProfile):
+    name = "svelte"
+
+
+_SFC_SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script>", re.S | re.I)
+
+
+def sfc_script_mask(text: str) -> str:
+    """The component's script blocks, with everything else blanked out.
+
+    Blanked rather than extracted so every symbol keeps the line number it has
+    in the real file — `get_lines`, body slicing and editor jumps all read the
+    original file, so a shifted span would point at the wrong code.
+    """
+    lines = text.splitlines()
+    masked = [""] * len(lines)
+    for m in _SFC_SCRIPT_RE.finditer(text):
+        start = text.count("\n", 0, m.start(1))
+        for offset, line in enumerate(m.group(1).splitlines()):
+            if start + offset < len(masked):
+                masked[start + offset] = line
+    return "\n".join(masked)
+
+
+def _sql_child(node, *types):
+    """First *direct* child of one of `types`, in source order.
+
+    Deliberately not `_first_descendant`, which walks the subtree in reverse:
+    on `CREATE TABLE users (org_id INT REFERENCES orgs(id))` that would return
+    the *referenced* table as the name of the one being defined.
+    """
+    if node is None:
+        return None
+    for c in node.children:
+        if c.type in types:
+            return c
+    return None
+
+
+def _sql_name(node) -> Optional[str]:
+    """Leaf of a possibly schema-qualified object reference (`public.users`)."""
+    if node is None:
+        return None
+    leaf = _text(node).strip().split(".")[-1].strip().strip('`"[]')
+    return leaf or None
+
+
+def _sql_uniq(names) -> list[str]:
+    out: list[str] = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def _sql_fk_targets(node) -> list[str]:
+    """Tables named by a REFERENCES clause anywhere under `node`.
+
+    Covers both spellings: inline on the column (`org_id INT REFERENCES orgs`)
+    and a named table constraint (`CONSTRAINT fk FOREIGN KEY (…) REFERENCES …`),
+    which is also the form `ALTER TABLE … ADD CONSTRAINT` carries.
+    """
+    return _sql_uniq(
+        _sql_name(d.next_named_sibling)
+        for d in _descendants(node)
+        if d.type == "keyword_references"
+        and d.next_named_sibling is not None
+        and d.next_named_sibling.type == "object_reference")
+
+
+def _sql_query_sources(node) -> list[str]:
+    """Tables a SELECT under `node` reads — view and function lineage."""
+    return _sql_uniq(_sql_name(_sql_child(d, "object_reference"))
+                     for d in _descendants(node) if d.type == "relation")
+
+
+class SqlProfile(_TsBase):
+    """Schema as a graph: tables, columns, views, indexes and foreign keys.
+
+    A regex scan of DDL recovers a table's *name* and nothing else, which left
+    the database tier structurally weaker than every code tier — `get_impact`
+    on a table could only ever come back empty, and an empty answer there was
+    indistinguishable from "nothing depends on this". Here a table is a scope
+    whose columns are symbols in their own right, and every REFERENCES clause
+    becomes a real `REFERENCES` edge, so blast radius, context expansion and
+    the graph export treat schema exactly like code. Views and SQL functions
+    carry lineage edges to the tables they read.
+    """
+    name = "sql"
+    DEF_KINDS = {
+        "create_table": "table",
+        "create_view": "view",
+        "create_materialized_view": "view",
+        "create_index": "index",
+        "create_function": "function",
+        "create_type": "type",
+        "column_definition": "column",
+    }
+    RELATION_TYPES = {"alter_table"}
+    _QUERY_DEFS = ("create_view", "create_materialized_view", "create_function")
+
+    def name_of(self, node):
+        # `CREATE INDEX <name> ON <table>` names the index with a bare
+        # identifier and the table with an object_reference; a column
+        # definition likewise leads with its identifier.
+        if node.type in ("create_index", "column_definition"):
+            c = _sql_child(node, "identifier")
+            return _text(c) if c is not None else None
+        return _sql_name(_sql_child(node, "object_reference"))
+
+    def body_of(self, node):
+        # A table's body is its column list, so columns are recorded as
+        # definitions scoped to the table (`schema.orders.user_id`).
+        return _sql_child(node, "column_definitions", "create_query",
+                          "function_body") or node
+
+    def refs_of(self, node):
+        t = node.type
+        if t == "create_table":
+            return _sql_fk_targets(node)
+        if t in self._QUERY_DEFS:
+            return _sql_query_sources(node)
+        if t == "create_index":
+            return _sql_uniq([_sql_name(_sql_child(node, "object_reference"))])
+        return []
+
+    def doc_of(self, node):
+        # Top-level DDL is wrapped in a `statement`, so the comment describing
+        # a table is the wrapper's preceding sibling, not the table's.
+        doc = leading_doc_comment(node)
+        if not doc and node.parent is not None and node.parent.type == "statement":
+            doc = leading_doc_comment(node.parent)
+        return doc
+
+    def relations_of(self, node):
+        # ALTER TABLE relates tables it does not define — in a migration the
+        # subject usually lives in an earlier file — so there is no local qname
+        # to hang the edge on and these attach to the file. That still answers
+        # the question worth asking ("which migrations touch this table?"),
+        # while the inline-constraint form, how most schemas spell a foreign
+        # key, keeps producing exact table-to-table edges.
+        return [("", name, "REFERENCES") for name in _sql_uniq(
+            [_sql_name(_sql_child(node, "object_reference"))]
+            + _sql_fk_targets(node))]
+
+
 class PerlProfile(_TsBase):
     name = "perl"
     DEF_KINDS = {
@@ -1829,6 +2013,8 @@ class _Walk:
         if with_bases or kind not in ("function", "method"):
             for b in self.p.bases_of(def_node):
                 self.edges.append(PendingEdge(qname, b, "INHERITS"))
+        for r in self.p.refs_of(def_node):
+            self.edges.append(PendingEdge(qname, r, "REFERENCES"))
         # A def body may be a container (block/template_body — walk its
         # statements) OR an expression that is *itself* a call, as in
         # expression-bodied defs (`def run() = helper()`, Lua/OCaml/F#/Scala).
@@ -1869,6 +2055,13 @@ class _Walk:
                                  kind in CLASS_KINDS)
                 return
 
+        if t in self.p.RELATION_TYPES:
+            for src, dst, etype in self.p.relations_of(node):
+                self.edges.append(PendingEdge(
+                    f"{self.module}.{src}" if src else self.module, dst, etype))
+            self._walk(node, scope)
+            return
+
         # CN-1: a binding is a symbol only at file or type scope. Inside a
         # function body the same node type is a local, which would swamp the
         # symbol table without answering any question.
@@ -1893,6 +2086,64 @@ class _Walk:
         self._walk(node, scope)
 
 
+class TSProfile(TsJsProfile):
+    name = "typescript"
+
+
+class TSXProfile(TsJsProfile):
+    name = "tsx"
+
+
+class JSProfile(TsJsProfile):
+    name = "javascript"
+
+
+# Every language the tree-sitter language pack can deep-parse, as
+# (pack grammar name, profile class, extensions…). Declared once so the loader
+# and the "you are missing grammars" diagnostic can never disagree about what
+# *could* carry a call graph — the gap only misleads if the two drift apart.
+PACK_LANGUAGES: tuple[tuple, ...] = (
+    ("c", CFamilyProfile, ".c", ".h"),
+    ("cpp", CppProfile, ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"),
+    ("csharp", CSharpProfile, ".cs"),
+    ("rust", RustProfile, ".rs"),
+    ("ruby", RubyProfile, ".rb", ".rake"),
+    ("php", PhpProfile, ".php"),
+    ("kotlin", KotlinProfile, ".kt", ".kts"),
+    ("swift", SwiftProfile, ".swift"),
+    ("scala", ScalaProfile, ".scala", ".sc"),
+    # languages upgraded from flat regex to a full graph (definitions plus
+    # call / import / inheritance edges) by the pack.
+    ("lua", LuaProfile, ".lua"),
+    ("bash", BashProfile, ".sh", ".bash", ".zsh"),
+    ("solidity", SolidityProfile, ".sol"),
+    ("perl", PerlProfile, ".pl", ".pm"),
+    ("erlang", ErlangProfile, ".erl", ".hrl"),
+    ("julia", JuliaProfile, ".jl"),
+    ("r", RProfile, ".r"),
+    ("haskell", HaskellProfile, ".hs"),
+    ("ocaml", OCamlProfile, ".ml", ".mli"),
+    ("nim", NimProfile, ".nim", ".nims"),
+    ("powershell", PowerShellProfile, ".ps1", ".psm1", ".psd1"),
+    ("dart", DartProfile, ".dart"),
+    # DDL is code: deep-parsing it makes tables, columns and foreign keys
+    # first-class graph nodes instead of bare names.
+    ("sql", SqlProfile, ".sql", ".ddl"),
+    # also cover the original deep-parse languages when their solo wheels are absent
+    ("java", JavaProfile, ".java"),
+    ("go", GoProfile, ".go"),
+    ("typescript", TSProfile, ".ts", ".mts", ".cts"),
+    ("tsx", TSXProfile, ".tsx"),
+    ("javascript", JSProfile, ".js", ".jsx", ".mjs", ".cjs"),
+)
+
+# Extensions that get a call graph *when the grammars are installed*. Python is
+# always deep-parsed (stdlib `ast`); SFCs ride on the TypeScript grammar.
+DEEP_PARSABLE_EXTENSIONS = frozenset(
+    [ext for _name, _cls, *exts in PACK_LANGUAGES for ext in exts]
+    + [".py", ".vue", ".svelte"])
+
+
 # ---- public API -----------------------------------------------------------
 
 def build_profiles() -> dict[str, LanguageProfile]:
@@ -1911,6 +2162,7 @@ def build_profiles() -> dict[str, LanguageProfile]:
         except Exception:
             pass
 
+
     try:
         import tree_sitter_java as tsj  # type: ignore[import-not-found]
         _try(tsj.language, JavaProfile, ".java")
@@ -1923,20 +2175,12 @@ def build_profiles() -> dict[str, LanguageProfile]:
         pass
     try:
         import tree_sitter_typescript as tst  # type: ignore[import-not-found]
-
-        class TSProfile(TsJsProfile):
-            name = "typescript"
-        class TSXProfile(TsJsProfile):
-            name = "tsx"
         _try(tst.language_typescript, TSProfile, ".ts", ".mts", ".cts")
         _try(tst.language_tsx, TSXProfile, ".tsx")
     except Exception:
         pass
     try:
         import tree_sitter_javascript as tsjs  # type: ignore[import-not-found]
-
-        class JSProfile(TsJsProfile):
-            name = "javascript"
         _try(tsjs.language, JSProfile, ".js", ".jsx", ".mjs", ".cjs")
     except Exception:
         pass
@@ -1948,15 +2192,6 @@ def build_profiles() -> dict[str, LanguageProfile]:
     try:
         from tree_sitter_language_pack import get_language as _glang  # type: ignore
 
-        class _TSProfile(TsJsProfile):
-            name = "typescript"
-
-        class _TSXProfile(TsJsProfile):
-            name = "tsx"
-
-        class _JSProfile(TsJsProfile):
-            name = "javascript"
-
         def _pack(lpname, cls, *exts):
             try:
                 prof = cls(_glang(lpname))
@@ -1965,42 +2200,32 @@ def build_profiles() -> dict[str, LanguageProfile]:
             for e in exts:
                 profiles.setdefault(e, prof)
 
-        _pack("c", CFamilyProfile, ".c", ".h")
-        _pack("cpp", CppProfile, ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx")
-        _pack("csharp", CSharpProfile, ".cs")
-        _pack("rust", RustProfile, ".rs")
-        _pack("ruby", RubyProfile, ".rb", ".rake")
-        _pack("php", PhpProfile, ".php")
-        _pack("kotlin", KotlinProfile, ".kt", ".kts")
-        _pack("swift", SwiftProfile, ".swift")
-        _pack("scala", ScalaProfile, ".scala", ".sc")
-        # languages upgraded from flat regex to full graph processing
-        # (definitions + call / import / inheritance edges) via the pack.
-        _pack("lua", LuaProfile, ".lua")
-        _pack("bash", BashProfile, ".sh", ".bash", ".zsh")
-        _pack("solidity", SolidityProfile, ".sol")
-        _pack("perl", PerlProfile, ".pl", ".pm")
-        _pack("erlang", ErlangProfile, ".erl", ".hrl")
-        _pack("julia", JuliaProfile, ".jl")
-        _pack("r", RProfile, ".r")
-        _pack("haskell", HaskellProfile, ".hs")
-        _pack("ocaml", OCamlProfile, ".ml", ".mli")
-        _pack("nim", NimProfile, ".nim", ".nims")
-        _pack("powershell", PowerShellProfile, ".ps1", ".psm1", ".psd1")
-        _pack("dart", DartProfile, ".dart")
-        # also cover the original deep-parse languages if their solo wheels are absent
-        _pack("java", JavaProfile, ".java")
-        _pack("go", GoProfile, ".go")
-        _pack("typescript", _TSProfile, ".ts", ".mts", ".cts")
-        _pack("tsx", _TSXProfile, ".tsx")
-        _pack("javascript", _JSProfile, ".js", ".jsx", ".mjs", ".cjs")
+        for lpname, cls, *exts in PACK_LANGUAGES:
+            _pack(lpname, cls, *exts)
     except Exception:
         pass
+
+    # Vue/Svelte single-file components: the markup is not code, but the
+    # `<script>` block inside it is TS/JS the existing grammar already handles.
+    # Reusing the TypeScript Language object (a superset of JS) gives SFC
+    # frontends a real call graph without another wheel.
+    ts_profile = profiles.get(".ts")
+    if ts_profile is not None:
+        for cls, ext in ((VueProfile, ".vue"), (SvelteProfile, ".svelte")):
+            try:
+                profiles.setdefault(ext, cls(ts_profile.language))
+            except Exception:
+                pass
     return profiles
 
 
-def parse_treesitter(repo_root: Path, path: Path,
-                     profile: LanguageProfile) -> ParseResult:
+def parse_treesitter(repo_root: Path, path: Path, profile: LanguageProfile,
+                     parse_text: str | None = None) -> ParseResult:
+    """Parse `path` with `profile`. `parse_text` substitutes what the grammar
+    sees — used for single-file components, where the markup must be hidden
+    from a TS parser. The hash and line count still come from the real file, so
+    incremental reindexing and line spans stay tied to what is on disk.
+    """
     rel = path.relative_to(repo_root).as_posix()
     try:
         text = read_source_text(path)
@@ -2015,7 +2240,7 @@ def parse_treesitter(repo_root: Path, path: Path,
         qname=mod, name=mod.split(".")[-1], kind="module", file=rel,
         lineno=1, end_lineno=nlines, signature=f"module {mod}"))
 
-    src = text.encode("utf-8")
+    src = (text if parse_text is None else parse_text).encode("utf-8")
     try:
         tree = profile.parser.parse(src)
     except Exception as e:
@@ -2045,7 +2270,7 @@ GENERIC_LANGUAGE_EXTENSIONS: dict[str, str] = {
     ".c": "c", ".h": "c", ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
     ".rs": "rust", ".php": "php", ".rb": "ruby", ".kt": "kotlin",
     ".kts": "kotlin", ".swift": "swift", ".scala": "scala",
-    ".sc": "scala", ".sql": "sql",
+    ".sc": "scala", ".sql": "sql", ".ddl": "sql",
     # markup / framework / config (FR-2 breadth — regex, no native deps)
     ".vue": "vue", ".svelte": "svelte",
     ".graphql": "graphql", ".gql": "graphql",
@@ -2423,6 +2648,42 @@ def extractor_version() -> str:
     return f"{EXTRACTOR_GENERATION}:{langs}"
 
 
+# Prose and declarative configuration. These never carry a call graph and
+# nobody writes a unit test against them, so counting them in the denominator
+# of a coverage metric understates the tool rather than informing anyone: a
+# repository whose docs outnumber its modules reads as barely covered when the
+# code itself is covered fine. Kept as two views of one idea — by language for
+# callers that already read a file row, by extension for callers holding a path.
+NON_CODE_LANGUAGES = frozenset({
+    "markdown", "text", "yaml", "toml", "ini", "properties", "xml", "json",
+    "css", "html", "csv",
+})
+NON_CODE_EXTENSIONS = frozenset({
+    ".md", ".markdown", ".mdx", ".txt", ".rst", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".conf", ".properties", ".xml", ".xsd", ".xsl", ".xslt",
+    ".json", ".css", ".scss", ".sass", ".less", ".html", ".htm", ".csv",
+})
+
+
+def is_code_language(language: str) -> bool:
+    """Whether a language is source code rather than prose or configuration."""
+    return bool(language) and language not in NON_CODE_LANGUAGES
+
+
+def is_code_path(path: str) -> bool:
+    """Whether a path is source code rather than prose or configuration.
+
+    Extension-based so it works on a bare path with no index behind it.
+    Extensionless files (Dockerfile, Makefile) count as code, which is the
+    useful default: they carry build logic worth reasoning about.
+    """
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    dot = name.rfind(".")
+    if dot <= 0:                       # no extension, or a leading-dot name
+        return True
+    return name[dot:].lower() not in NON_CODE_EXTENSIONS
+
+
 def language_for_path(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".py":
@@ -2491,6 +2752,42 @@ def language_tier(language: str) -> str:
     return "regex"
 
 
+def grammar_gap(rows) -> dict[str, int]:
+    """Indexed files that *could* carry a call graph but don't, by language.
+
+    Takes rows from `files_with_tokens`. The gap exists because the deep-parse
+    languages fall back to regex when their grammar is missing, which is a
+    silent downgrade: `get_callers` on a Rust function then returns empty for a
+    structural reason the caller cannot see. `langs --repo` has always shown the
+    split, but only to someone who thought to run it.
+    """
+    profiles = _profiles()
+    gap: dict[str, int] = {}
+    for r in rows:
+        path = r["path"] if not isinstance(r, str) else r
+        ext = Path(path).suffix.lower()
+        if ext in DEEP_PARSABLE_EXTENSIONS and ext not in profiles and ext != ".py":
+            lang = (r["language"] if not isinstance(r, str) else "") or ext
+            gap[lang] = gap.get(lang, 0) + 1
+    return gap
+
+
+def format_grammar_gap(gap: dict[str, int]) -> str:
+    """One line naming what the missing grammars cost, or '' when nothing."""
+    if not gap:
+        return ""
+    parts = ", ".join(f"{n} {lang}" for lang, n in
+                      sorted(gap.items(), key=lambda kv: (-kv[1], kv[0])))
+    total = sum(gap.values())
+    return (f"grammars: {total} file(s) indexed at the regex tier — definitions "
+            f"only, no call graph ({parts}). Install the grammars with: "
+            f"pip install 'contextiq[langpack]'")
+
+
+def grammar_gap_hint(rows) -> str:
+    return format_grammar_gap(grammar_gap(rows))
+
+
 def tier_for_path(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".py":
@@ -2504,6 +2801,13 @@ def parse_path(repo_root: Path, path: Path):
         return parse_file(repo_root, path)
     prof = _profiles().get(ext)
     if prof is not None:
+        if getattr(prof, "sfc", False):
+            try:
+                masked = sfc_script_mask(read_source_text(path))
+            except OSError as e:
+                return ParseResult(path.relative_to(repo_root).as_posix(),
+                                   "", error=str(e))
+            return parse_treesitter(repo_root, path, prof, parse_text=masked)
         return parse_treesitter(repo_root, path, prof)
     language = (GENERIC_LANGUAGE_EXTENSIONS.get(ext)
                 or GENERIC_LANGUAGE_FILENAMES.get(path.name.lower()))
@@ -3283,6 +3587,54 @@ class Store:
             "SELECT path, token_est, symbols_count, language FROM files "
             "ORDER BY path").fetchall()
 
+    def handler_for_line(self, file: str, line: int,
+                         lookahead: int = 3) -> Optional[sqlite3.Row]:
+        """The symbol a route declaration on `line` belongs to.
+
+        A decorator sits *above* the function it decorates, so containment
+        alone would report the enclosing class (or nothing). A definition
+        starting within the next few lines therefore wins; otherwise the
+        innermost containing symbol answers, which is right for an inline
+        `app.get(...)` registered inside some setup function.
+        """
+        near = self.conn.execute(
+            "SELECT qname, name, kind FROM symbols "
+            "WHERE file=? AND kind<>'module' AND lineno BETWEEN ? AND ? "
+            "ORDER BY lineno ASC LIMIT 1", (file, line, line + lookahead)).fetchone()
+        if near is not None and near["kind"] in ("function", "method"):
+            return near
+        # Containment is restricted to callables on purpose: a Django route
+        # lives inside the `urlpatterns` list, and naming a list constant as
+        # the handler would be worse than admitting there isn't one here.
+        return self.conn.execute(
+            "SELECT qname, name, kind FROM symbols "
+            "WHERE file=? AND kind IN ('function','method') "
+            "AND lineno<=? AND end_lineno>=? "
+            "ORDER BY (end_lineno - lineno) ASC LIMIT 1",
+            (file, line, line)).fetchone()
+
+    def function_named(self, file: str, name: str) -> Optional[sqlite3.Row]:
+        """A callable defined in `file` with this leaf name."""
+        return self.conn.execute(
+            "SELECT qname, name, kind FROM symbols "
+            "WHERE file=? AND name=? AND kind IN ('function','method') LIMIT 1",
+            (file, name)).fetchone()
+
+    def cross_file_edges(self) -> list[sqlite3.Row]:
+        """`(src_file, dst_file, n)` for every resolved edge crossing files.
+
+        One grouped query rather than a neighbour walk per symbol: callers that
+        want a file-level view of what depends on what would otherwise pay
+        thousands of round trips on a repo-sized graph.
+        """
+        return self.conn.execute(
+            "SELECT ss.file AS src_file, sd.file AS dst_file, COUNT(*) AS n "
+            "FROM edges e "
+            "JOIN symbols ss ON ss.id = e.src_id "
+            "JOIN symbols sd ON sd.id = e.dst_id "
+            "WHERE ss.file <> sd.file "
+            "GROUP BY ss.file, sd.file").fetchall()
+
     def commit(self):
         self.conn.commit()
 
@@ -3505,21 +3857,97 @@ def embed_model_name() -> str:
     return os.environ.get("TOKENGRAPH_EMBED_MODEL", "all-MiniLM-L6-v2")
 
 
-def _stdio_embedding_default() -> bool:
-    """Default a stdio MCP server to the hash embedding unless the operator
-    explicitly chose a backend. Returns True iff it applied the default.
+def _stdio_embedding_default(db: Path | None = None) -> bool:
+    """Choose the stdio MCP server's embedding backend. True iff it forced hash.
 
     A stdio server speaks JSON-RPC over stdout and must stay fast and alive.
     Loading the neural backend (sentence-transformers / TensorFlow) on the first
     `ask` / `find_relevant_context` call can take tens of seconds and, on some
     platforms, crash or write to stdout — either of which drops the connection
-    (-32000: Connection closed). The deterministic hash embedding is instant and
-    robust; neural stays a one-line opt-in (`TOKENGRAPH_EMBEDDINGS=auto`).
+    (-32000: Connection closed).
+
+    Forcing the hash backend *unconditionally*, though, made `embed-warm` a
+    no-op for the interface most people actually use: an editor got the lexical
+    fallback no matter what had been downloaded and indexed, so semantic search
+    silently stopped matching by meaning. The rule is now **follow the index**.
+    Vectors record the space that produced them, so a graph whose stored
+    `embed_backend` is `st:…` was built by someone who ran `embed-warm` — the
+    model is in the local cache, and those vectors are meaningless in any other
+    space. Anything else (no index yet, or hash vectors) keeps the instant,
+    robust default. `cmd_serve` then loads the model before serving, so the
+    stall and the stdout hazard both stay off the request path.
     """
-    if os.environ.get("TOKENGRAPH_EMBEDDINGS") is None:
-        os.environ["TOKENGRAPH_EMBEDDINGS"] = "off"
-        return True
-    return False
+    if os.environ.get("TOKENGRAPH_EMBEDDINGS") is not None:
+        return False                      # the operator chose; respect it
+    if db is not None and Path(db).exists() and not offline_mode():
+        try:
+            store = Store(Path(db))
+            try:
+                built_with = store.get_meta("embed_backend", "")
+            finally:
+                store.close()
+        except Exception:
+            built_with = ""
+        if built_with.startswith("st:"):
+            return False                  # `auto` applies; the model is cached
+    os.environ["TOKENGRAPH_EMBEDDINGS"] = "off"
+    return True
+
+
+def _preload_embeddings() -> dict:
+    """Load the neural backend *before* the JSON-RPC loop starts.
+
+    Two hazards make a lazy first-query load unsafe on stdio: it can take tens
+    of seconds, which the client sees as a hung tool call, and the import chain
+    (torch / TensorFlow) may write to fd 1, which corrupts the protocol stream.
+    Doing it here removes both — nothing has been written to the transport yet,
+    and stdout is pointed at stderr for the duration. Failure is not fatal:
+    `_embed_model` records why and every caller degrades to hashing.
+    """
+    saved = None
+    try:
+        sys.stdout.flush()
+        saved = os.dup(1)
+        os.dup2(2, 1)
+        return embed_backend_info()
+    except Exception as ex:
+        return {"semantic": False, "backend": f"hash-v1-d{EMBED_DIM}",
+                "status": f"preload failed: {type(ex).__name__}: {ex}"}
+    finally:
+        if saved is not None:
+            try:
+                sys.stdout.flush()
+                os.dup2(saved, 1)
+                os.close(saved)
+            except Exception:
+                pass
+
+
+def _report_embedding_backend() -> None:
+    """Say which space the vectors were just built in, and how to improve it.
+
+    Silent degradation was the gap: with `contextiq[embeddings]` installed but
+    the model never fetched, indexing quietly produced hash vectors and
+    `search_semantic` quietly stopped matching by meaning. One line at index
+    time makes the active backend, and the single command that upgrades it,
+    impossible to miss.
+    """
+    info = embed_backend_info()
+    if info["semantic"]:
+        print(f"embeddings: {info['backend']} — semantic search matches by meaning")
+        return
+    print(f"embeddings: {info['backend']} — lexical/structural overlap only")
+    if offline_mode() or os.environ.get(
+            "TOKENGRAPH_EMBEDDINGS", "").strip().lower() in _EMBED_DISABLED:
+        return
+    try:
+        import sentence_transformers  # type: ignore  # noqa: F401
+    except Exception:
+        print("  for true semantic search: pip install 'contextiq[embeddings]' "
+              "&& tokengraph embed-warm")
+        return
+    print(f"  sentence-transformers is installed but {embed_model_name()} is not "
+          f"cached — run `tokengraph embed-warm` once to enable semantic search")
 
 
 def _embed_model():
@@ -4164,6 +4592,9 @@ _ROUTE_PATTERNS: dict[str, list[str]] = {
     "js": [
         r'\b(?:app|router|api|server|route)\.(get|post|put|delete|patch|all|head|options|use)'
         r'\(\s*["\'`]([^"\'`]+)["\'`]',
+        # NestJS controller decorators, with and without an explicit path.
+        r'@(Get|Post|Put|Delete|Patch|All|Head|Options)\(\s*["\'`]([^"\'`]*)["\'`]',
+        r'@(Get|Post|Put|Delete|Patch|All|Head|Options)\(\s*\)',
     ],
     "java": [
         r'@(Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*)?["\']([^"\']+)["\']',
@@ -4173,8 +4604,88 @@ _ROUTE_PATTERNS: dict[str, list[str]] = {
     ],
 }
 
+# Frameworks whose routing verbs are ordinary words everywhere else: Django's
+# `path(...)` and Rails' `get "..."` would produce constant false positives if
+# scanned repo-wide, but both live in a conventionally named file. Scoping them
+# to the file that owns routing buys the coverage without the noise.
+_ROUTE_FILE_PATTERNS: dict[str, list[str]] = {
+    "urls.py": [
+        r'\b(?:re_)?path\(\s*r?["\']([^"\']*)["\']',
+        r'\burl\(\s*r?["\']([^"\']+)["\']',
+    ],
+    "routes.rb": [
+        r'^\s*(get|post|put|patch|delete|match)\s+["\']([^"\']+)["\']',
+        r'^\s*(resources?)\s+:(\w+)',
+        r'^\s*(root)\s+(?:to:\s*)?["\']([^"\']+)["\']',
+    ],
+}
+
 _ROUTE_FAMILY = {"python": "python", "typescript": "js", "javascript": "js",
-                 "java": "java", "go": "go"}
+                 "vue": "js", "svelte": "js", "java": "java", "go": "go",
+                 "kotlin": "java"}
+
+# Next.js / Nuxt style file-based endpoints: the route is the path on disk, so
+# there is no call for a pattern to match and they were invisible to a scan.
+_FS_ROUTE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs")
+
+
+def _fs_route_path(rel: str) -> Optional[str]:
+    """The URL a file-based routing convention gives `rel`, if any."""
+    parts = rel.split("/")
+    stem, dot, ext = parts[-1].rpartition(".")
+    if not dot or f".{ext}" not in _FS_ROUTE_EXTS:
+        return None
+    for i, part in enumerate(parts[:-1]):
+        if part == "pages" and parts[i + 1:i + 2] == ["api"]:
+            segs = parts[i + 2:-1] + ([] if stem == "index" else [stem])
+            break
+        if part == "app" and stem == "route":
+            segs = parts[i + 1:-1]
+            break
+    else:
+        return None
+    # `[id]` is a path parameter; `[...slug]` is a catch-all.
+    out = []
+    for s in segs:
+        if s.startswith("[") and s.endswith("]"):
+            inner = s[1:-1].lstrip(".")
+            out.append(("*" if s[1:4] == "..." else ":") + inner)
+        else:
+            out.append(s)
+    return "/" + "/".join(out) if out else "/"
+
+
+_HTTP_VERBS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "ALL",
+                         "HEAD", "OPTIONS", "WEBSOCKET", "ROUTE"})
+
+# `router.get("/users", listUsers)` — the handler named as the next argument.
+_ROUTE_HANDLER_REF = re.compile(
+    r'["\'`]\s*,\s*(?:async\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)')
+
+
+def _logical_lines(lines: list[str], max_join: int = 4) -> list[tuple[int, int, str]]:
+    """`(line number, text)` with bracket-continued lines joined.
+
+    A route split across lines — a decorator carrying its options below it, an
+    Express handler whose path sits on its own line — never matched a
+    line-anchored pattern. Joining while parentheses stay open makes the
+    multi-line form match without turning the scan into a parser. The reported
+    line stays the one the declaration starts on.
+    """
+    out: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(lines):
+        text = lines[i]
+        depth = text.count("(") - text.count(")")
+        joined = 0
+        while depth > 0 and joined < max_join and i + 1 < len(lines):
+            i += 1
+            joined += 1
+            text += " " + lines[i].strip()
+            depth += lines[i].count("(") - lines[i].count(")")
+        out.append((i - joined + 1, joined, text))
+        i += 1
+    return out
 
 
 def _import_cycles(graph: dict[str, set]) -> list[list[str]]:
@@ -6873,6 +7384,20 @@ class Retriever:
         }
 
     # ---- get_test_map: implementation <-> test discovery (named tool) ----
+    def _test_graph_links(self) -> dict[str, dict[str, int]]:
+        """Test file -> {implementation file: edges into it}, for `build_test_map`.
+
+        The naming heuristic cannot pair a suite whose filename diverges from
+        what it covers; the graph can, because calling, importing or
+        subclassing that code leaves real edges behind.
+        """
+        links: dict[str, dict[str, int]] = {}
+        for row in self.store.cross_file_edges():
+            src, dst = row["src_file"], row["dst_file"]
+            if is_test_path(src) and not is_test_path(dst):
+                links.setdefault(src, {})[dst] = row["n"]
+        return links
+
     def get_test_map(self, target: str = "") -> dict:
         """Map implementations to their tests (and back).
 
@@ -6883,7 +7408,7 @@ class Retriever:
         naming) — the two signals unioned.
         """
         files = [r["path"] for r in self.store.files_with_tokens()]
-        m = build_test_map(files)
+        m = build_test_map(files, self._test_graph_links())
         if not target:
             n_impl = len(m["impls"])
             tested = len(m["impl_to_tests"])
@@ -6900,6 +7425,9 @@ class Retriever:
                     "coverage_pct": round(tested / n_impl * 100, 1) if n_impl else 0.0,
                     "test_files": len(m["tests"]),
                     "pairs": len(m["pairs"]),
+                    # Excluded from the ratio above, reported so the count is
+                    # auditable rather than silently narrowed.
+                    "non_code_files_excluded": len(m["non_code_files"]),
                 },
             }
 
@@ -6907,11 +7435,17 @@ class Retriever:
         row = self.store.symbol_by_qname(target)
         if row:
             impl_file = row["file"]
-            by_name = m["impl_to_tests"].get(impl_file, [])
-            by_edges = sorted({
-                c["file"] for c in self.store.neighbors(
+            # Keep the two signals honestly separated: the file-level map now
+            # also pairs by edges, and folding those into `tests_by_name` would
+            # report a graph result under the naming field.
+            by_name = [p["test"] for p in m["pairs"]
+                       if p["impl"] == impl_file and p["via"] == "naming"]
+            by_edges = sorted(
+                {p["test"] for p in m["pairs"]
+                 if p["impl"] == impl_file and p["via"] == "graph"}
+                | {c["file"] for c in self.store.neighbors(
                     row["id"], ["CALLS", "INHERITS", "REFERENCES"], "in")
-                if is_test_path(c["file"])})
+                   if is_test_path(c["file"])})
             return {
                 "target": target, "kind": "symbol", "file": impl_file,
                 "tests_by_name": sorted(by_name),
@@ -6943,30 +7477,83 @@ class Retriever:
                 "edges": {k: sorted(set(v)) for k, v in graph.items()}}
 
     def _route_map(self, cap: int = 200) -> dict:
-        """Extract HTTP routes (Flask/FastAPI, Express, Spring, Go) from source."""
+        """HTTP routes from source: decorators, router calls and file layout.
+
+        Covers Flask/FastAPI, Django URLconfs, Express, NestJS, Rails, Spring,
+        Go and Next.js-style file-based endpoints. Each route carries the
+        `handler` symbol it belongs to, which is what ties a URL to the code
+        that serves it — the one link between an app's HTTP surface and its
+        call graph that a path pattern alone cannot give you.
+        """
         import re
         routes: list[dict] = []
+        seen: set[tuple] = set()
         compiled = {fam: [re.compile(p) for p in pats]
                     for fam, pats in _ROUTE_PATTERNS.items()}
+        file_compiled = {name: [re.compile(p) for p in pats]
+                         for name, pats in _ROUTE_FILE_PATTERNS.items()}
+
+        def add(method: str, path: str, file: str, line: int,
+                text: str = "", span: int = 0) -> bool:
+            if not path:
+                path = "/"
+            if not path.startswith(("/", "^", "http")):
+                path = "/" + path            # Rails `resources :x`, Spring "users"
+            key = (method, path, file, line)
+            if key in seen:
+                return True
+            seen.add(key)
+            # A handler named in the call itself (Express, Django) beats
+            # position; otherwise the decorated or enclosing function answers.
+            handler = None
+            ref = _ROUTE_HANDLER_REF.search(text) if text else None
+            if ref is not None:
+                handler = self.store.function_named(file, ref.group(1).split(".")[-1])
+            if handler is None:
+                handler = self.store.handler_for_line(file, line, span + 3)
+            route = {"method": method, "path": path, "file": file, "line": line}
+            if handler is not None:
+                route["handler"] = handler["qname"]
+            routes.append(route)
+            return len(routes) < cap
+
         for fr in self.store.files_with_tokens():
-            family = _ROUTE_FAMILY.get(fr["language"])
-            if not family:
+            path_rel = fr["path"]
+            patterns = list(compiled.get(_ROUTE_FAMILY.get(fr["language"]) or "", ()))
+            patterns += file_compiled.get(path_rel.rsplit("/", 1)[-1].lower(), [])
+
+            fs_route = _fs_route_path(path_rel)
+            if fs_route is not None and not add("ANY", fs_route, path_rel, 1):
+                return {"kind": "routes", "routes": routes,
+                        "note": f"capped at {cap}"}
+            if not patterns:
                 continue
             try:
-                lines = (self.root / fr["path"]).read_text(
+                lines = (self.root / path_rel).read_text(
                     encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
-            for rx in compiled.get(family, []):
-                for i, ln in enumerate(lines, 1):
-                    m = rx.search(ln)
+            for lineno, span, text in _logical_lines(lines):
+                for rx in patterns:
+                    m = rx.search(text)
                     if not m:
                         continue
                     g = [x for x in m.groups() if x]
-                    method = g[0].upper() if len(g) > 1 else "ANY"
-                    routes.append({"method": method, "path": g[-1],
-                                   "file": fr["path"], "line": i})
-                    if len(routes) >= cap:
+                    if not g:
+                        continue
+                    if len(g) > 1:
+                        method, route_path = g[0].upper(), g[-1]
+                    elif g[0].upper() in _HTTP_VERBS:
+                        # `@Post()` — the decorator names the method and the
+                        # path comes from the controller's own prefix.
+                        method, route_path = g[0].upper(), "/"
+                    else:
+                        # Django `path(...)`: the framework fixes the method
+                        # elsewhere, so it is reported as ANY, never guessed.
+                        method, route_path = "ANY", g[0]
+                    if method not in _HTTP_VERBS:
+                        method = "ANY"       # Rails `resources` / `root` / `match`
+                    if not add(method, route_path, path_rel, lineno, text, span):
                         return {"kind": "routes", "routes": routes,
                                 "note": f"capped at {cap}"}
         return {"kind": "routes", "routes": routes}
@@ -10749,16 +11336,47 @@ def _impl_stem_candidates(stem: str) -> list[str]:
     return seen or [stem]
 
 
-def build_test_map(files: list[str]) -> dict:
+# Thresholds for pairing a test with an implementation by graph edges rather
+# than by name. A file must carry at least GRAPH_LINK_SHARE of the strongest
+# link out of that test file, and one test may claim at most
+# GRAPH_LINK_MAX_IMPLS implementations: proportional rather than absolute,
+# because edge counts differ by orders of magnitude between a unit test and a
+# whole-suite file, and together they let an integration test map to the few
+# modules it exercises while a stray reference does not register as coverage.
+# GRAPH_LINK_MIN_EDGES then discards single-edge links outright — cross-file
+# call resolution is by name, so one edge to a method called `resolve` or `get`
+# is as likely to be a same-name coincidence as a real dependency, while two
+# independent references to the same file are not.
+GRAPH_LINK_SHARE = 0.25
+GRAPH_LINK_MAX_IMPLS = 3
+GRAPH_LINK_MIN_EDGES = 2
+
+
+def build_test_map(files: list[str],
+                   graph_links: dict[str, dict[str, int]] | None = None) -> dict:
     """Language-aware impl<->test file mapping over a list of repo paths.
 
     Matching, in priority order: (1) same directory + same stem (Go
     `x_test.go`, colocated `x.test.ts`); (2) same stem anywhere, preferring the
     same extension (`tests/test_x.py` -> `x.py`); the impl stem is derived from
     the test stem by stripping the ecosystem's test affix. Deterministic.
+
+    `graph_links` maps a test file to `{implementation file: edge count}` and is
+    consulted **only** for tests the naming rules could not place, so pairs
+    those rules found are never overridden. It exists because a name is a weak
+    signal and the graph is a strong one: a suite whose filename diverges from
+    what it covers still calls, imports and subclasses that code, and those
+    edges are already indexed. Without it a file like `tests/test_everything.py`
+    reads as an unmatched test and everything it exercises reads as untested —
+    a coverage figure that is wrong rather than merely incomplete.
     """
     tests = [f for f in files if is_test_path(f)]
-    impls = [f for f in files if not is_test_path(f)]
+    # README.md, .prompts/*.md and CI YAML are not implementations, and listing
+    # them as untested ones turned a coverage figure into noise — this repo
+    # reported 98 "untested impls" of which most were prose. Counting only code
+    # makes the number mean what it says.
+    impls = [f for f in files if not is_test_path(f) and is_code_path(f)]
+    non_code = [f for f in files if not is_test_path(f) and not is_code_path(f)]
     by_dir_stem: dict[tuple[str, str], list[str]] = {}
     by_stem: dict[str, list[str]] = {}
     for f in impls:
@@ -10782,6 +11400,23 @@ def build_test_map(files: list[str]) -> dict:
         if matched:
             test_to_impl[t] = sorted(set(matched))
 
+    by_graph: set[str] = set()
+    if graph_links:
+        impl_set = set(impls)
+        for t in tests:
+            if t in test_to_impl:
+                continue                       # naming already placed it
+            counts = {im: n for im, n in (graph_links.get(t) or {}).items()
+                      if im in impl_set and n >= GRAPH_LINK_MIN_EDGES}
+            if not counts:
+                continue
+            floor = max(counts.values()) * GRAPH_LINK_SHARE
+            keep = sorted((im for im, n in counts.items() if n >= floor),
+                          key=lambda im: (-counts[im], im))[:GRAPH_LINK_MAX_IMPLS]
+            if keep:
+                test_to_impl[t] = sorted(keep)
+                by_graph.add(t)
+
     impl_to_tests: dict[str, list[str]] = {}
     for t, ims in test_to_impl.items():
         for im in ims:
@@ -10792,9 +11427,12 @@ def build_test_map(files: list[str]) -> dict:
         "test_to_impl": {k: sorted(v) for k, v in test_to_impl.items()},
         "tests": sorted(tests),
         "impls": sorted(impls),
-        "pairs": [{"impl": im, "test": t} for im, t in pairs],
+        "pairs": [{"impl": im, "test": t,
+                   "via": "graph" if t in by_graph else "naming"}
+                  for im, t in pairs],
         "unmatched_tests": sorted(t for t in tests if t not in test_to_impl),
         "untested_impls": sorted(f for f in impls if f not in impl_to_tests),
+        "non_code_files": sorted(non_code),
     }
 
 
@@ -13029,9 +13667,11 @@ def build_mcp_server(root: Path, db: Path):
             "call/import/inheritance graph for 25+ languages: Python, Java, Go, "
             "TypeScript, JavaScript, C/C++, C#, Rust, Ruby, PHP, Kotlin, Swift, Scala, "
             "Lua, Bash, Solidity, Perl, Erlang, Julia, R, Haskell, OCaml, Nim, "
-            "PowerShell, Dart; 30+ more languages regex-indexed incl. "
-            "SQL/Elixir/Clojure/F#/Groovy/Zig/Objective-C/Markdown). PREFER these "
-            "tools over reading whole files. "
+            "PowerShell, Dart, SQL; 30+ more languages regex-indexed incl. "
+            "Elixir/Clojure/F#/Groovy/Zig/Objective-C/Markdown). SQL is parsed as "
+            "schema: tables, columns, views and indexes are symbols, and foreign "
+            "keys are REFERENCES edges, so get_impact works on a table. PREFER "
+            "these tools over reading whole files. "
             "Orientation: call list_modules() first for a token table of top dirs, "
             "then find_relevant_context(task) (or ask(task) for intent/coverage/risk "
             "metadata) for a budgeted slice of the most relevant symbols + chunks. "
@@ -13981,6 +14621,14 @@ def cmd_index(args):
     print(f"scanned={rep.scanned} parsed={rep.parsed} skipped={rep.skipped} "
           f"removed={rep.removed}")
     print(f"graph: {rep.stats}")
+    _report_embedding_backend()
+    store = Store(_db_path(root))
+    try:
+        hint = grammar_gap_hint(store.files_with_tokens())
+    finally:
+        store.close()
+    if hint:
+        print(hint)
     if rep.errors:
         print(f"{len(rep.errors)} file(s) had errors:", file=sys.stderr)
         for e in rep.errors[:10]:
@@ -15490,12 +16138,27 @@ def repo_fidelity(root: Path) -> dict:
         entry["tokens"] += r["token_est"] or 0
     total = sum(e["files"] for e in langs.values()) or 1
     graphed = sum(e["files"] for e in langs.values() if e["calls"])
+    # Markdown and YAML can never have a call graph, so counting them in the
+    # denominator measures the repo's docs-to-code ratio, not the extractor:
+    # this repo read as 49.5% covered purely because it ships 52 markdown
+    # files. `code_*` is the number that actually says how much of the code
+    # got a graph; the all-files figures stay for continuity.
+    code_files = sum(e["files"] for e in langs.values()
+                     if is_code_language(e["language"]))
+    code_graphed = sum(e["files"] for e in langs.values()
+                       if e["calls"] and is_code_language(e["language"]))
     return {
         "languages": sorted(langs.values(),
                             key=lambda e: (-e["files"], e["language"])),
         "files": total,
         "graph_coverage_pct": round(graphed / total * 100, 1),
         "regex_only_files": total - graphed,
+        "code_files": code_files,
+        "code_graph_coverage_pct": (round(code_graphed / code_files * 100, 1)
+                                    if code_files else 0.0),
+        "code_regex_only_files": code_files - code_graphed,
+        "non_code_files": total - code_files,
+        "grammar_gap": grammar_gap(rows),
         # SCIP lifts reference precision for languages whose native resolution
         # is weak, but only where an external indexer has actually been run.
         "scip_ingested": bool(scip),
@@ -15510,10 +16173,14 @@ def cmd_langs(args):
         if getattr(args, "json", False):
             _emit(rep, True)
             return
-        print(f"indexed files: {rep['files']}   "
-              f"call-graph coverage: {rep['graph_coverage_pct']}%   "
-              f"regex-only: {rep['regex_only_files']}   "
+        print(f"indexed files: {rep['files']} "
+              f"({rep['code_files']} code, {rep['non_code_files']} docs/config)   "
+              f"call-graph coverage: {rep['code_graph_coverage_pct']}% of code   "
+              f"regex-only code: {rep['code_regex_only_files']}   "
               f"SCIP: {'yes' if rep['scip_ingested'] else 'no'}")
+        hint = format_grammar_gap(rep["grammar_gap"])
+        if hint:
+            print(hint)
         print(f"{'language':14} {'tier':20} {'files':>6} {'symbols':>8}  edges")
         for e in rep["languages"]:
             edges = ("calls+imports+inheritance" if e["calls"]
@@ -15570,14 +16237,24 @@ def cmd_serve(args):
 
     transport = (getattr(args, "transport", None) or "stdio").lower()
     if transport == "stdio":
-        if _stdio_embedding_default():
+        if _stdio_embedding_default(db):
             print("tokengraph: stdio MCP server is using the deterministic hash "
                   "embedding for stability. The neural backend (sentence-"
                   "transformers/TensorFlow) can take tens of seconds to load on "
                   "the first ask/find_relevant_context call and, on some "
-                  "platforms, drop the connection — so it is opt-in here: set "
-                  "TOKENGRAPH_EMBEDDINGS=auto (and pre-warm with `tokengraph "
-                  "embed-warm`) to enable it.", file=sys.stderr)
+                  "platforms, drop the connection — so it is enabled here only "
+                  "once the index is built with it: run `tokengraph embed-warm` "
+                  "(or set TOKENGRAPH_EMBEDDINGS=auto).", file=sys.stderr)
+        else:
+            info = _preload_embeddings()
+            if info.get("semantic"):
+                print(f"tokengraph: semantic embeddings ready ({info['backend']}), "
+                      f"loaded before serving so no tool call stalls on it.",
+                      file=sys.stderr)
+            else:
+                print(f"tokengraph: neural embeddings unavailable "
+                      f"({info.get('status')}) — using {info.get('backend')}.",
+                      file=sys.stderr)
         server.run()
         return
 
@@ -17412,6 +18089,26 @@ def cmd_doctor(args):
         except (ValueError, TypeError) as ex:
             add("LLM answer-quality eval", False,
                 f"unreadable {jrec.name}: {ex}", severity="warn")
+
+    # PF-1 follow-through: a missing grammar and best-effort name resolution are
+    # both silent — they cost call edges without ever reporting an error, and an
+    # empty `get_callers` looks identical either way. Doctor is where someone
+    # goes to find out why answers are thin, so both are surfaced here.
+    if db.exists():
+        fid = repo_fidelity(root)
+        gap = fid["grammar_gap"]
+        add("grammars installed for every deep-parse language", not gap,
+            format_grammar_gap(gap), severity="warn")
+        ts_files = sum(e["files"] for e in fid["languages"]
+                       if e["tier"] == "tree-sitter")
+        if ts_files and not fid["scip_ingested"]:
+            share = ts_files / max(1, fid["code_files"])
+            add("precise references (SCIP)", share < 0.25,
+                f"{ts_files} file(s) resolve cross-file calls by NAME, which is "
+                f"best-effort: a same-named method elsewhere can absorb an edge. "
+                f"For compiler-exact references run your language's SCIP indexer "
+                f"(e.g. scip-typescript / scip-java / scip-go), then: "
+                f"tokengraph import-scip index.scip.json", severity="warn")
 
     info = embed_backend_info()
     add(f"embeddings: {info['kind']}", True, "")
